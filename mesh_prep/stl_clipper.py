@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QStatusBar,
     QVBoxLayout,
@@ -443,9 +444,14 @@ class STLClipperApp(QMainWindow):
         self.plotter.set_background("black")
         layout.addWidget(self.plotter.interactor, stretch=3)
 
-        # Control panel
-        panel = QVBoxLayout()
-        layout.addLayout(panel, stretch=1)
+        # Control panel (scrollable so widgets aren't squished on resize)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        panel_widget = QWidget()
+        panel = QVBoxLayout(panel_widget)
+        scroll.setWidget(panel_widget)
+        layout.addWidget(scroll, stretch=1)
 
         # --- Load ---
         self.btn_load = QPushButton("Load STL...")
