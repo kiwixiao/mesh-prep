@@ -389,11 +389,13 @@ class STLClipperApp(QMainWindow):
         self._plane_confirmed = False       # plane locked after user confirms position
         self._static_plane_actor = None     # static visual replacing interactive widget
 
-        # Box constraint state (spinbox-driven, replaces VTK box widget)
+        # Box constraint state (VTK box widget + spinbox/slider dual-input)
         self._box_center = None              # np.array([cx, cy, cz])
         self._box_rotation_deg = None        # np.array([rx, ry, rz]) degrees
         self._box_half_extents = None        # np.array([hx, hy, hz])
-        self._box_actor = None               # wireframe box pyvista actor
+        self._box_initial_center = None      # center used in PlaceWidget
+        self._box_initial_half_extents = None  # half-extents used in PlaceWidget
+        self._box_actor = None               # wireframe box pyvista actor (fallback)
         self._updating_box_controls = False  # recursion guard
 
         self._build_ui()
@@ -533,51 +535,78 @@ class STLClipperApp(QMainWindow):
         self._box_controls_box = QGroupBox("Box Constraint")
         bc_layout = QVBoxLayout()
 
-        # Center X / Y / Z
+        # Center X / Y / Z  (spinbox + slider per axis)
         center_row = QHBoxLayout()
         self._spin_box_cx = QDoubleSpinBox()
         self._spin_box_cy = QDoubleSpinBox()
         self._spin_box_cz = QDoubleSpinBox()
-        for label, spin in [("CX", self._spin_box_cx), ("CY", self._spin_box_cy), ("CZ", self._spin_box_cz)]:
+        self._slider_box_cx = QSlider(Qt.Horizontal)
+        self._slider_box_cy = QSlider(Qt.Horizontal)
+        self._slider_box_cz = QSlider(Qt.Horizontal)
+        for label, spin, slider in [
+            ("CX", self._spin_box_cx, self._slider_box_cx),
+            ("CY", self._spin_box_cy, self._slider_box_cy),
+            ("CZ", self._spin_box_cz, self._slider_box_cz),
+        ]:
             spin.setRange(-1e6, 1e6)
             spin.setDecimals(2)
             spin.setSingleStep(0.5)
+            slider.setRange(-1000, 1000)  # default; updated per mesh
             col = QVBoxLayout()
             col.addWidget(QLabel(label))
             col.addWidget(spin)
+            col.addWidget(slider)
             center_row.addLayout(col)
         bc_layout.addWidget(QLabel("Center:"))
         bc_layout.addLayout(center_row)
 
-        # Rotation Rx / Ry / Rz (degrees)
+        # Rotation Rx / Ry / Rz (degrees)  (spinbox + slider per axis)
         rot_row = QHBoxLayout()
         self._spin_box_rx = QDoubleSpinBox()
         self._spin_box_ry = QDoubleSpinBox()
         self._spin_box_rz = QDoubleSpinBox()
-        for label, spin in [("Rx", self._spin_box_rx), ("Ry", self._spin_box_ry), ("Rz", self._spin_box_rz)]:
+        self._slider_box_rx = QSlider(Qt.Horizontal)
+        self._slider_box_ry = QSlider(Qt.Horizontal)
+        self._slider_box_rz = QSlider(Qt.Horizontal)
+        for label, spin, slider in [
+            ("Rx", self._spin_box_rx, self._slider_box_rx),
+            ("Ry", self._spin_box_ry, self._slider_box_ry),
+            ("Rz", self._spin_box_rz, self._slider_box_rz),
+        ]:
             spin.setRange(0, 360)
             spin.setDecimals(1)
             spin.setSingleStep(5.0)
             spin.setWrapping(True)
+            slider.setRange(0, 3600)  # 0.0° - 360.0°, step = 0.1°
             col = QVBoxLayout()
             col.addWidget(QLabel(label))
             col.addWidget(spin)
+            col.addWidget(slider)
             rot_row.addLayout(col)
         bc_layout.addWidget(QLabel("Rotation (deg):"))
         bc_layout.addLayout(rot_row)
 
-        # Size W / H / D (full dimensions along local axes)
+        # Size W / H / D (full dimensions along local axes)  (spinbox + slider per axis)
         size_row = QHBoxLayout()
         self._spin_box_w = QDoubleSpinBox()
         self._spin_box_h = QDoubleSpinBox()
         self._spin_box_d = QDoubleSpinBox()
-        for label, spin in [("W", self._spin_box_w), ("H", self._spin_box_h), ("D", self._spin_box_d)]:
+        self._slider_box_w = QSlider(Qt.Horizontal)
+        self._slider_box_h = QSlider(Qt.Horizontal)
+        self._slider_box_d = QSlider(Qt.Horizontal)
+        for label, spin, slider in [
+            ("W", self._spin_box_w, self._slider_box_w),
+            ("H", self._spin_box_h, self._slider_box_h),
+            ("D", self._spin_box_d, self._slider_box_d),
+        ]:
             spin.setRange(0.01, 1e6)
             spin.setDecimals(2)
             spin.setSingleStep(0.5)
+            slider.setRange(1, 10000)  # default; updated per mesh
             col = QVBoxLayout()
             col.addWidget(QLabel(label))
             col.addWidget(spin)
+            col.addWidget(slider)
             size_row.addLayout(col)
         bc_layout.addWidget(QLabel("Size:"))
         bc_layout.addLayout(size_row)
@@ -591,11 +620,17 @@ class STLClipperApp(QMainWindow):
         panel.addWidget(self._box_controls_box)
         self._box_controls_box.setVisible(False)
 
-        # Connect box spinboxes
+        # Connect box spinboxes → _on_box_control_change
         for spin in (self._spin_box_cx, self._spin_box_cy, self._spin_box_cz,
                      self._spin_box_rx, self._spin_box_ry, self._spin_box_rz,
                      self._spin_box_w, self._spin_box_h, self._spin_box_d):
             spin.valueChanged.connect(self._on_box_control_change)
+
+        # Connect box sliders → _on_box_slider_change
+        for slider in (self._slider_box_cx, self._slider_box_cy, self._slider_box_cz,
+                       self._slider_box_rx, self._slider_box_ry, self._slider_box_rz,
+                       self._slider_box_w, self._slider_box_h, self._slider_box_d):
+            slider.valueChanged.connect(self._on_box_slider_change)
 
         # Connect origin spinboxes (after guard flag is initialized)
         self._spin_x.valueChanged.connect(self._on_manual_origin_change)
@@ -744,12 +779,15 @@ class STLClipperApp(QMainWindow):
         self._current_plane_origin = None
         self._current_plane_normal = None
         # Reset box state from any previous constraint
+        self.plotter.clear_box_widgets()
         if self._box_actor is not None:
             self.plotter.remove_actor(self._box_actor, render=False)
             self._box_actor = None
         self._box_center = None
         self._box_rotation_deg = None
         self._box_half_extents = None
+        self._box_initial_center = None
+        self._box_initial_half_extents = None
         self._box_controls_box.setVisible(False)
 
         self.plotter.add_plane_widget(
@@ -807,7 +845,11 @@ class STLClipperApp(QMainWindow):
         )
 
     def _on_add_constraint(self):
-        """Add optional constraint box to limit cut to a region of interest."""
+        """Add optional constraint box to limit cut to a region of interest.
+
+        Creates both a VTK box widget (mouse drag) and spinbox/slider controls,
+        kept in bidirectional sync.
+        """
         if not self._plane_widget_active or self._current_plane_origin is None:
             return
         mesh = self.engine.get_wall_mesh()
@@ -819,11 +861,16 @@ class STLClipperApp(QMainWindow):
         extents = bounds.ptp(axis=1)  # [dx, dy, dz]
         half_extents = extents * 0.3 / 2.0  # factor=0.3 matching old widget
 
-        self._box_center = center
+        self._box_center = center.copy()
         self._box_rotation_deg = np.array([0.0, 0.0, 0.0])
-        self._box_half_extents = half_extents
+        self._box_half_extents = half_extents.copy()
+        self._box_initial_center = center.copy()
+        self._box_initial_half_extents = half_extents.copy()
 
-        # Set spinbox values (guarded against triggering callbacks)
+        # Initialize slider ranges from mesh geometry
+        self._init_box_slider_ranges(mesh)
+
+        # Set spinbox + slider values (guarded against triggering callbacks)
         self._updating_box_controls = True
         self._spin_box_cx.setValue(float(center[0]))
         self._spin_box_cy.setValue(float(center[1]))
@@ -835,13 +882,75 @@ class STLClipperApp(QMainWindow):
         self._spin_box_h.setValue(float(half_extents[1] * 2))
         self._spin_box_d.setValue(float(half_extents[2] * 2))
         self._updating_box_controls = False
+        self._sync_box_sliders_from_spinboxes()
 
+        # Add VTK box widget for mouse interaction
+        box_bounds = [
+            center[0] - half_extents[0], center[0] + half_extents[0],
+            center[1] - half_extents[1], center[1] + half_extents[1],
+            center[2] - half_extents[2], center[2] + half_extents[2],
+        ]
+        self.plotter.add_box_widget(
+            self._constraint_box_callback,
+            bounds=box_bounds,
+            factor=1.0,
+            rotation_enabled=True,
+            color=(0.2, 0.8, 0.4),
+            use_planes=True,
+        )
+
+        # Compute initial 6 planes from current state
         self._box_controls_box.setVisible(True)
         self._update_constraint_box()
         self._update_button_states()
 
+    def _constraint_box_callback(self, vtk_planes):
+        """Called when user drags the VTK box widget handles.
+
+        Extracts 6 planes from the vtkPlanes object, decomposes them into
+        center/rotation/half_extents, and syncs the spinboxes + sliders.
+        """
+        if self._updating_box_controls:
+            return
+
+        # Extract 6 planes from vtkPlanes
+        planes_data = []
+        for i in range(vtk_planes.GetNumberOfPlanes()):
+            plane = vtk_planes.GetPlane(i)
+            n = np.array(plane.GetNormal())
+            p = np.array(plane.GetOrigin())
+            planes_data.append((n.copy(), p.copy()))
+
+        self._current_box_planes_data = planes_data
+
+        # Decompose planes into center, rotation, half_extents
+        center, rot_deg, half_extents = self._decompose_box_planes(planes_data)
+        if center is None:
+            self._update_preview()
+            return
+
+        self._box_center = center
+        self._box_rotation_deg = rot_deg
+        self._box_half_extents = half_extents
+
+        # Update spinboxes + sliders (guarded)
+        self._updating_box_controls = True
+        self._spin_box_cx.setValue(float(center[0]))
+        self._spin_box_cy.setValue(float(center[1]))
+        self._spin_box_cz.setValue(float(center[2]))
+        self._spin_box_rx.setValue(float(rot_deg[0]))
+        self._spin_box_ry.setValue(float(rot_deg[1]))
+        self._spin_box_rz.setValue(float(rot_deg[2]))
+        self._spin_box_w.setValue(float(half_extents[0] * 2))
+        self._spin_box_h.setValue(float(half_extents[1] * 2))
+        self._spin_box_d.setValue(float(half_extents[2] * 2))
+        self._updating_box_controls = False
+        self._sync_box_sliders_from_spinboxes()
+
+        self._update_preview()
+
     def _on_box_control_change(self):
-        """Read all 9 spinboxes and update box state + wireframe + planes."""
+        """Read all 9 spinboxes and update box state + planes + VTK widget."""
         if self._updating_box_controls:
             return
         self._box_center = np.array([
@@ -858,7 +967,9 @@ class STLClipperApp(QMainWindow):
         h = self._spin_box_h.value()
         d = self._spin_box_d.value()
         self._box_half_extents = np.array([w / 2.0, h / 2.0, d / 2.0])
+        self._sync_box_sliders_from_spinboxes()
         self._update_constraint_box()
+        self._push_transform_to_box_widget()
 
     @staticmethod
     def _euler_rotation_matrix(rx_deg, ry_deg, rz_deg):
@@ -874,13 +985,201 @@ class STLClipperApp(QMainWindow):
         Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
         return Rz @ Ry @ Rx
 
+    @staticmethod
+    def _rotation_matrix_to_euler(R):
+        """Extract Euler angles (rx, ry, rz) in degrees from R = Rz * Ry * Rx.
+
+        Uses the convention:
+            R[2,0] = -sin(ry)
+            R[2,1]/cos(ry) = sin(rx), R[2,2]/cos(ry) = cos(rx)
+            R[1,0]/cos(ry) = sin(rz), R[0,0]/cos(ry) = cos(rz)
+        """
+        sy = -R[2, 0]
+        sy = np.clip(sy, -1.0, 1.0)
+        ry = np.arcsin(sy)
+        cy = np.cos(ry)
+        if abs(cy) > 1e-6:
+            rx = np.arctan2(R[2, 1] / cy, R[2, 2] / cy)
+            rz = np.arctan2(R[1, 0] / cy, R[0, 0] / cy)
+        else:
+            # Gimbal lock: ry ≈ ±90°, set rz=0 and solve rx
+            rx = np.arctan2(-R[1, 2], R[1, 1])
+            rz = 0.0
+        return np.degrees(rx) % 360, np.degrees(ry) % 360, np.degrees(rz) % 360
+
+    @staticmethod
+    def _decompose_box_planes(planes_data):
+        """Decompose 6 (normal, point) tuples into (center, rotation_deg, half_extents).
+
+        Pairs opposite faces (normals that sum to ~zero), extracts 3 axis
+        directions, half-extents, and center, then converts the rotation
+        matrix to Euler angles.
+        """
+        if len(planes_data) != 6:
+            return None, None, None
+
+        normals = [np.asarray(n, dtype=float) for n, _ in planes_data]
+        points = [np.asarray(p, dtype=float) for _, p in planes_data]
+
+        # Pair opposite faces: find pairs whose normals sum to ~zero
+        used = [False] * 6
+        pairs = []
+        for i in range(6):
+            if used[i]:
+                continue
+            for j in range(i + 1, 6):
+                if used[j]:
+                    continue
+                if np.linalg.norm(normals[i] + normals[j]) < 0.3:
+                    pairs.append((i, j))
+                    used[i] = used[j] = True
+                    break
+
+        if len(pairs) != 3:
+            return None, None, None
+
+        axes = []
+        half_exts = []
+        centers = []
+        for i, j in pairs:
+            # Axis direction = normal of the "positive" face
+            axis = normals[i] / np.linalg.norm(normals[i])
+            # Half-extent = half the distance between opposite face points projected onto axis
+            diff = points[i] - points[j]
+            he = abs(np.dot(axis, diff)) / 2.0
+            # Center contribution from this pair
+            mid = (points[i] + points[j]) / 2.0
+            axes.append(axis)
+            half_exts.append(he)
+            centers.append(mid)
+
+        center = np.mean(centers, axis=0)
+
+        # Sort axes to canonical ordering: axis[0] closest to global X,
+        # axis[1] closest to Y, axis[2] closest to Z — so W/H/D spinboxes
+        # match the expected local-axis convention.
+        order = sorted(range(3), key=lambda k: np.argmax(np.abs(axes[k])))
+        axes = [axes[i] for i in order]
+        half_exts = [half_exts[i] for i in order]
+        half_extents = np.array(half_exts)
+
+        # Build rotation matrix from 3 axes (ensure right-handed)
+        R = np.column_stack(axes)
+        if np.linalg.det(R) < 0:
+            R[:, 2] = -R[:, 2]
+
+        rx, ry, rz = STLClipperApp._rotation_matrix_to_euler(R)
+        return center, np.array([rx, ry, rz]), half_extents
+
+    def _on_box_slider_change(self):
+        """When a slider moves, push its value to the corresponding spinbox.
+
+        The spinbox valueChanged signal then triggers _on_box_control_change.
+        """
+        if self._updating_box_controls:
+            return
+        self._updating_box_controls = True
+        # Center sliders: integer value / 100.0 → float position
+        self._spin_box_cx.setValue(self._slider_box_cx.value() / 100.0)
+        self._spin_box_cy.setValue(self._slider_box_cy.value() / 100.0)
+        self._spin_box_cz.setValue(self._slider_box_cz.value() / 100.0)
+        # Rotation sliders: integer / 10.0 → degrees
+        self._spin_box_rx.setValue(self._slider_box_rx.value() / 10.0)
+        self._spin_box_ry.setValue(self._slider_box_ry.value() / 10.0)
+        self._spin_box_rz.setValue(self._slider_box_rz.value() / 10.0)
+        # Size sliders: integer / 100.0 → float dimension
+        self._spin_box_w.setValue(self._slider_box_w.value() / 100.0)
+        self._spin_box_h.setValue(self._slider_box_h.value() / 100.0)
+        self._spin_box_d.setValue(self._slider_box_d.value() / 100.0)
+        self._updating_box_controls = False
+        # Trigger full update (since spinbox signals were blocked by guard)
+        self._on_box_control_change()
+
+    def _sync_box_sliders_from_spinboxes(self):
+        """Push current spinbox values to slider positions (guarded)."""
+        self._updating_box_controls = True
+        self._slider_box_cx.setValue(int(round(self._spin_box_cx.value() * 100)))
+        self._slider_box_cy.setValue(int(round(self._spin_box_cy.value() * 100)))
+        self._slider_box_cz.setValue(int(round(self._spin_box_cz.value() * 100)))
+        self._slider_box_rx.setValue(int(round(self._spin_box_rx.value() * 10)))
+        self._slider_box_ry.setValue(int(round(self._spin_box_ry.value() * 10)))
+        self._slider_box_rz.setValue(int(round(self._spin_box_rz.value() * 10)))
+        self._slider_box_w.setValue(int(round(self._spin_box_w.value() * 100)))
+        self._slider_box_h.setValue(int(round(self._spin_box_h.value() * 100)))
+        self._slider_box_d.setValue(int(round(self._spin_box_d.value() * 100)))
+        self._updating_box_controls = False
+
+    def _init_box_slider_ranges(self, mesh):
+        """Set slider integer ranges based on mesh bounds.
+
+        Center sliders: mesh_min - margin .. mesh_max + margin  (×100 for 0.01 step)
+        Size sliders:   0.01 .. 2× mesh extent per axis  (×100)
+        Rotation sliders: fixed 0-3600 (0.0°-360.0°)
+        """
+        bounds = np.array(mesh.bounds).reshape(3, 2)
+        extents = bounds.ptp(axis=1)
+        margin = extents * 0.5  # 50% margin
+
+        for slider, bmin, bmax, m in [
+            (self._slider_box_cx, bounds[0, 0], bounds[0, 1], margin[0]),
+            (self._slider_box_cy, bounds[1, 0], bounds[1, 1], margin[1]),
+            (self._slider_box_cz, bounds[2, 0], bounds[2, 1], margin[2]),
+        ]:
+            slider.setRange(int((bmin - m) * 100), int((bmax + m) * 100))
+
+        for slider, ext in [
+            (self._slider_box_w, extents[0]),
+            (self._slider_box_h, extents[1]),
+            (self._slider_box_d, extents[2]),
+        ]:
+            slider.setRange(1, int(ext * 2 * 100))  # min 0.01, max 2× extent
+
+        # Rotation sliders: always 0-3600
+        for slider in (self._slider_box_rx, self._slider_box_ry, self._slider_box_rz):
+            slider.setRange(0, 3600)
+
+    def _push_transform_to_box_widget(self):
+        """Push current center/rotation/size to the VTK box widget."""
+        if not self.plotter.box_widgets:
+            return
+        if self._box_initial_center is None or self._box_initial_half_extents is None:
+            return
+        widget = self.plotter.box_widgets[-1]
+        c0 = self._box_initial_center
+        h0 = self._box_initial_half_extents
+        c = self._box_center
+        h = self._box_half_extents
+        R = self._euler_rotation_matrix(*self._box_rotation_deg)
+
+        t = vtk.vtkTransform()
+        t.PostMultiply()
+        # 1. Undo initial placement center
+        t.Translate(-c0[0], -c0[1], -c0[2])
+        # 2. Scale from initial to desired size
+        sx = h[0] / h0[0] if h0[0] > 1e-12 else 1.0
+        sy = h[1] / h0[1] if h0[1] > 1e-12 else 1.0
+        sz = h[2] / h0[2] if h0[2] > 1e-12 else 1.0
+        t.Scale(sx, sy, sz)
+        # 3. Rotate
+        rx, ry, rz = self._box_rotation_deg
+        t.RotateX(float(rx))
+        t.RotateY(float(ry))
+        t.RotateZ(float(rz))
+        # 4. Move to desired center
+        t.Translate(c[0], c[1], c[2])
+
+        widget.SetTransform(t)
+        self.plotter.render()
+
     def _update_constraint_box(self):
-        """Recompute 6 planes, update wireframe actor, and refresh preview."""
+        """Recompute 6 planes from current box state and refresh preview.
+
+        The VTK box widget provides the visual — no wireframe actor needed.
+        """
         if self._box_center is None:
             return
 
         center = self._box_center
-        hx, hy, hz = self._box_half_extents
         R = self._euler_rotation_matrix(*self._box_rotation_deg)
 
         # 6 planes with outward-pointing normals
@@ -892,27 +1191,10 @@ class STLClipperApp(QMainWindow):
             planes.append((-axis.copy(), (center - axis * h).copy()))
         self._current_box_planes_data = planes
 
-        # Remove old wireframe actor
-        if self._box_actor is not None:
-            self.plotter.remove_actor(self._box_actor, render=False)
-            self._box_actor = None
-
-        # Render new wireframe box
-        box_mesh = pv.Box(bounds=[-hx, hx, -hy, hy, -hz, hz])
-        transform = np.eye(4)
-        transform[:3, :3] = R
-        transform[:3, 3] = center
-        box_mesh = box_mesh.transform(transform, inplace=False)
-        self._box_actor = self.plotter.add_mesh(
-            box_mesh, style='wireframe', color=(0.2, 0.8, 0.4),
-            line_width=2, name="_constraint_box", render=False,
-            reset_camera=False,
-        )
-
         self._update_preview()
 
     def _on_reset_box(self):
-        """Reset box spinboxes to initial values (mesh center, no rotation, default size)."""
+        """Reset box controls to initial values (mesh center, no rotation, default size)."""
         mesh = self.engine.get_wall_mesh()
         if mesh is None:
             return
@@ -932,10 +1214,29 @@ class STLClipperApp(QMainWindow):
         self._spin_box_h.setValue(float(half_extents[1] * 2))
         self._spin_box_d.setValue(float(half_extents[2] * 2))
         self._updating_box_controls = False
+        self._sync_box_sliders_from_spinboxes()
 
         self._box_center = center
         self._box_rotation_deg = np.array([0.0, 0.0, 0.0])
         self._box_half_extents = half_extents
+        self._box_initial_center = center.copy()
+        self._box_initial_half_extents = half_extents.copy()
+
+        # Re-place VTK widget at reset bounds
+        self.plotter.clear_box_widgets()
+        box_bounds = [
+            center[0] - half_extents[0], center[0] + half_extents[0],
+            center[1] - half_extents[1], center[1] + half_extents[1],
+            center[2] - half_extents[2], center[2] + half_extents[2],
+        ]
+        self.plotter.add_box_widget(
+            self._constraint_box_callback,
+            bounds=box_bounds,
+            factor=1.0,
+            rotation_enabled=True,
+            color=(0.2, 0.8, 0.4),
+            use_planes=True,
+        )
         self._update_constraint_box()
 
     def _update_preview(self):
@@ -1009,14 +1310,18 @@ class STLClipperApp(QMainWindow):
         self._constraint_box_active = False
         self._plane_confirmed = False
         self._current_box_planes_data = None
+        self._updating_box_controls = False  # defensive reset
         self.plotter.clear_plane_widgets()
-        # Remove wireframe box actor (replaces clear_box_widgets)
+        self.plotter.clear_box_widgets()
+        # Remove wireframe box actor (fallback)
         if self._box_actor is not None:
             self.plotter.remove_actor(self._box_actor, render=False)
             self._box_actor = None
         self._box_center = None
         self._box_rotation_deg = None
         self._box_half_extents = None
+        self._box_initial_center = None
+        self._box_initial_half_extents = None
         self._box_controls_box.setVisible(False)
         if self._static_plane_actor is not None:
             self.plotter.remove_actor(self._static_plane_actor, render=False)
