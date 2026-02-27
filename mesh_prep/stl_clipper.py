@@ -7,7 +7,7 @@ vessel branch endpoints, name each cross-section cap, and export multi-solid
 ASCII STL files.
 
 Usage:
-    python stl_clipper.py [path/to/file.stl]
+    mesh-prep [path/to/file.stl]
 """
 
 import json
@@ -23,7 +23,9 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication,
+    QDoubleSpinBox,
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -32,6 +34,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -112,7 +115,7 @@ class STLClipperEngine:
                 kept.append(cid)
         if not kept:
             return pv.PolyData()
-        return loops.extract_cells(kept).extract_surface(algorithm=None)
+        return loops.extract_cells(kept).extract_surface()
 
     @staticmethod
     def _generate_cap(original_mesh, origin, normal, box_planes_data=None):
@@ -386,6 +389,13 @@ class STLClipperApp(QMainWindow):
         self._plane_confirmed = False       # plane locked after user confirms position
         self._static_plane_actor = None     # static visual replacing interactive widget
 
+        # Box constraint state (spinbox-driven, replaces VTK box widget)
+        self._box_center = None              # np.array([cx, cy, cz])
+        self._box_rotation_deg = None        # np.array([rx, ry, rz]) degrees
+        self._box_half_extents = None        # np.array([hx, hy, hz])
+        self._box_actor = None               # wireframe box pyvista actor
+        self._updating_box_controls = False  # recursion guard
+
         self._build_ui()
         self._build_menu()
         self._update_button_states()
@@ -443,6 +453,158 @@ class STLClipperApp(QMainWindow):
         self.btn_flip = QPushButton("Flip Normal")
         self.btn_flip.clicked.connect(self._on_flip_normal)
         panel.addWidget(self.btn_flip)
+
+        # --- Manual Plane Controls (trackpad-friendly) ---
+        self._updating_controls = False
+        self._plane_controls_box = QGroupBox("Plane Position / Normal")
+        pc_layout = QVBoxLayout()
+
+        # Origin X / Y / Z spinboxes
+        origin_row = QHBoxLayout()
+        self._spin_x = QDoubleSpinBox()
+        self._spin_y = QDoubleSpinBox()
+        self._spin_z = QDoubleSpinBox()
+        for label, spin in [("X", self._spin_x), ("Y", self._spin_y), ("Z", self._spin_z)]:
+            spin.setRange(-1e6, 1e6)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.5)
+            col = QVBoxLayout()
+            col.addWidget(QLabel(label))
+            col.addWidget(spin)
+            origin_row.addLayout(col)
+        pc_layout.addLayout(origin_row)
+
+        # Nudge along normal
+        nudge_row = QHBoxLayout()
+        nudge_row.addWidget(QLabel("Step:"))
+        self._spin_step = QDoubleSpinBox()
+        self._spin_step.setRange(0.01, 1000.0)
+        self._spin_step.setValue(1.0)
+        self._spin_step.setDecimals(2)
+        nudge_row.addWidget(self._spin_step)
+        btn_nudge_fwd = QPushButton("+N")
+        btn_nudge_fwd.setToolTip("Nudge plane forward along normal")
+        btn_nudge_fwd.clicked.connect(lambda: self._on_nudge(+1))
+        nudge_row.addWidget(btn_nudge_fwd)
+        btn_nudge_back = QPushButton("-N")
+        btn_nudge_back.setToolTip("Nudge plane backward along normal")
+        btn_nudge_back.clicked.connect(lambda: self._on_nudge(-1))
+        nudge_row.addWidget(btn_nudge_back)
+        pc_layout.addLayout(nudge_row)
+
+        # Normal orientation (spherical coordinates)
+        pc_layout.addWidget(QLabel("Tilt (elevation):"))
+        self._slider_elev = QSlider(Qt.Horizontal)
+        self._slider_elev.setRange(0, 180)      # 0=+Z, 90=XY plane, 180=-Z
+        self._slider_elev.setValue(0)
+        self._elev_label = QLabel("0°")
+        elev_row = QHBoxLayout()
+        elev_row.addWidget(self._slider_elev)
+        elev_row.addWidget(self._elev_label)
+        pc_layout.addLayout(elev_row)
+
+        pc_layout.addWidget(QLabel("Spin (azimuth):"))
+        self._slider_azim = QSlider(Qt.Horizontal)
+        self._slider_azim.setRange(0, 360)      # rotation in XY plane
+        self._slider_azim.setValue(0)
+        self._azim_label = QLabel("0°")
+        azim_row = QHBoxLayout()
+        azim_row.addWidget(self._slider_azim)
+        azim_row.addWidget(self._azim_label)
+        pc_layout.addLayout(azim_row)
+
+        # Quick axis presets (set both sliders at once)
+        preset_row = QHBoxLayout()
+        for label, elev, azim in [
+            ("+X", 90, 0), ("-X", 90, 180),
+            ("+Y", 90, 90), ("-Y", 90, 270),
+            ("+Z", 0, 0), ("-Z", 180, 0),
+        ]:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _, e=elev, a=azim: self._on_normal_preset_angles(e, a))
+            preset_row.addWidget(btn)
+        pc_layout.addLayout(preset_row)
+
+        self._plane_controls_box.setLayout(pc_layout)
+        panel.addWidget(self._plane_controls_box)
+        self._plane_controls_box.setVisible(False)
+
+        # --- Box Constraint Controls (trackpad-friendly) ---
+        self._box_controls_box = QGroupBox("Box Constraint")
+        bc_layout = QVBoxLayout()
+
+        # Center X / Y / Z
+        center_row = QHBoxLayout()
+        self._spin_box_cx = QDoubleSpinBox()
+        self._spin_box_cy = QDoubleSpinBox()
+        self._spin_box_cz = QDoubleSpinBox()
+        for label, spin in [("CX", self._spin_box_cx), ("CY", self._spin_box_cy), ("CZ", self._spin_box_cz)]:
+            spin.setRange(-1e6, 1e6)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.5)
+            col = QVBoxLayout()
+            col.addWidget(QLabel(label))
+            col.addWidget(spin)
+            center_row.addLayout(col)
+        bc_layout.addWidget(QLabel("Center:"))
+        bc_layout.addLayout(center_row)
+
+        # Rotation Rx / Ry / Rz (degrees)
+        rot_row = QHBoxLayout()
+        self._spin_box_rx = QDoubleSpinBox()
+        self._spin_box_ry = QDoubleSpinBox()
+        self._spin_box_rz = QDoubleSpinBox()
+        for label, spin in [("Rx", self._spin_box_rx), ("Ry", self._spin_box_ry), ("Rz", self._spin_box_rz)]:
+            spin.setRange(0, 360)
+            spin.setDecimals(1)
+            spin.setSingleStep(5.0)
+            spin.setWrapping(True)
+            col = QVBoxLayout()
+            col.addWidget(QLabel(label))
+            col.addWidget(spin)
+            rot_row.addLayout(col)
+        bc_layout.addWidget(QLabel("Rotation (deg):"))
+        bc_layout.addLayout(rot_row)
+
+        # Size W / H / D (full dimensions along local axes)
+        size_row = QHBoxLayout()
+        self._spin_box_w = QDoubleSpinBox()
+        self._spin_box_h = QDoubleSpinBox()
+        self._spin_box_d = QDoubleSpinBox()
+        for label, spin in [("W", self._spin_box_w), ("H", self._spin_box_h), ("D", self._spin_box_d)]:
+            spin.setRange(0.01, 1e6)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.5)
+            col = QVBoxLayout()
+            col.addWidget(QLabel(label))
+            col.addWidget(spin)
+            size_row.addLayout(col)
+        bc_layout.addWidget(QLabel("Size:"))
+        bc_layout.addLayout(size_row)
+
+        # Reset button
+        btn_reset_box = QPushButton("Reset to Mesh Bounds")
+        btn_reset_box.clicked.connect(self._on_reset_box)
+        bc_layout.addWidget(btn_reset_box)
+
+        self._box_controls_box.setLayout(bc_layout)
+        panel.addWidget(self._box_controls_box)
+        self._box_controls_box.setVisible(False)
+
+        # Connect box spinboxes
+        for spin in (self._spin_box_cx, self._spin_box_cy, self._spin_box_cz,
+                     self._spin_box_rx, self._spin_box_ry, self._spin_box_rz,
+                     self._spin_box_w, self._spin_box_h, self._spin_box_d):
+            spin.valueChanged.connect(self._on_box_control_change)
+
+        # Connect origin spinboxes (after guard flag is initialized)
+        self._spin_x.valueChanged.connect(self._on_manual_origin_change)
+        self._spin_y.valueChanged.connect(self._on_manual_origin_change)
+        self._spin_z.valueChanged.connect(self._on_manual_origin_change)
+
+        # Connect normal sliders
+        self._slider_elev.valueChanged.connect(self._on_normal_slider_change)
+        self._slider_azim.valueChanged.connect(self._on_normal_slider_change)
 
         panel.addWidget(self._separator("Patches"))
 
@@ -581,6 +743,14 @@ class STLClipperApp(QMainWindow):
         self._current_box_planes_data = None
         self._current_plane_origin = None
         self._current_plane_normal = None
+        # Reset box state from any previous constraint
+        if self._box_actor is not None:
+            self.plotter.remove_actor(self._box_actor, render=False)
+            self._box_actor = None
+        self._box_center = None
+        self._box_rotation_deg = None
+        self._box_half_extents = None
+        self._box_controls_box.setVisible(False)
 
         self.plotter.add_plane_widget(
             self._plane_callback,
@@ -588,12 +758,25 @@ class STLClipperApp(QMainWindow):
             origin=mesh.center,
             color=PREVIEW_COLOR,
         )
+
+        # Initialize manual controls from mesh geometry
+        center = np.array(mesh.center, dtype=float)
+        self._current_plane_origin = center.copy()
+        self._current_plane_normal = np.array([0.0, 0.0, 1.0])
+        bounds = np.array(mesh.bounds).reshape(3, 2)
+        diag = np.linalg.norm(bounds.ptp(axis=1))
+        self._spin_step.setValue(round(max(diag * 0.01, 0.1), 2))
+        self._show_plane_controls(True)
+
         self._update_button_states()
 
     def _plane_callback(self, normal, origin):
         """Called when user moves/rotates the plane widget."""
+        if self._updating_controls:
+            return
         self._current_plane_normal = np.asarray(normal, dtype=float)
         self._current_plane_origin = np.asarray(origin, dtype=float)
+        self._sync_controls_from_state()
         self._update_preview()
 
     def _on_confirm_plane(self):
@@ -603,6 +786,7 @@ class STLClipperApp(QMainWindow):
         self._plane_confirmed = True
         self.plotter.clear_plane_widgets()
         self._add_static_plane_visual()
+        self._show_plane_controls(False)
         self._update_button_states()
 
     def _add_static_plane_visual(self):
@@ -629,28 +813,130 @@ class STLClipperApp(QMainWindow):
         mesh = self.engine.get_wall_mesh()
         self._constraint_box_active = True
 
-        self.plotter.add_box_widget(
-            self._constraint_box_callback,
-            bounds=mesh.bounds,
-            factor=0.3,
-            rotation_enabled=True,
-            color=(0.2, 0.8, 0.4),
-            use_planes=True,
-        )
+        # Compute initial box state from mesh bounds
+        center = np.array(mesh.center, dtype=float)
+        bounds = np.array(mesh.bounds).reshape(3, 2)
+        extents = bounds.ptp(axis=1)  # [dx, dy, dz]
+        half_extents = extents * 0.3 / 2.0  # factor=0.3 matching old widget
+
+        self._box_center = center
+        self._box_rotation_deg = np.array([0.0, 0.0, 0.0])
+        self._box_half_extents = half_extents
+
+        # Set spinbox values (guarded against triggering callbacks)
+        self._updating_box_controls = True
+        self._spin_box_cx.setValue(float(center[0]))
+        self._spin_box_cy.setValue(float(center[1]))
+        self._spin_box_cz.setValue(float(center[2]))
+        self._spin_box_rx.setValue(0.0)
+        self._spin_box_ry.setValue(0.0)
+        self._spin_box_rz.setValue(0.0)
+        self._spin_box_w.setValue(float(half_extents[0] * 2))
+        self._spin_box_h.setValue(float(half_extents[1] * 2))
+        self._spin_box_d.setValue(float(half_extents[2] * 2))
+        self._updating_box_controls = False
+
+        self._box_controls_box.setVisible(True)
+        self._update_constraint_box()
         self._update_button_states()
 
-    def _constraint_box_callback(self, vtk_planes):
-        """Called when user modifies the constraint box."""
-        normals = vtk_planes.GetNormals()
-        points = vtk_planes.GetPoints()
-        n_planes = normals.GetNumberOfTuples()
-        box_planes_data = []
-        for i in range(n_planes):
-            normal = np.array(normals.GetTuple3(i))
-            point = np.array(points.GetPoint(i))
-            box_planes_data.append((normal.copy(), point.copy()))
-        self._current_box_planes_data = box_planes_data
+    def _on_box_control_change(self):
+        """Read all 9 spinboxes and update box state + wireframe + planes."""
+        if self._updating_box_controls:
+            return
+        self._box_center = np.array([
+            self._spin_box_cx.value(),
+            self._spin_box_cy.value(),
+            self._spin_box_cz.value(),
+        ])
+        self._box_rotation_deg = np.array([
+            self._spin_box_rx.value(),
+            self._spin_box_ry.value(),
+            self._spin_box_rz.value(),
+        ])
+        w = self._spin_box_w.value()
+        h = self._spin_box_h.value()
+        d = self._spin_box_d.value()
+        self._box_half_extents = np.array([w / 2.0, h / 2.0, d / 2.0])
+        self._update_constraint_box()
+
+    @staticmethod
+    def _euler_rotation_matrix(rx_deg, ry_deg, rz_deg):
+        """Build rotation matrix from Euler angles (Rz * Ry * Rx order)."""
+        rx = np.radians(rx_deg)
+        ry = np.radians(ry_deg)
+        rz = np.radians(rz_deg)
+        cx, sx = np.cos(rx), np.sin(rx)
+        cy, sy = np.cos(ry), np.sin(ry)
+        cz, sz = np.cos(rz), np.sin(rz)
+        Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+        Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+        Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+        return Rz @ Ry @ Rx
+
+    def _update_constraint_box(self):
+        """Recompute 6 planes, update wireframe actor, and refresh preview."""
+        if self._box_center is None:
+            return
+
+        center = self._box_center
+        hx, hy, hz = self._box_half_extents
+        R = self._euler_rotation_matrix(*self._box_rotation_deg)
+
+        # 6 planes with outward-pointing normals
+        axes = [R[:, 0], R[:, 1], R[:, 2]]
+        planes = []
+        for i, axis in enumerate(axes):
+            h = self._box_half_extents[i]
+            planes.append((axis.copy(), (center + axis * h).copy()))
+            planes.append((-axis.copy(), (center - axis * h).copy()))
+        self._current_box_planes_data = planes
+
+        # Remove old wireframe actor
+        if self._box_actor is not None:
+            self.plotter.remove_actor(self._box_actor, render=False)
+            self._box_actor = None
+
+        # Render new wireframe box
+        box_mesh = pv.Box(bounds=[-hx, hx, -hy, hy, -hz, hz])
+        transform = np.eye(4)
+        transform[:3, :3] = R
+        transform[:3, 3] = center
+        box_mesh = box_mesh.transform(transform, inplace=False)
+        self._box_actor = self.plotter.add_mesh(
+            box_mesh, style='wireframe', color=(0.2, 0.8, 0.4),
+            line_width=2, name="_constraint_box", render=False,
+            reset_camera=False,
+        )
+
         self._update_preview()
+
+    def _on_reset_box(self):
+        """Reset box spinboxes to initial values (mesh center, no rotation, default size)."""
+        mesh = self.engine.get_wall_mesh()
+        if mesh is None:
+            return
+        center = np.array(mesh.center, dtype=float)
+        bounds = np.array(mesh.bounds).reshape(3, 2)
+        extents = bounds.ptp(axis=1)
+        half_extents = extents * 0.3 / 2.0
+
+        self._updating_box_controls = True
+        self._spin_box_cx.setValue(float(center[0]))
+        self._spin_box_cy.setValue(float(center[1]))
+        self._spin_box_cz.setValue(float(center[2]))
+        self._spin_box_rx.setValue(0.0)
+        self._spin_box_ry.setValue(0.0)
+        self._spin_box_rz.setValue(0.0)
+        self._spin_box_w.setValue(float(half_extents[0] * 2))
+        self._spin_box_h.setValue(float(half_extents[1] * 2))
+        self._spin_box_d.setValue(float(half_extents[2] * 2))
+        self._updating_box_controls = False
+
+        self._box_center = center
+        self._box_rotation_deg = np.array([0.0, 0.0, 0.0])
+        self._box_half_extents = half_extents
+        self._update_constraint_box()
 
     def _update_preview(self):
         """Show a yellow slice preview (clipped to box) and a green normal arrow."""
@@ -708,6 +994,8 @@ class STLClipperApp(QMainWindow):
     def _on_flip_normal(self):
         if self._current_plane_normal is not None:
             self._current_plane_normal = -self._current_plane_normal
+            self._sync_normal_sliders_from_state()
+            self._update_plane_widget_position()
             self._update_preview()
 
     def _on_cancel(self):
@@ -722,7 +1010,14 @@ class STLClipperApp(QMainWindow):
         self._plane_confirmed = False
         self._current_box_planes_data = None
         self.plotter.clear_plane_widgets()
-        self.plotter.clear_box_widgets()
+        # Remove wireframe box actor (replaces clear_box_widgets)
+        if self._box_actor is not None:
+            self.plotter.remove_actor(self._box_actor, render=False)
+            self._box_actor = None
+        self._box_center = None
+        self._box_rotation_deg = None
+        self._box_half_extents = None
+        self._box_controls_box.setVisible(False)
         if self._static_plane_actor is not None:
             self.plotter.remove_actor(self._static_plane_actor, render=False)
             self._static_plane_actor = None
@@ -732,6 +1027,100 @@ class STLClipperApp(QMainWindow):
         if self._arrow_actor is not None:
             self.plotter.remove_actor(self._arrow_actor, render=False)
             self._arrow_actor = None
+        self._show_plane_controls(False)
+
+    # ------------------------------------------------------------------
+    # Manual plane controls (trackpad-friendly)
+    # ------------------------------------------------------------------
+
+    def _on_manual_origin_change(self):
+        """Update plane position from manual spinbox input."""
+        if self._updating_controls:
+            return
+        origin = np.array([
+            self._spin_x.value(),
+            self._spin_y.value(),
+            self._spin_z.value(),
+        ])
+        self._current_plane_origin = origin
+        self._update_plane_widget_position()
+        self._update_preview()
+
+    def _on_normal_slider_change(self):
+        """Compute plane normal from elevation/azimuth sliders."""
+        if self._updating_controls:
+            return
+        elev = np.radians(self._slider_elev.value())
+        azim = np.radians(self._slider_azim.value())
+        self._current_plane_normal = np.array([
+            np.sin(elev) * np.cos(azim),
+            np.sin(elev) * np.sin(azim),
+            np.cos(elev),
+        ])
+        self._elev_label.setText(f"{self._slider_elev.value()}°")
+        self._azim_label.setText(f"{self._slider_azim.value()}°")
+        self._update_plane_widget_position()
+        self._update_preview()
+
+    def _on_normal_preset_angles(self, elev, azim):
+        """Set sliders to preset axis angles (triggers _on_normal_slider_change)."""
+        self._updating_controls = True
+        self._slider_elev.setValue(elev)
+        self._updating_controls = False
+        self._slider_azim.setValue(azim)  # this triggers the slider change
+
+    def _sync_normal_sliders_from_state(self):
+        """Convert current normal vector back to elevation/azimuth and update sliders."""
+        if self._current_plane_normal is None:
+            return
+        n = self._current_plane_normal / np.linalg.norm(self._current_plane_normal)
+        elev = int(round(np.degrees(np.arccos(np.clip(n[2], -1, 1)))))
+        azim = int(round(np.degrees(np.arctan2(n[1], n[0])))) % 360
+        self._updating_controls = True
+        self._slider_elev.setValue(elev)
+        self._slider_azim.setValue(azim)
+        self._elev_label.setText(f"{elev}°")
+        self._azim_label.setText(f"{azim}°")
+        self._updating_controls = False
+
+    def _on_nudge(self, direction):
+        """Move plane along its current normal by step amount."""
+        if self._current_plane_origin is None or self._current_plane_normal is None:
+            return
+        step = self._spin_step.value() * direction
+        n = self._current_plane_normal / np.linalg.norm(self._current_plane_normal)
+        self._current_plane_origin = self._current_plane_origin + n * step
+        self._sync_controls_from_state()
+        self._update_plane_widget_position()
+        self._update_preview()
+
+    def _update_plane_widget_position(self):
+        """Push current origin/normal to the VTK plane widget (if active)."""
+        if not self.plotter.plane_widgets:
+            return
+        widget = self.plotter.plane_widgets[-1]
+        widget.SetOrigin(*self._current_plane_origin)
+        widget.SetNormal(*self._current_plane_normal)
+        widget.UpdatePlacement()
+        self.plotter.render()
+
+    def _sync_controls_from_state(self):
+        """Update spinbox values from internal plane state (guarded against recursion)."""
+        if self._current_plane_origin is None:
+            return
+        self._updating_controls = True
+        self._spin_x.setValue(float(self._current_plane_origin[0]))
+        self._spin_y.setValue(float(self._current_plane_origin[1]))
+        self._spin_z.setValue(float(self._current_plane_origin[2]))
+        self._updating_controls = False
+        self._sync_normal_sliders_from_state()
+
+    def _show_plane_controls(self, visible: bool):
+        """Show/hide the manual plane controls panel."""
+        self._plane_controls_box.setVisible(visible)
+        if visible and self._current_plane_origin is not None:
+            self._sync_controls_from_state()
+            self._sync_normal_sliders_from_state()
 
     # ------------------------------------------------------------------
     # Confirm / store clip
