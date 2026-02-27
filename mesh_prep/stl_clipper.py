@@ -19,7 +19,7 @@ from typing import Optional
 import numpy as np
 import pyvista as pv
 import vtk
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication,
@@ -58,6 +58,26 @@ def _color_for_name(name: str) -> tuple:
     elif "outlet" in lower:
         return OUTLET_COLOR
     return DEFAULT_CAP_COLOR
+
+
+class CenterlineWorker(QThread):
+    """Background thread for VMTK centerline computation."""
+    finished = pyqtSignal(object)   # pv.PolyData
+    failed = pyqtSignal(str)        # error message
+
+    def __init__(self, surface_mesh, source_points, target_points):
+        super().__init__()
+        self.surface_mesh = surface_mesh
+        self.source_points = source_points
+        self.target_points = target_points
+
+    def run(self):
+        try:
+            from mesh_prep.centerline import compute_centerlines
+            result = compute_centerlines(self.surface_mesh, self.source_points, self.target_points)
+            self.finished.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 @dataclass
@@ -398,6 +418,10 @@ class STLClipperApp(QMainWindow):
         self._box_actor = None               # wireframe box pyvista actor (fallback)
         self._updating_box_controls = False  # recursion guard
 
+        # Centerline state
+        self._centerline_mesh = None          # pv.PolyData from VMTK
+        self._centerline_worker = None        # CenterlineWorker QThread
+
         self._build_ui()
         self._build_menu()
         self._update_button_states()
@@ -670,6 +694,16 @@ class STLClipperApp(QMainWindow):
         self.btn_export_comb.clicked.connect(self._on_export_combined)
         panel.addWidget(self.btn_export_comb)
 
+        panel.addWidget(self._separator("Centerline"))
+
+        self.btn_compute_cl = QPushButton("Compute Centerline")
+        self.btn_compute_cl.clicked.connect(self._on_compute_centerline)
+        panel.addWidget(self.btn_compute_cl)
+
+        self.btn_clear_cl = QPushButton("Clear Centerline")
+        self.btn_clear_cl.clicked.connect(self._on_clear_centerline)
+        panel.addWidget(self.btn_clear_cl)
+
         panel.addWidget(self._separator("View"))
 
         # Orthogonal view buttons — 3 rows of axis pairs
@@ -736,6 +770,13 @@ class STLClipperApp(QMainWindow):
         self.btn_export_sep.setEnabled(has_clips)
         self.btn_export_comb.setEnabled(has_clips)
 
+        # Centerline buttons
+        has_inlet = any("inlet" in c.name.lower() for c in self.engine.clips)
+        has_outlet = any("outlet" in c.name.lower() for c in self.engine.clips)
+        computing = self._centerline_worker is not None and self._centerline_worker.isRunning()
+        self.btn_compute_cl.setEnabled(has_inlet and has_outlet and not computing)
+        self.btn_clear_cl.setEnabled(self._centerline_mesh is not None)
+
     # ------------------------------------------------------------------
     # Load
     # ------------------------------------------------------------------
@@ -756,6 +797,8 @@ class STLClipperApp(QMainWindow):
 
         self._loaded_filepath = filepath
         self._cancel_clip_widgets()
+        self._centerline_mesh = None
+        self._centerline_worker = None
         self._refresh_display()
 
         fname = os.path.basename(filepath)
@@ -1499,6 +1542,7 @@ class STLClipperApp(QMainWindow):
             QMessageBox.warning(self, "Duplicate Name", f"'{new_name}' is already used.")
             return
         self.engine.rename_clip(row, new_name)
+        self._centerline_mesh = None  # invalidate — inlet/outlet classification may have changed
         self._refresh_patch_list()
         self._refresh_display()
         self._update_status()
@@ -1514,6 +1558,7 @@ class STLClipperApp(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.engine.remove_clip(row)
+            self._centerline_mesh = None  # invalidate — clip set changed
             self._refresh_display()
             self._refresh_patch_list()
             self._update_status()
@@ -1528,6 +1573,66 @@ class STLClipperApp(QMainWindow):
             item.setForeground(Qt.black)
             item.setBackground(QColor(r, g, b, 60))
             self.patch_list.addItem(item)
+
+    # ------------------------------------------------------------------
+    # Centerline
+    # ------------------------------------------------------------------
+
+    def _on_compute_centerline(self):
+        """Collect inlet/outlet points and launch VMTK in a background thread."""
+        clips = self.engine.clips
+        source_points = [c.origin.tolist() for c in clips if "inlet" in c.name.lower()]
+        target_points = [c.origin.tolist() for c in clips if "outlet" in c.name.lower()]
+
+        if not source_points or not target_points:
+            QMessageBox.warning(self, "Centerline Error",
+                                "Need at least one clip named 'inlet' and one named 'outlet'.")
+            return
+
+        # Build watertight surface from clipped wall + cap patches
+        # (instead of original_mesh, which extends past clip planes)
+        wall = self.engine.get_wall_mesh()
+        if wall is None or wall.n_cells == 0:
+            return
+
+        parts = [wall]
+        for c in self.engine.clips:
+            if c.cap_mesh is not None and c.cap_mesh.n_cells > 0:
+                parts.append(c.cap_mesh)
+
+        surface = parts[0]
+        for p in parts[1:]:
+            surface = surface.merge(p)
+        surface = surface.clean()
+
+        worker = CenterlineWorker(surface, source_points, target_points)
+        worker.finished.connect(self._on_centerline_finished)
+        worker.failed.connect(self._on_centerline_failed)
+        self._centerline_worker = worker
+        worker.start()
+        self.status.showMessage("Computing centerline...")
+        self._update_button_states()
+
+    def _on_centerline_finished(self, result):
+        """Slot: VMTK computation succeeded."""
+        self._centerline_mesh = result
+        self._centerline_worker = None
+        self._refresh_display()
+        self._update_button_states()
+        self.status.showMessage("Centerline computed successfully.")
+
+    def _on_centerline_failed(self, error_msg):
+        """Slot: VMTK computation failed."""
+        self._centerline_worker = None
+        QMessageBox.warning(self, "Centerline Error", error_msg)
+        self._update_button_states()
+
+    def _on_clear_centerline(self):
+        """Remove the computed centerline from the display."""
+        self._centerline_mesh = None
+        self._refresh_display()
+        self._update_button_states()
+        self.status.showMessage("Centerline cleared.")
 
     # ------------------------------------------------------------------
     # Display
@@ -1555,6 +1660,14 @@ class STLClipperApp(QMainWindow):
                     show_edges=True, edge_color="white", line_width=2,
                     name=f"cap_{clip_def.name}",
                 )
+
+        # Centerline — yellow tube
+        if self._centerline_mesh is not None and self._centerline_mesh.n_cells > 0:
+            tube = self._centerline_mesh.tube(radius=0.3)
+            self.plotter.add_mesh(
+                tube, color="yellow", opacity=1.0,
+                name="centerline",
+            )
 
         self.plotter.reset_camera()
         self.plotter.render()
