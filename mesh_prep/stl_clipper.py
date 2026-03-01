@@ -11,8 +11,10 @@ Usage:
 """
 
 import json
+import logging
 import os
 import sys
+import types
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -42,6 +44,8 @@ from PyQt5.QtWidgets import (
 )
 from pyvistaqt import QtInteractor
 
+logger = logging.getLogger(__name__)
+
 # Name-based cap colors for semantic identification
 INLET_COLOR = (0.9, 0.2, 0.2)       # red
 OUTLET_COLOR = (0.2, 0.4, 0.9)      # blue
@@ -63,20 +67,20 @@ def _color_for_name(name: str) -> tuple:
 
 class CenterlineWorker(QThread):
     """Background thread for VMTK centerline computation."""
-    finished = pyqtSignal(object)   # pv.PolyData
-    failed = pyqtSignal(str)        # error message
+    result_ready = pyqtSignal(object)   # pv.PolyData
+    failed = pyqtSignal(str)            # error message
 
-    def __init__(self, surface_mesh, source_points, target_points):
+    def __init__(self, surface_mesh, source_ids, target_ids):
         super().__init__()
         self.surface_mesh = surface_mesh
-        self.source_points = source_points
-        self.target_points = target_points
+        self.source_ids = source_ids
+        self.target_ids = target_ids
 
     def run(self):
         try:
             from mesh_prep.centerline import compute_centerlines
-            result = compute_centerlines(self.surface_mesh, self.source_points, self.target_points)
-            self.finished.emit(result)
+            result = compute_centerlines(self.surface_mesh, self.source_ids, self.target_ids)
+            self.result_ready.emit(result)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -741,6 +745,8 @@ class STLClipperApp(QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("Ready — load an STL file to begin.")
 
+        self._patch_dpr_picking()
+
     def _build_menu(self):
         menu = self.menuBar()
         file_menu = menu.addMenu("File")
@@ -751,6 +757,54 @@ class STLClipperApp(QMainWindow):
         file_menu.addAction("Export Combined STL...", self._on_export_combined)
         file_menu.addSeparator()
         file_menu.addAction("Quit", self.close)
+
+    def _patch_dpr_picking(self):
+        """Fix macOS Retina DPR mismatch for VTK widget picking.
+
+        pyvistaqt scales mouse coords by device-pixel-ratio before passing
+        them to VTK, but vtkCocoaRenderWindow reports size in logical pixels.
+        This makes widget pickers (plane, box) receive physical-pixel coords
+        against a logical-pixel viewport — the pick ray misses.  Patch the
+        interactor to keep everything in logical-pixel space.
+        """
+        interactor = self.plotter.interactor
+
+        def _patched_setEventInformation(
+            self, x, y, ctrl, shift, key, repeat=0, keysum=None
+        ):
+            self._Iren.SetEventInformation(
+                int(round(x)),
+                int(round(self.height() - y - 1)),
+                ctrl, shift, key, repeat, keysum,
+            )
+
+        def _patched_resizeEvent(self, ev):
+            w = self.width()
+            h = self.height()
+            if self._RenderWindow is None:
+                return
+            self._RenderWindow.SetDPI(72)
+            vtk.vtkRenderWindow.SetSize(self._RenderWindow, w, h)
+            self._Iren.SetSize(w, h)
+            self._Iren.ConfigureEvent()
+            self.update()
+
+        interactor._setEventInformation = types.MethodType(
+            _patched_setEventInformation, interactor
+        )
+        interactor.resizeEvent = types.MethodType(
+            _patched_resizeEvent, interactor
+        )
+
+        # Force a resize so VTK picks up the corrected dimensions now
+        from PyQt5.QtGui import QResizeEvent
+        from PyQt5.QtCore import QSize
+        interactor.resizeEvent(
+            QResizeEvent(
+                QSize(interactor.width(), interactor.height()),
+                QSize(interactor.width(), interactor.height()),
+            )
+        )
 
     @staticmethod
     def _separator(label: str) -> QLabel:
@@ -1585,53 +1639,86 @@ class STLClipperApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_compute_centerline(self):
-        """Collect inlet/outlet points and launch VMTK in a background thread."""
+        """Discover open profiles, map to inlet/outlet, launch VMTK with profileidlist."""
         clips = self.engine.clips
-        source_points = [c.origin.tolist() for c in clips if "inlet" in c.name.lower()]
-        target_points = [c.origin.tolist() for c in clips if "outlet" in c.name.lower()]
+        inlet_clips = [c for c in clips if "inlet" in c.name.lower()]
+        outlet_clips = [c for c in clips if "outlet" in c.name.lower()]
 
-        if not source_points or not target_points:
+        if not inlet_clips or not outlet_clips:
             QMessageBox.warning(self, "Centerline Error",
                                 "Need at least one clip named 'inlet' and one named 'outlet'.")
             return
 
-        # Build watertight surface from clipped wall + cap patches
-        # (instead of original_mesh, which extends past clip planes)
         wall = self.engine.get_wall_mesh()
         if wall is None or wall.n_cells == 0:
             return
 
-        parts = [wall]
-        for c in self.engine.clips:
-            if c.cap_mesh is not None and c.cap_mesh.n_cells > 0:
-                parts.append(c.cap_mesh)
+        # Discover open-profile centers using the same capper vmtkCenterlines uses internally
+        from vmtk import vtkvmtk
+        capper = vtkvmtk.vtkvmtkCapPolyData()
+        capper.SetInputData(wall)
+        capper.SetDisplacement(0)
+        capper.SetInPlaneDisplacement(0)
+        capper.Update()
+        capped = capper.GetOutput()
+        cap_center_ids = capper.GetCapCenterIds()
 
-        surface = parts[0]
-        for p in parts[1:]:
-            surface = surface.merge(p)
-        surface = surface.clean()
+        n_caps = cap_center_ids.GetNumberOfIds()
+        logger.info("Open profiles detected: %d", n_caps)
 
-        worker = CenterlineWorker(surface, source_points, target_points)
-        worker.finished.connect(self._on_centerline_finished)
+        # Match each cap center to nearest inlet/outlet clip origin
+        source_ids, target_ids = [], []
+        for i in range(n_caps):
+            pt = np.array(capped.GetPoint(cap_center_ids.GetId(i)))
+            d_in = min((np.linalg.norm(pt - c.origin) for c in inlet_clips), default=float("inf"))
+            d_out = min((np.linalg.norm(pt - c.origin) for c in outlet_clips), default=float("inf"))
+            if d_in <= d_out:
+                source_ids.append(i)
+            else:
+                target_ids.append(i)
+        logger.info("Profile mapping: source_ids=%s, target_ids=%s", source_ids, target_ids)
+
+        if not source_ids or not target_ids:
+            QMessageBox.warning(self, "Centerline Error",
+                                "Could not map open profiles to inlet/outlet clips.")
+            return
+
+        # Pass the OPEN wall mesh — vmtkCenterlines with profileidlist caps internally
+        worker = CenterlineWorker(wall, source_ids, target_ids)
+        worker.result_ready.connect(self._on_centerline_finished)
         worker.failed.connect(self._on_centerline_failed)
+        worker.finished.connect(self._cleanup_centerline_worker)  # QThread built-in
         self._centerline_worker = worker
         worker.start()
         self.status.showMessage("Computing centerline...")
         self._update_button_states()
 
     def _on_centerline_finished(self, result):
-        """Slot: VMTK computation succeeded."""
+        """Slot: VMTK computation succeeded (result_ready signal)."""
+        logger.info("Centerline finished — result: n_points=%s, n_cells=%s",
+                     result.n_points if result is not None else None,
+                     result.n_cells if result is not None else None)
+        if result is None or result.n_points == 0:
+            QMessageBox.warning(self, "Centerline Warning",
+                                "VMTK returned an empty centerline — seed points may be unreachable.")
+            self.status.showMessage("Centerline computation returned empty result.")
+            return
+        logger.info("Storing centerline mesh (%d points, %d cells)",
+                     result.n_points, result.n_cells)
         self._centerline_mesh = result
-        self._centerline_worker = None
         self._refresh_display()
         self._update_button_states()
         self.status.showMessage("Centerline computed successfully.")
 
     def _on_centerline_failed(self, error_msg):
         """Slot: VMTK computation failed."""
-        self._centerline_worker = None
+        logger.error("Centerline failed: %s", error_msg)
         QMessageBox.warning(self, "Centerline Error", error_msg)
         self._update_button_states()
+
+    def _cleanup_centerline_worker(self):
+        """Slot: QThread.finished — safe to release the worker now."""
+        self._centerline_worker = None
 
     def _on_clear_centerline(self):
         """Remove the computed centerline from the display."""
@@ -1668,12 +1755,24 @@ class STLClipperApp(QMainWindow):
                 )
 
         # Centerline — yellow tube
-        if self._centerline_mesh is not None and self._centerline_mesh.n_cells > 0:
+        has_cl = self._centerline_mesh is not None and self._centerline_mesh.n_points > 0
+        logger.debug("Refresh display: _centerline_mesh exists=%s, n_points=%s, n_cells=%s",
+                      self._centerline_mesh is not None,
+                      self._centerline_mesh.n_points if self._centerline_mesh is not None else 0,
+                      self._centerline_mesh.n_cells if self._centerline_mesh is not None else 0)
+        if has_cl:
             tube = self._centerline_mesh.tube(radius=0.3)
-            self.plotter.add_mesh(
-                tube, color="yellow", opacity=1.0,
-                name="centerline",
-            )
+            logger.debug("Tube generated: n_points=%s, n_cells=%s",
+                          tube.n_points if tube is not None else None,
+                          tube.n_cells if tube is not None else None)
+            if tube is not None and tube.n_points > 0:
+                self.plotter.add_mesh(
+                    tube, color="yellow", opacity=1.0,
+                    name="centerline",
+                )
+                logger.info("Centerline tube added to plotter")
+            else:
+                logger.warning("Tube generation produced empty mesh — centerline not rendered")
 
         self.plotter.reset_camera()
         self.plotter.render()
@@ -1817,6 +1916,11 @@ class STLClipperApp(QMainWindow):
 
 
 def main():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+
     app = QApplication.instance() or QApplication(sys.argv)
 
     initial_file = sys.argv[1] if len(sys.argv) > 1 else None
