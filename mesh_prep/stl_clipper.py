@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+
+from . import openfoam_case
 import pyvista as pv
 import vtk
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -38,6 +40,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSplitter,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -382,6 +385,175 @@ class STLClipperEngine:
 
         return {"stl_path": stl_path, "planes_path": planes_path}
 
+    def export_openfoam_case(
+        self,
+        case_dir: str,
+        stl_filename: str,
+        centerline_mesh=None,
+    ) -> dict:
+        """Export a complete OpenFOAM LES case directory.
+
+        Calls the existing ``export_openfoam`` for STL + clip_planes.json,
+        then generates all solver dictionaries, BCs, and run scripts via
+        the ``openfoam_case`` module.
+
+        Parameters
+        ----------
+        case_dir : str
+            Root of the OpenFOAM case directory.
+        stl_filename : str
+            STL file name (written into constant/triSurface/).
+        centerline_mesh : pyvista.PolyData, optional
+            Centerline polyline — its midpoint is used as locationInMesh.
+
+        Returns
+        -------
+        dict
+            Paths of all written files, keyed by category.
+        """
+        # 1. Existing export: STL + clip_planes.json
+        base_result = self.export_openfoam(case_dir, stl_filename)
+
+        # 2. Compute locationInMesh
+        if centerline_mesh is not None and centerline_mesh.n_points > 0:
+            mid_idx = centerline_mesh.n_points // 2
+            location_in_mesh = tuple(centerline_mesh.points[mid_idx])
+        else:
+            bounds = self.original_mesh.bounds
+            cx = (bounds[0] + bounds[1]) / 2.0
+            cy = (bounds[2] + bounds[3]) / 2.0
+            cz = (bounds[4] + bounds[5]) / 2.0
+            # Shift slightly along shortest axis to avoid landing on a face
+            dx = bounds[1] - bounds[0]
+            dy = bounds[3] - bounds[2]
+            dz = bounds[5] - bounds[4]
+            shortest = min(dx, dy, dz) or 1.0
+            if shortest == dx:
+                cx += 0.01 * dx
+            elif shortest == dy:
+                cy += 0.01 * dy
+            else:
+                cz += 0.01 * dz
+            location_in_mesh = (cx, cy, cz)
+
+        # 3. Collect patch metadata
+        stl_stem = stl_filename.rsplit(".", 1)[0] if "." in stl_filename else stl_filename
+        patch_names = [c.name for c in self.clips] + ["wall"]
+        inlet_normals = {
+            c.name: tuple(-c.normal)    # Flip to STL/CFD convention: outward-pointing
+            for c in self.clips
+            if "inlet" in c.name.lower()
+        }
+        bounds = self.original_mesh.bounds
+
+        # 4. Create subdirectories
+        dirs = {
+            "system": os.path.join(case_dir, "system"),
+            "constant": os.path.join(case_dir, "constant"),
+            "zero": os.path.join(case_dir, "0"),
+        }
+        for d in dirs.values():
+            os.makedirs(d, exist_ok=True)
+
+        written = dict(base_result)
+
+        # 5. Write system/ dictionaries
+        system_files = {
+            "blockMeshDict": openfoam_case.generate_block_mesh_dict(bounds),
+            "snappyHexMeshDict": openfoam_case.generate_snappy_hex_mesh_dict(
+                stl_filename, patch_names, location_in_mesh,
+            ),
+            "meshQualityDict": openfoam_case.generate_mesh_quality_dict(),
+            "controlDict": openfoam_case.generate_control_dict(
+                outlet_patches=[
+                    c.name for c in self.clips if "outlet" in c.name.lower()
+                ],
+                geo_name=stl_stem,
+            ),
+            "fvSchemes": openfoam_case.generate_fv_schemes(),
+            "fvSolution": openfoam_case.generate_fv_solution(),
+            "decomposeParDict": openfoam_case.generate_decompose_par_dict(),
+        }
+        for name, content in system_files.items():
+            path = os.path.join(dirs["system"], name)
+            with open(path, "w") as f:
+                f.write(content)
+            written[name] = path
+
+        # 6. Write constant/ dictionaries
+        const_files = {
+            "transportProperties": openfoam_case.generate_transport_properties(),
+            "turbulenceProperties": openfoam_case.generate_turbulence_properties(),
+        }
+        for name, content in const_files.items():
+            path = os.path.join(dirs["constant"], name)
+            with open(path, "w") as f:
+                f.write(content)
+            written[name] = path
+
+        # massFlowRate.csv
+        csv_path = os.path.join(dirs["constant"], "massFlowRate.csv")
+        with open(csv_path, "w") as f:
+            f.write(openfoam_case.generate_mass_flow_rate_csv())
+        written["massFlowRate.csv"] = csv_path
+
+        # 7. Write 0/ boundary conditions
+        bc_files = {
+            "p": openfoam_case.generate_p(patch_names, geo_name=stl_stem),
+            "U": openfoam_case.generate_U(patch_names, inlet_normals, geo_name=stl_stem),
+            "nut": openfoam_case.generate_nut(patch_names, geo_name=stl_stem),
+        }
+        for name, content in bc_files.items():
+            path = os.path.join(dirs["zero"], name)
+            with open(path, "w") as f:
+                f.write(content)
+            written[name] = path
+
+        # 8. Write shell scripts (executable)
+        scripts = {
+            "env.sh": openfoam_case.generate_env_sh(),
+            "Allrun": openfoam_case.generate_allrun(),
+            "Allclean": openfoam_case.generate_allclean(),
+        }
+        for name, content in scripts.items():
+            path = os.path.join(case_dir, name)
+            with open(path, "w") as f:
+                f.write(content)
+            os.chmod(path, 0o755)
+            written[name] = path
+
+        # 9. ParaView visualization: .foam file + visualize.py
+        foam_path = os.path.join(case_dir, f"{stl_stem}.foam")
+        open(foam_path, "w").close()  # empty file — ParaView convention
+        written[".foam"] = foam_path
+
+        clips_data = [
+            {
+                "name": c.name,
+                "origin": tuple(float(v) for v in c.origin),
+                "normal": tuple(float(v) for v in c.normal),
+            }
+            for c in self.clips
+        ]
+        viz_content = openfoam_case.generate_visualize_py(stl_filename, clips_data)
+        viz_path = os.path.join(case_dir, "visualize.py")
+        with open(viz_path, "w") as f:
+            f.write(viz_content)
+        os.chmod(viz_path, 0o755)
+        written["visualize.py"] = viz_path
+
+        # diagnose_patches.py
+        diag_content = openfoam_case.generate_diagnose_patches_py(
+            stl_filename, patch_names, inlet_normals, geo_name=stl_stem,
+        )
+        diag_path = os.path.join(case_dir, "diagnose_patches.py")
+        with open(diag_path, "w") as f:
+            f.write(diag_content)
+        os.chmod(diag_path, 0o755)
+        written["diagnose_patches.py"] = diag_path
+
+        return written
+
     def export_separate_stl(self, output_dir: str):
         """Write one STL file per patch into output_dir."""
         os.makedirs(output_dir, exist_ok=True)
@@ -446,16 +618,25 @@ class STLClipperApp(QMainWindow):
         # 3D viewport
         self.plotter = QtInteractor(central)
         self.plotter.set_background("black")
-        layout.addWidget(self.plotter.interactor, stretch=3)
 
         # Control panel (scrollable so widgets aren't squished on resize)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(220)
         panel_widget = QWidget()
         panel = QVBoxLayout(panel_widget)
         scroll.setWidget(panel_widget)
-        layout.addWidget(scroll, stretch=1)
+
+        # Draggable splitter between viewport and panel
+        splitter = QSplitter(Qt.Horizontal, central)
+        splitter.addWidget(self.plotter.interactor)
+        splitter.addWidget(scroll)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        layout.addWidget(splitter)
 
         # --- Load ---
         self.btn_load = QPushButton("Load STL...")
@@ -714,6 +895,10 @@ class STLClipperApp(QMainWindow):
         self.btn_clear_cl.clicked.connect(self._on_clear_centerline)
         panel.addWidget(self.btn_clear_cl)
 
+        self.btn_save_cl = QPushButton("Save Centerline")
+        self.btn_save_cl.clicked.connect(self._on_save_centerline)
+        panel.addWidget(self.btn_save_cl)
+
         panel.addWidget(self._separator("View"))
 
         # Orthogonal view buttons — 3 rows of axis pairs
@@ -836,6 +1021,7 @@ class STLClipperApp(QMainWindow):
         computing = self._centerline_worker is not None and self._centerline_worker.isRunning()
         self.btn_compute_cl.setEnabled(has_inlet and has_outlet and not computing)
         self.btn_clear_cl.setEnabled(self._centerline_mesh is not None)
+        self.btn_save_cl.setEnabled(self._centerline_mesh is not None)
 
     # ------------------------------------------------------------------
     # Load
@@ -1720,6 +1906,23 @@ class STLClipperApp(QMainWindow):
         """Slot: QThread.finished — safe to release the worker now."""
         self._centerline_worker = None
 
+    def _on_save_centerline(self):
+        """Export the computed centerline to the case directory."""
+        if self._centerline_mesh is None:
+            return
+        case_dir = self._get_or_create_case_dir()
+        if not case_dir:
+            return
+        filepath = os.path.join(case_dir, "centerline.vtp")
+        try:
+            self._centerline_mesh.save(filepath)
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Centerline saved to:\n{filepath}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
     def _on_clear_centerline(self):
         """Remove the computed centerline from the display."""
         self._centerline_mesh = None
@@ -1903,13 +2106,29 @@ class STLClipperApp(QMainWindow):
             return
         stl_filename = os.path.basename(self._loaded_filepath)
         try:
-            result = self.engine.export_openfoam(case_dir, stl_filename)
+            result = self.engine.export_openfoam_case(
+                case_dir, stl_filename, self._centerline_mesh,
+            )
             patches = ", ".join(c.name for c in self.engine.clips) + ", wall"
+            # Summarise generated files by category
+            bc_files = [k for k in ("p", "U", "nut") if k in result]
+            system_files = [
+                k for k in result
+                if k not in ("stl_path", "planes_path", "p", "U", "nut",
+                             "transportProperties", "turbulenceProperties",
+                             "massFlowRate.csv", "env.sh", "Allrun", "Allclean",
+                             ".foam", "visualize.py")
+            ]
             QMessageBox.information(
-                self, "OpenFOAM Export Complete",
-                f"Multi-solid STL:\n{result['stl_path']}\n\n"
-                f"Clip planes JSON:\n{result['planes_path']}\n\n"
-                f"Patches: {patches}",
+                self, "OpenFOAM Case Export Complete",
+                f"Case directory: {case_dir}\n\n"
+                f"Patches: {patches}\n\n"
+                f"Boundary conditions (0/): {', '.join(bc_files)}\n"
+                f"System dictionaries: {', '.join(system_files)}\n"
+                f"Scripts: Allrun, Allclean, env.sh\n"
+                f"ParaView: visualize.py, .foam file\n\n"
+                f"Run: source env.sh && ./Allrun\n"
+                f"View: pvpython visualize.py",
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
