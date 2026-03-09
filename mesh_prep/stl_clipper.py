@@ -13,7 +13,9 @@ Usage:
 import json
 import logging
 import os
+import subprocess
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from typing import Optional
@@ -23,10 +25,11 @@ import numpy as np
 from . import openfoam_case
 import pyvista as pv
 import vtk
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
@@ -37,11 +40,14 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -73,19 +79,119 @@ class CenterlineWorker(QThread):
     result_ready = pyqtSignal(object)   # pv.PolyData
     failed = pyqtSignal(str)            # error message
 
-    def __init__(self, surface_mesh, source_ids, target_ids):
+    def __init__(self, surface_mesh, source_points, target_points):
         super().__init__()
         self.surface_mesh = surface_mesh
-        self.source_ids = source_ids
-        self.target_ids = target_ids
+        self.source_points = source_points
+        self.target_points = target_points
 
     def run(self):
         try:
             from mesh_prep.centerline import compute_centerlines
-            result = compute_centerlines(self.surface_mesh, self.source_ids, self.target_ids)
+            result = compute_centerlines(self.surface_mesh, self.source_points, self.target_points)
             self.result_ready.emit(result)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+# Container names used by run_docker.sh (must match generate_run_docker_sh)
+_DOCKER_CONTAINERS = [
+    "meshprep-pmesh", "meshprep-checkmesh", "meshprep-decompose",
+    "meshprep-solver", "meshprep-reconstruct",
+]
+
+# Stage markers emitted by run_docker.sh (echo "=== <text> ===")
+_STAGE_MARKERS = {
+    "Running pMesh": "pMesh",
+    "Running checkMesh": "checkMesh",
+    "Decomposing mesh": "decomposePar",
+    "Running pimpleFoam": "pimpleFoam",
+    "Reconstructing": "reconstructPar",
+    "Pulling Docker": "docker pull",
+    "Done": "Done",
+}
+
+
+class OpenFOAMWorker(QThread):
+    """Background thread that runs run_docker.sh and streams output."""
+
+    log_line = pyqtSignal(str)           # batched log text
+    stage_changed = pyqtSignal(str)      # current pipeline stage
+    finished_ok = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    _BATCH_INTERVAL = 0.1  # seconds between line-batch emissions
+
+    def __init__(self, case_dir: str, nprocs: int):
+        super().__init__()
+        self._case_dir = case_dir
+        self._nprocs = nprocs
+        self._cancel = False
+        self._process = None  # type: Optional[subprocess.Popen]
+
+    def cancel(self):
+        """Request cancellation: stop Docker containers then terminate bash."""
+        self._cancel = True
+        # Stop any running Docker container
+        try:
+            subprocess.run(
+                ["docker", "stop"] + _DOCKER_CONTAINERS,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except Exception:
+            pass
+        # Terminate the bash process
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+
+    def run(self):
+        script = os.path.join(self._case_dir, "run_docker.sh")
+        try:
+            self._process = subprocess.Popen(
+                ["bash", script, str(self._nprocs)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=self._case_dir,
+            )
+        except Exception as e:
+            self.failed.emit(f"Failed to start: {e}")
+            return
+
+        batch = []
+        last_emit = time.monotonic()
+        for raw_line in self._process.stdout:
+            if self._cancel:
+                break
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+
+            # Detect stage changes from echo markers
+            for marker, stage in _STAGE_MARKERS.items():
+                if marker in line:
+                    self.stage_changed.emit(stage)
+                    break
+
+            batch.append(line)
+            now = time.monotonic()
+            if now - last_emit >= self._BATCH_INTERVAL:
+                self.log_line.emit("\n".join(batch))
+                batch.clear()
+                last_emit = now
+
+        # Flush remaining lines
+        if batch:
+            self.log_line.emit("\n".join(batch))
+
+        self._process.stdout.close()
+        rc = self._process.wait()
+        self._process = None
+
+        if self._cancel:
+            self.failed.emit("Cancelled by user")
+        elif rc != 0:
+            self.failed.emit(f"run_docker.sh exited with code {rc}")
+        else:
+            self.finished_ok.emit()
 
 
 @dataclass
@@ -302,12 +408,97 @@ class STLClipperEngine:
     def get_wall_mesh(self) -> Optional[pv.PolyData]:
         return self._wall_mesh
 
+    def geometry_quality(self) -> dict:
+        """Return geometry quality metrics for the current wall mesh."""
+        wall = self._wall_mesh
+        if wall is None or wall.n_cells == 0:
+            return {"open_edges": 0, "open_profiles": 0, "boundary_mesh": None}
+
+        boundary = wall.extract_feature_edges(
+            boundary_edges=True, feature_edges=False,
+            manifold_edges=False, non_manifold_edges=False,
+        )
+        n_open_edges = boundary.n_cells if boundary else 0
+
+        if n_open_edges > 0 and boundary.n_cells > 0:
+            connected = boundary.connectivity()
+            n_profiles = int(connected["RegionId"].max()) + 1
+        else:
+            n_profiles = 0
+
+        # Combined manifold check: wall + all caps, tolerance merge
+        if self.clips:
+            combined = wall.copy()
+            for clip_def in self.clips:
+                if clip_def.cap_mesh and clip_def.cap_mesh.n_cells > 0:
+                    combined = combined.merge(clip_def.cap_mesh)
+            mesh_diag = np.linalg.norm(
+                np.ptp(np.array(wall.bounds).reshape(3, 2), axis=1)
+            )
+            combined = combined.clean(tolerance=mesh_diag * 1e-6)
+
+            non_manifold = combined.extract_feature_edges(
+                boundary_edges=False, feature_edges=False,
+                manifold_edges=False, non_manifold_edges=True,
+            )
+            n_nm = non_manifold.n_cells
+            is_mf = combined.is_manifold
+        else:
+            # No clips yet — check original mesh for defects only
+            non_manifold = wall.extract_feature_edges(
+                boundary_edges=False, feature_edges=False,
+                manifold_edges=False, non_manifold_edges=True,
+            )
+            n_nm = non_manifold.n_cells
+            is_mf = None  # indeterminate without caps
+
+        return {
+            "open_edges": n_open_edges,
+            "open_profiles": n_profiles,
+            "boundary_mesh": boundary,
+            "non_manifold_edges": n_nm,
+            "is_manifold": is_mf,
+            "non_manifold_mesh": non_manifold,
+        }
+
+    # ------------------------------------------------------------------
+    # Repair
+    # ------------------------------------------------------------------
+
+    def _apply_repair(self, repaired_mesh) -> None:
+        """Replace original mesh with repaired version, clear all clips."""
+        self.original_mesh = repaired_mesh
+        self.clips.clear()
+        self._wall_mesh = repaired_mesh.copy()
+
+    def repair_clean(self) -> str:
+        """Remove duplicate points and degenerate triangles from original mesh."""
+        if self.original_mesh is None:
+            return "No mesh loaded."
+        before = self.original_mesh.n_cells
+        repaired = self.original_mesh.clean()
+        after = repaired.n_cells
+        self._apply_repair(repaired)
+        return f"Cleaned: {before} \u2192 {after} faces ({before - after} removed)"
+
+    def repair_normals(self) -> str:
+        """Fix inconsistent face normals on original mesh."""
+        if self.original_mesh is None:
+            return "No mesh loaded."
+        repaired = self.original_mesh.compute_normals(
+            cell_normals=False, point_normals=True,
+            split_vertices=False, consistent_normals=True,
+            auto_orient_normals=False,
+        )
+        self._apply_repair(repaired)
+        return "Normals fixed (consistent winding)"
+
     # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _polydata_to_ascii_stl_block(mesh: pv.PolyData, solid_name: str) -> str:
+    def _polydata_to_ascii_stl_block(mesh: pv.PolyData, solid_name: str, scale_factor: float = 1.0) -> str:
         """Convert a PolyData to an ASCII STL solid block."""
         if mesh is None or mesh.n_cells == 0:
             return f"solid {solid_name}\nendsolid {solid_name}\n"
@@ -317,8 +508,8 @@ class STLClipperEngine:
         tri.compute_normals(cell_normals=True, point_normals=False, inplace=True)
 
         lines = [f"solid {solid_name}"]
-        normals = tri.cell_normals
-        points = tri.points
+        normals = tri.cell_normals  # unit vectors — do NOT scale
+        points = tri.points * scale_factor
         # Extract face connectivity
         faces = tri.faces
         idx = 0
@@ -343,17 +534,17 @@ class STLClipperEngine:
         lines.append(f"endsolid {solid_name}")
         return "\n".join(lines) + "\n"
 
-    def export_combined_stl(self, filepath: str):
+    def export_combined_stl(self, filepath: str, scale_factor: float = 1.0):
         """Write a single ASCII STL with multiple solid blocks."""
         blocks = []
         for clip_def in self.clips:
-            blocks.append(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name))
-        blocks.append(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall"))
+            blocks.append(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name, scale_factor))
+        blocks.append(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall", scale_factor))
         with open(filepath, "w") as f:
             f.write("".join(blocks))
 
     def export_clip_planes(self, filepath: str):
-        """Save clip plane origins and normals as JSON for VMTK centerline generation."""
+        """Save clip plane origins and normals as JSON."""
         data = {
             "clips": [
                 {
@@ -367,7 +558,7 @@ class STLClipperEngine:
         with open(filepath, "w") as f:
             json.dump(data, f, indent=2)
 
-    def export_openfoam(self, case_dir: str, stl_filename: str) -> dict:
+    def export_openfoam(self, case_dir: str, stl_filename: str, scale_factor: float = 1.0) -> dict:
         """
         Export for OpenFOAM: multi-solid STL to case_dir/constant/triSurface/
         and clip plane data as JSON to case_dir/.
@@ -378,7 +569,7 @@ class STLClipperEngine:
         os.makedirs(tri_dir, exist_ok=True)
 
         stl_path = os.path.join(tri_dir, stl_filename)
-        self.export_combined_stl(stl_path)
+        self.export_combined_stl(stl_path, scale_factor)
 
         planes_path = os.path.join(case_dir, "clip_planes.json")
         self.export_clip_planes(planes_path)
@@ -390,12 +581,15 @@ class STLClipperEngine:
         case_dir: str,
         stl_filename: str,
         centerline_mesh=None,
+        scale_factor: float = 1.0,
+        template_params: dict = None,
     ) -> dict:
-        """Export a complete OpenFOAM LES case directory.
+        """Export a complete OpenFOAM LES case directory for cfMesh pMesh.
 
-        Calls the existing ``export_openfoam`` for STL + clip_planes.json,
-        then generates all solver dictionaries, BCs, and run scripts via
-        the ``openfoam_case`` module.
+        Writes the multi-solid STL to ``constant/triSurface/``, generates
+        ``system/meshDict`` for cfMesh pMesh, and ``run_docker.sh`` for
+        Docker-based meshing + solving.  pMesh creates patch names directly
+        from STL solid names (no geometry prefix).
 
         Parameters
         ----------
@@ -404,39 +598,23 @@ class STLClipperEngine:
         stl_filename : str
             STL file name (written into constant/triSurface/).
         centerline_mesh : pyvista.PolyData, optional
-            Centerline polyline — its midpoint is used as locationInMesh.
+            Centerline polyline (kept for API compatibility).
+        template_params : dict, optional
+            When provided, overrides default generator values and copies static
+            template files.  Keys: mesh, solver, fluid, turbulence, inlet,
+            decompose (mirrors config.json structure).
 
         Returns
         -------
         dict
             Paths of all written files, keyed by category.
         """
+        import shutil
+
         # 1. Existing export: STL + clip_planes.json
-        base_result = self.export_openfoam(case_dir, stl_filename)
+        base_result = self.export_openfoam(case_dir, stl_filename, scale_factor)
 
-        # 2. Compute locationInMesh
-        if centerline_mesh is not None and centerline_mesh.n_points > 0:
-            mid_idx = centerline_mesh.n_points // 2
-            location_in_mesh = tuple(centerline_mesh.points[mid_idx])
-        else:
-            bounds = self.original_mesh.bounds
-            cx = (bounds[0] + bounds[1]) / 2.0
-            cy = (bounds[2] + bounds[3]) / 2.0
-            cz = (bounds[4] + bounds[5]) / 2.0
-            # Shift slightly along shortest axis to avoid landing on a face
-            dx = bounds[1] - bounds[0]
-            dy = bounds[3] - bounds[2]
-            dz = bounds[5] - bounds[4]
-            shortest = min(dx, dy, dz) or 1.0
-            if shortest == dx:
-                cx += 0.01 * dx
-            elif shortest == dy:
-                cy += 0.01 * dy
-            else:
-                cz += 0.01 * dz
-            location_in_mesh = (cx, cy, cz)
-
-        # 3. Collect patch metadata
+        # 2. Collect patch metadata
         stl_stem = stl_filename.rsplit(".", 1)[0] if "." in stl_filename else stl_filename
         patch_names = [c.name for c in self.clips] + ["wall"]
         inlet_normals = {
@@ -444,9 +622,8 @@ class STLClipperEngine:
             for c in self.clips
             if "inlet" in c.name.lower()
         }
-        bounds = self.original_mesh.bounds
 
-        # 4. Create subdirectories
+        # 3. Create subdirectories
         dirs = {
             "system": os.path.join(case_dir, "system"),
             "constant": os.path.join(case_dir, "constant"),
@@ -457,33 +634,71 @@ class STLClipperEngine:
 
         written = dict(base_result)
 
-        # 5. Write system/ dictionaries
+        # Extract template params (or empty dicts for backward compat)
+        p = template_params or {}
+        mesh_p = p.get("mesh", {})
+        solver_p = p.get("solver", {})
+        fluid_p = p.get("fluid", {})
+        turb_p = p.get("turbulence", {})
+        inlet_p = p.get("inlet", {})
+        decomp_p = p.get("decompose", {})
+
+        # 4. Write system/ dictionaries
+        #    Static files (fvSchemes, fvSolution, meshQualityDict) are copied
+        #    from the template directory when template_params is provided.
         system_files = {
-            "blockMeshDict": openfoam_case.generate_block_mesh_dict(bounds),
-            "snappyHexMeshDict": openfoam_case.generate_snappy_hex_mesh_dict(
-                stl_filename, patch_names, location_in_mesh,
+            "meshDict": openfoam_case.generate_mesh_dict(
+                stl_filename, patch_names,
+                max_cell_size=mesh_p.get("maxCellSize", 0.8),
+                boundary_cell_size=mesh_p.get("boundaryCellSize", 0.35),
+                num_layers=mesh_p.get("nLayers", 3),
+                thickness_ratio=mesh_p.get("thicknessRatio", 0.5),
+                wall_cell_size=mesh_p.get("wallCellSize"),
             ),
-            "meshQualityDict": openfoam_case.generate_mesh_quality_dict(),
             "controlDict": openfoam_case.generate_control_dict(
                 outlet_patches=[
                     c.name for c in self.clips if "outlet" in c.name.lower()
                 ],
-                geo_name=stl_stem,
+                geo_name="",
+                end_time=solver_p.get("endTime", 1.6),
+                delta_t=solver_p.get("deltaT", 1e-5),
+                write_interval=solver_p.get("writeInterval", 0.01),
+                max_co=solver_p.get("maxCo", 0.5),
+                max_delta_t=solver_p.get("maxDeltaT", 1e-3),
             ),
-            "fvSchemes": openfoam_case.generate_fv_schemes(),
-            "fvSolution": openfoam_case.generate_fv_solution(),
-            "decomposeParDict": openfoam_case.generate_decompose_par_dict(),
+            "decomposeParDict": openfoam_case.generate_decompose_par_dict(
+                n_procs=decomp_p.get("nProcs", 4),
+            ),
         }
+
+        # Copy static template files if template_params provided
+        if template_params is not None:
+            tmpl_dir = openfoam_case.get_template_dir()
+            for static_name in ("fvSchemes", "fvSolution", "meshQualityDict"):
+                src = tmpl_dir / static_name
+                if src.exists():
+                    dst = os.path.join(dirs["system"], static_name)
+                    shutil.copy2(str(src), dst)
+                    written[static_name] = dst
+        else:
+            system_files["fvSchemes"] = openfoam_case.generate_fv_schemes()
+            system_files["fvSolution"] = openfoam_case.generate_fv_solution()
+            system_files["meshQualityDict"] = openfoam_case.generate_mesh_quality_dict()
+
         for name, content in system_files.items():
             path = os.path.join(dirs["system"], name)
             with open(path, "w") as f:
                 f.write(content)
             written[name] = path
 
-        # 6. Write constant/ dictionaries
+        # 5. Write constant/ dictionaries
         const_files = {
-            "transportProperties": openfoam_case.generate_transport_properties(),
-            "turbulenceProperties": openfoam_case.generate_turbulence_properties(),
+            "transportProperties": openfoam_case.generate_transport_properties(
+                nu=fluid_p.get("nu", 3.3e-6),
+            ),
+            "turbulenceProperties": openfoam_case.generate_turbulence_properties(
+                cs=turb_p.get("Cs", 0.1),
+            ),
         }
         for name, content in const_files.items():
             path = os.path.join(dirs["constant"], name)
@@ -491,17 +706,29 @@ class STLClipperEngine:
                 f.write(content)
             written[name] = path
 
-        # massFlowRate.csv
-        csv_path = os.path.join(dirs["constant"], "massFlowRate.csv")
-        with open(csv_path, "w") as f:
-            f.write(openfoam_case.generate_mass_flow_rate_csv())
-        written["massFlowRate.csv"] = csv_path
+        # volumetricFlowRate.csv — copy from template if available, else generate
+        csv_path = os.path.join(dirs["constant"], "volumetricFlowRate.csv")
+        if template_params is not None:
+            tmpl_csv = openfoam_case.get_template_dir() / "volumetricFlowRate.csv"
+            if tmpl_csv.exists():
+                shutil.copy2(str(tmpl_csv), csv_path)
+            else:
+                with open(csv_path, "w") as f:
+                    f.write(openfoam_case.generate_volumetric_flow_rate_csv())
+        else:
+            with open(csv_path, "w") as f:
+                f.write(openfoam_case.generate_volumetric_flow_rate_csv())
+        written["volumetricFlowRate.csv"] = csv_path
 
-        # 7. Write 0/ boundary conditions
+        # 6. Write 0/ boundary conditions (no geo_name prefix with pMesh)
+        vel_mag = inlet_p.get("velocityMagnitude", 0.3)
         bc_files = {
-            "p": openfoam_case.generate_p(patch_names, geo_name=stl_stem),
-            "U": openfoam_case.generate_U(patch_names, inlet_normals, geo_name=stl_stem),
-            "nut": openfoam_case.generate_nut(patch_names, geo_name=stl_stem),
+            "p": openfoam_case.generate_p(patch_names, geo_name=""),
+            "U": openfoam_case.generate_U(
+                patch_names, inlet_normals, geo_name="",
+                velocity_magnitude=vel_mag,
+            ),
+            "nut": openfoam_case.generate_nut(patch_names, geo_name=""),
         }
         for name, content in bc_files.items():
             path = os.path.join(dirs["zero"], name)
@@ -509,11 +736,12 @@ class STLClipperEngine:
                 f.write(content)
             written[name] = path
 
-        # 8. Write shell scripts (executable)
+        # 7. Write shell scripts (executable)
         scripts = {
             "env.sh": openfoam_case.generate_env_sh(),
-            "Allrun": openfoam_case.generate_allrun(),
-            "Allclean": openfoam_case.generate_allclean(),
+            "Allrun": openfoam_case.generate_allrun(meshing_method="pmesh"),
+            "Allclean": openfoam_case.generate_allclean(meshing_method="pmesh"),
+            "run_docker.sh": openfoam_case.generate_run_docker_sh(),
         }
         for name, content in scripts.items():
             path = os.path.join(case_dir, name)
@@ -522,7 +750,7 @@ class STLClipperEngine:
             os.chmod(path, 0o755)
             written[name] = path
 
-        # 9. ParaView visualization: .foam file + visualize.py
+        # 8. ParaView visualization: .foam file + visualize.py
         foam_path = os.path.join(case_dir, f"{stl_stem}.foam")
         open(foam_path, "w").close()  # empty file — ParaView convention
         written[".foam"] = foam_path
@@ -542,9 +770,10 @@ class STLClipperEngine:
         os.chmod(viz_path, 0o755)
         written["visualize.py"] = viz_path
 
-        # diagnose_patches.py
+        # diagnose_patches.py (uses direct names, no geo prefix)
         diag_content = openfoam_case.generate_diagnose_patches_py(
-            stl_filename, patch_names, inlet_normals, geo_name=stl_stem,
+            stl_filename, patch_names, inlet_normals, geo_name="",
+            velocity_magnitude=vel_mag,
         )
         diag_path = os.path.join(case_dir, "diagnose_patches.py")
         with open(diag_path, "w") as f:
@@ -552,18 +781,26 @@ class STLClipperEngine:
         os.chmod(diag_path, 0o755)
         written["diagnose_patches.py"] = diag_path
 
+        # plot_residuals.py (solver convergence monitoring)
+        resid_content = openfoam_case.generate_plot_residuals_py()
+        resid_path = os.path.join(case_dir, "plot_residuals.py")
+        with open(resid_path, "w") as f:
+            f.write(resid_content)
+        os.chmod(resid_path, 0o755)
+        written["plot_residuals.py"] = resid_path
+
         return written
 
-    def export_separate_stl(self, output_dir: str):
+    def export_separate_stl(self, output_dir: str, scale_factor: float = 1.0):
         """Write one STL file per patch into output_dir."""
         os.makedirs(output_dir, exist_ok=True)
         for clip_def in self.clips:
             path = os.path.join(output_dir, f"{clip_def.name}.stl")
             with open(path, "w") as f:
-                f.write(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name))
+                f.write(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name, scale_factor))
         wall_path = os.path.join(output_dir, "wall.stl")
         with open(wall_path, "w") as f:
-            f.write(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall"))
+            f.write(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall", scale_factor))
 
 
 class STLClipperApp(QMainWindow):
@@ -598,6 +835,12 @@ class STLClipperApp(QMainWindow):
         # Centerline state
         self._centerline_mesh = None          # pv.PolyData from VMTK
         self._centerline_worker = None        # CenterlineWorker QThread
+        self._boundary_mesh = None            # pv.PolyData for boundary edge visualization
+        self._non_manifold_mesh = None        # pv.PolyData for non-manifold edge visualization
+
+        # OpenFOAM runner state
+        self._last_case_dir = None            # set after successful export
+        self._openfoam_worker = None          # OpenFOAMWorker QThread
 
         self._build_ui()
         self._build_menu()
@@ -619,31 +862,25 @@ class STLClipperApp(QMainWindow):
         self.plotter = QtInteractor(central)
         self.plotter.set_background("black")
 
-        # Control panel (scrollable so widgets aren't squished on resize)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(220)
-        panel_widget = QWidget()
-        panel = QVBoxLayout(panel_widget)
-        scroll.setWidget(panel_widget)
+        # Tabbed control panel
+        self._tab_widget = QTabWidget()
+        self._tab_widget.setMinimumWidth(220)
 
-        # Draggable splitter between viewport and panel
-        splitter = QSplitter(Qt.Horizontal, central)
-        splitter.addWidget(self.plotter.interactor)
-        splitter.addWidget(scroll)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
-        layout.addWidget(splitter)
+        # ── Tab 1: Clipping ──
+        clip_scroll = QScrollArea()
+        clip_scroll.setWidgetResizable(True)
+        clip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        clip_widget = QWidget()
+        panel = QVBoxLayout(clip_widget)
+        clip_scroll.setWidget(clip_widget)
+        self._tab_widget.addTab(clip_scroll, "Clipping")
 
         # --- Load ---
         self.btn_load = QPushButton("Load STL...")
         self.btn_load.clicked.connect(self._on_load)
         panel.addWidget(self.btn_load)
 
-        panel.addWidget(self._separator("Clipping"))
+        panel.addWidget(self._separator("Clip Plane"))
 
         self.btn_add_plane = QPushButton("Add Clip Plane")
         self.btn_add_plane.clicked.connect(self._on_add_plane)
@@ -871,11 +1108,43 @@ class STLClipperApp(QMainWindow):
         btn_row2.addWidget(self.btn_delete)
         panel.addLayout(btn_row2)
 
-        panel.addWidget(self._separator("Export"))
+        # ── Geometry Info panel ──
+        geo_box = QGroupBox("Geometry Info")
+        geo_lay = QVBoxLayout()
+        self._lbl_bounds = QLabel("Extents: —")
+        geo_lay.addWidget(self._lbl_bounds)
+        self._lbl_wall_faces = QLabel("Wall: — faces")
+        geo_lay.addWidget(self._lbl_wall_faces)
+        self._lbl_open_profiles = QLabel("Open profiles: —")
+        geo_lay.addWidget(self._lbl_open_profiles)
+        self._lbl_open_edges = QLabel("Open edges: —")
+        geo_lay.addWidget(self._lbl_open_edges)
+        self._btn_show_boundary = QPushButton("Show Boundary Edges")
+        self._btn_show_boundary.setCheckable(True)
+        self._btn_show_boundary.setChecked(False)
+        self._btn_show_boundary.clicked.connect(self._on_toggle_boundary_edges)
+        geo_lay.addWidget(self._btn_show_boundary)
+        self._lbl_non_manifold = QLabel("Non-manifold edges: —")
+        geo_lay.addWidget(self._lbl_non_manifold)
+        self._lbl_manifold = QLabel("Manifold: —")
+        geo_lay.addWidget(self._lbl_manifold)
+        self._btn_show_non_manifold = QPushButton("Show Non-Manifold")
+        self._btn_show_non_manifold.setCheckable(True)
+        self._btn_show_non_manifold.setChecked(False)
+        self._btn_show_non_manifold.clicked.connect(self._on_toggle_non_manifold)
+        geo_lay.addWidget(self._btn_show_non_manifold)
+        geo_box.setLayout(geo_lay)
+        panel.addWidget(geo_box)
 
-        self.btn_export_foam = QPushButton("Export for OpenFOAM")
-        self.btn_export_foam.clicked.connect(self._on_export_openfoam)
-        panel.addWidget(self.btn_export_foam)
+        panel.addWidget(self._separator("STL Export"))
+
+        # Scale factor dropdown (for STL-only exports on this tab)
+        self._combo_scale = QComboBox()
+        self._combo_scale.addItem("mm → m  (×0.001)", 0.001)
+        self._combo_scale.addItem("cm → m  (×0.01)",  0.01)
+        self._combo_scale.addItem("m → m   (×1.0)",   1.0)
+        self._combo_scale.setCurrentIndex(0)
+        panel.addWidget(self._combo_scale)
 
         self.btn_export_sep = QPushButton("Export Separate STLs")
         self.btn_export_sep.clicked.connect(self._on_export_separate)
@@ -922,8 +1191,24 @@ class STLClipperApp(QMainWindow):
 
         panel.addStretch()
 
-        self.wall_label = QLabel("Wall: — faces")
-        panel.addWidget(self.wall_label)
+        # ── Tab 2: Export Settings ──
+        self._build_export_settings_tab()
+
+        # ── Tab 3: Mesh Repair ──
+        self._build_repair_tab()
+
+        # ── Tab 4: Run OpenFOAM (Beta) ──
+        self._build_run_tab()
+
+        # Draggable splitter between viewport and tab panel
+        splitter = QSplitter(Qt.Horizontal, central)
+        splitter.addWidget(self.plotter.interactor)
+        splitter.addWidget(self._tab_widget)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        layout.addWidget(splitter)
 
         # Status bar
         self.status = QStatusBar()
@@ -931,6 +1216,473 @@ class STLClipperApp(QMainWindow):
         self.status.showMessage("Ready — load an STL file to begin.")
 
         self._patch_dpr_picking()
+
+    def _build_export_settings_tab(self):
+        """Build Tab 2 with all tunable export parameters from the template."""
+        cfg = openfoam_case.load_template()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tab2_widget = QWidget()
+        tab2 = QVBoxLayout(tab2_widget)
+        scroll.setWidget(tab2_widget)
+        self._tab_widget.addTab(scroll, "Export Settings")
+
+        # --- Scale ---
+        scale_box = QGroupBox("Scale")
+        scale_lay = QVBoxLayout()
+        self._combo_scale_of = QComboBox()
+        self._combo_scale_of.addItem("mm → m  (×0.001)", 0.001)
+        self._combo_scale_of.addItem("cm → m  (×0.01)",  0.01)
+        self._combo_scale_of.addItem("m → m   (×1.0)",   1.0)
+        self._combo_scale_of.setCurrentIndex(0)
+        scale_lay.addWidget(self._combo_scale_of)
+        scale_box.setLayout(scale_lay)
+        tab2.addWidget(scale_box)
+
+        # --- Mesh ---
+        mesh_box = QGroupBox("Mesh")
+        mesh_lay = QVBoxLayout()
+        mesh_cfg = cfg["mesh"]
+
+        self._export_max_cell_size = QDoubleSpinBox()
+        self._export_max_cell_size.setRange(1e-6, 10.0)
+        self._export_max_cell_size.setDecimals(6)
+        self._export_max_cell_size.setSingleStep(0.0001)
+        self._export_max_cell_size.setValue(mesh_cfg["maxCellSize"])
+
+        self._export_boundary_cell_size = QDoubleSpinBox()
+        self._export_boundary_cell_size.setRange(1e-6, 10.0)
+        self._export_boundary_cell_size.setDecimals(6)
+        self._export_boundary_cell_size.setSingleStep(0.0001)
+        self._export_boundary_cell_size.setValue(mesh_cfg["boundaryCellSize"])
+
+        self._export_wall_cell_size = QDoubleSpinBox()
+        self._export_wall_cell_size.setRange(1e-6, 10.0)
+        self._export_wall_cell_size.setDecimals(6)
+        self._export_wall_cell_size.setSingleStep(0.0001)
+        self._export_wall_cell_size.setValue(mesh_cfg["wallCellSize"])
+
+        self._export_n_layers = QSpinBox()
+        self._export_n_layers.setRange(0, 20)
+        self._export_n_layers.setValue(mesh_cfg["nLayers"])
+
+        self._export_thickness_ratio = QDoubleSpinBox()
+        self._export_thickness_ratio.setRange(0.01, 5.0)
+        self._export_thickness_ratio.setDecimals(2)
+        self._export_thickness_ratio.setSingleStep(0.1)
+        self._export_thickness_ratio.setValue(mesh_cfg["thicknessRatio"])
+
+        for label, widget in [
+            ("Max cell size:", self._export_max_cell_size),
+            ("Boundary cell size:", self._export_boundary_cell_size),
+            ("Wall cell size:", self._export_wall_cell_size),
+            ("Boundary layers:", self._export_n_layers),
+            ("Thickness ratio:", self._export_thickness_ratio),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(widget)
+            mesh_lay.addLayout(row)
+        mesh_box.setLayout(mesh_lay)
+        tab2.addWidget(mesh_box)
+
+        # --- Solver ---
+        solver_box = QGroupBox("Solver")
+        solver_lay = QVBoxLayout()
+        solver_cfg = cfg["solver"]
+
+        self._export_end_time = QDoubleSpinBox()
+        self._export_end_time.setRange(0.001, 1000.0)
+        self._export_end_time.setDecimals(3)
+        self._export_end_time.setSingleStep(0.1)
+        self._export_end_time.setValue(solver_cfg["endTime"])
+
+        self._export_delta_t = QDoubleSpinBox()
+        self._export_delta_t.setRange(1e-8, 1.0)
+        self._export_delta_t.setDecimals(8)
+        self._export_delta_t.setSingleStep(1e-5)
+        self._export_delta_t.setValue(solver_cfg["deltaT"])
+
+        self._export_write_interval = QDoubleSpinBox()
+        self._export_write_interval.setRange(1e-6, 100.0)
+        self._export_write_interval.setDecimals(4)
+        self._export_write_interval.setSingleStep(0.01)
+        self._export_write_interval.setValue(solver_cfg["writeInterval"])
+
+        self._export_max_co = QDoubleSpinBox()
+        self._export_max_co.setRange(0.01, 10.0)
+        self._export_max_co.setDecimals(2)
+        self._export_max_co.setSingleStep(0.1)
+        self._export_max_co.setValue(solver_cfg["maxCo"])
+
+        self._export_max_delta_t = QDoubleSpinBox()
+        self._export_max_delta_t.setRange(1e-8, 1.0)
+        self._export_max_delta_t.setDecimals(6)
+        self._export_max_delta_t.setSingleStep(1e-3)
+        self._export_max_delta_t.setValue(solver_cfg["maxDeltaT"])
+
+        for label, widget in [
+            ("End time (s):", self._export_end_time),
+            ("Delta T (s):", self._export_delta_t),
+            ("Write interval:", self._export_write_interval),
+            ("Max Courant:", self._export_max_co),
+            ("Max Delta T:", self._export_max_delta_t),
+        ]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(widget)
+            solver_lay.addLayout(row)
+        solver_box.setLayout(solver_lay)
+        tab2.addWidget(solver_box)
+
+        # --- Fluid ---
+        fluid_box = QGroupBox("Fluid")
+        fluid_lay = QVBoxLayout()
+
+        self._export_nu = QDoubleSpinBox()
+        self._export_nu.setRange(1e-9, 1.0)
+        self._export_nu.setDecimals(8)
+        self._export_nu.setSingleStep(1e-7)
+        self._export_nu.setValue(cfg["fluid"]["nu"])
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Viscosity nu:"))
+        row.addWidget(self._export_nu)
+        fluid_lay.addLayout(row)
+        fluid_box.setLayout(fluid_lay)
+        tab2.addWidget(fluid_box)
+
+        # --- Turbulence ---
+        turb_box = QGroupBox("Turbulence")
+        turb_lay = QVBoxLayout()
+
+        self._export_cs = QDoubleSpinBox()
+        self._export_cs.setRange(0.01, 1.0)
+        self._export_cs.setDecimals(3)
+        self._export_cs.setSingleStep(0.01)
+        self._export_cs.setValue(cfg["turbulence"]["Cs"])
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Cs:"))
+        row.addWidget(self._export_cs)
+        turb_lay.addLayout(row)
+        turb_box.setLayout(turb_lay)
+        tab2.addWidget(turb_box)
+
+        # --- Inlet ---
+        inlet_box = QGroupBox("Inlet")
+        inlet_lay = QVBoxLayout()
+
+        self._export_velocity_mag = QDoubleSpinBox()
+        self._export_velocity_mag.setRange(0.001, 100.0)
+        self._export_velocity_mag.setDecimals(4)
+        self._export_velocity_mag.setSingleStep(0.05)
+        self._export_velocity_mag.setValue(cfg["inlet"]["velocityMagnitude"])
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Velocity mag (m/s):"))
+        row.addWidget(self._export_velocity_mag)
+        inlet_lay.addLayout(row)
+        inlet_box.setLayout(inlet_lay)
+        tab2.addWidget(inlet_box)
+
+        # --- Parallel ---
+        par_box = QGroupBox("Parallel")
+        par_lay = QVBoxLayout()
+
+        self._export_n_procs = QSpinBox()
+        self._export_n_procs.setRange(1, 1024)
+        self._export_n_procs.setValue(cfg["decompose"]["nProcs"])
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Processors:"))
+        row.addWidget(self._export_n_procs)
+        par_lay.addLayout(row)
+        par_box.setLayout(par_lay)
+        tab2.addWidget(par_box)
+
+        # --- Buttons ---
+        btn_row = QHBoxLayout()
+        btn_reset = QPushButton("Reset Defaults")
+        btn_reset.clicked.connect(self._on_reset_export_defaults)
+        btn_row.addWidget(btn_reset)
+
+        self.btn_export_foam = QPushButton("Export for OpenFOAM")
+        self.btn_export_foam.clicked.connect(self._on_export_openfoam)
+        btn_row.addWidget(self.btn_export_foam)
+        tab2.addLayout(btn_row)
+
+        tab2.addStretch()
+
+    def _build_repair_tab(self):
+        """Build Tab 3 with mesh repair operations."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tab3_widget = QWidget()
+        tab3 = QVBoxLayout(tab3_widget)
+        scroll.setWidget(tab3_widget)
+        self._tab_widget.addTab(scroll, "Mesh Repair")
+
+        tab3.addWidget(QLabel("Repair modifies original mesh\nand clears all clips."))
+
+        self._btn_repair_clean = QPushButton("Clean Mesh")
+        self._btn_repair_clean.setToolTip("Remove duplicate points and degenerate triangles")
+        self._btn_repair_clean.clicked.connect(self._on_repair_clean)
+        tab3.addWidget(self._btn_repair_clean)
+
+        self._btn_repair_normals = QPushButton("Fix Normals")
+        self._btn_repair_normals.setToolTip("Consistent winding order for face normals")
+        self._btn_repair_normals.clicked.connect(self._on_repair_normals)
+        tab3.addWidget(self._btn_repair_normals)
+
+        self._lbl_repair_status = QLabel("Status: \u2014")
+        tab3.addWidget(self._lbl_repair_status)
+
+        tab3.addStretch()
+
+    def _build_run_tab(self):
+        """Build Tab 4: Run OpenFOAM (Beta) — Docker solver launcher."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tab4_widget = QWidget()
+        tab4 = QVBoxLayout(tab4_widget)
+        scroll.setWidget(tab4_widget)
+        self._tab_widget.addTab(scroll, "Run OpenFOAM (Beta)")
+
+        tab4.addWidget(QLabel("Run Docker pipeline from the app."))
+
+        # Read-only nProcs label (synced from Export Settings)
+        self._run_nprocs_label = QLabel("Processors: —")
+        tab4.addWidget(self._run_nprocs_label)
+        self._export_n_procs.valueChanged.connect(
+            lambda v: self._run_nprocs_label.setText(f"Processors: {v}")
+        )
+        # Set initial value
+        self._run_nprocs_label.setText(
+            f"Processors: {self._export_n_procs.value()}"
+        )
+
+        # Case directory label
+        self._run_case_label = QLabel("Case: (none exported)")
+        self._run_case_label.setWordWrap(True)
+        tab4.addWidget(self._run_case_label)
+
+        # Run / Cancel buttons
+        btn_row = QHBoxLayout()
+        self._btn_run_solver = QPushButton("Run Solver")
+        self._btn_run_solver.clicked.connect(self._on_run_solver)
+        btn_row.addWidget(self._btn_run_solver)
+
+        self._btn_cancel_solver = QPushButton("Cancel")
+        self._btn_cancel_solver.setEnabled(False)
+        self._btn_cancel_solver.clicked.connect(self._on_cancel_solver)
+        btn_row.addWidget(self._btn_cancel_solver)
+        tab4.addLayout(btn_row)
+
+        # Stage indicator
+        self._run_stage_label = QLabel("Stage: \u2014")
+        tab4.addWidget(self._run_stage_label)
+
+        # Log viewer
+        self._run_log = QPlainTextEdit()
+        self._run_log.setReadOnly(True)
+        self._run_log.setMaximumBlockCount(50000)
+        self._run_log.setFont(QFont("Courier", 10))
+        self._run_log.setStyleSheet(
+            "QPlainTextEdit { background-color: #1e1e1e; color: #d4d4d4; }"
+        )
+        tab4.addWidget(self._run_log)
+
+        # Bottom buttons
+        bottom_row = QHBoxLayout()
+        btn_clear_log = QPushButton("Clear Log")
+        btn_clear_log.clicked.connect(self._run_log.clear)
+        bottom_row.addWidget(btn_clear_log)
+
+        btn_open_folder = QPushButton("Open Case Folder")
+        btn_open_folder.clicked.connect(self._on_open_case_folder)
+        bottom_row.addWidget(btn_open_folder)
+        tab4.addLayout(bottom_row)
+
+    def _on_run_solver(self):
+        """Pre-flight checks then launch OpenFOAMWorker."""
+        # Check case directory
+        if not self._last_case_dir or not os.path.isdir(self._last_case_dir):
+            QMessageBox.warning(
+                self, "No Case",
+                "Export a case first (Export Settings tab).",
+            )
+            return
+
+        script = os.path.join(self._last_case_dir, "run_docker.sh")
+        if not os.path.isfile(script):
+            QMessageBox.warning(
+                self, "Missing Script",
+                f"run_docker.sh not found in:\n{self._last_case_dir}",
+            )
+            return
+
+        # Quick Docker check
+        try:
+            subprocess.run(
+                ["docker", "info"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception:
+            QMessageBox.critical(
+                self, "Docker Not Available",
+                "Cannot reach Docker. Is Docker Desktop running?",
+            )
+            return
+
+        # Check for existing time directories (results)
+        time_dirs = [
+            d for d in os.listdir(self._last_case_dir)
+            if os.path.isdir(os.path.join(self._last_case_dir, d))
+            and d not in ("0", "constant", "system", "processor0",
+                          "processor1", "processor2", "processor3",
+                          "__pycache__")
+            and not d.startswith(".")
+        ]
+        # Filter to numeric directory names (OpenFOAM time dirs)
+        time_dirs = [d for d in time_dirs if d.replace(".", "", 1).isdigit()
+                     and d != "0"]
+        if time_dirs:
+            reply = QMessageBox.question(
+                self, "Existing Results",
+                f"Found {len(time_dirs)} time directories. "
+                "Running again will overwrite results.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        nprocs = self._export_n_procs.value()
+        self._openfoam_worker = OpenFOAMWorker(self._last_case_dir, nprocs)
+        self._openfoam_worker.log_line.connect(self._on_solver_log_line)
+        self._openfoam_worker.stage_changed.connect(self._on_solver_stage_changed)
+        self._openfoam_worker.finished_ok.connect(self._on_solver_finished)
+        self._openfoam_worker.failed.connect(self._on_solver_failed)
+
+        self._btn_run_solver.setEnabled(False)
+        self._btn_cancel_solver.setEnabled(True)
+        self._run_stage_label.setText("Stage: starting...")
+        self._run_log.clear()
+
+        self._openfoam_worker.start()
+
+    def _on_cancel_solver(self):
+        """Stop Docker containers and terminate the worker."""
+        if self._openfoam_worker and self._openfoam_worker.isRunning():
+            self._run_stage_label.setText("Stage: cancelling...")
+            self._openfoam_worker.cancel()
+
+    def _on_solver_log_line(self, text: str):
+        """Append batched log text to the viewer."""
+        self._run_log.appendPlainText(text)
+        # Auto-scroll to bottom
+        sb = self._run_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_solver_stage_changed(self, stage: str):
+        """Update the stage label."""
+        self._run_stage_label.setText(f"Stage: {stage}")
+
+    def _on_solver_finished(self):
+        """Solver completed successfully."""
+        self._btn_run_solver.setEnabled(True)
+        self._btn_cancel_solver.setEnabled(False)
+        self._run_stage_label.setText("Stage: Done")
+        self._openfoam_worker = None
+        self.status.showMessage("OpenFOAM run completed.")
+
+    def _on_solver_failed(self, msg: str):
+        """Solver failed or was cancelled."""
+        self._btn_run_solver.setEnabled(True)
+        self._btn_cancel_solver.setEnabled(False)
+        self._run_stage_label.setText(f"Stage: FAILED")
+        self._openfoam_worker = None
+        if msg != "Cancelled by user":
+            QMessageBox.critical(self, "Solver Error", msg)
+        self.status.showMessage(f"OpenFOAM: {msg}")
+
+    def _on_open_case_folder(self):
+        """Open the case directory in the system file manager."""
+        if self._last_case_dir and os.path.isdir(self._last_case_dir):
+            import platform
+            if platform.system() == "Darwin":
+                subprocess.Popen(["open", self._last_case_dir])
+            elif platform.system() == "Linux":
+                subprocess.Popen(["xdg-open", self._last_case_dir])
+            else:
+                subprocess.Popen(["explorer", self._last_case_dir])
+        else:
+            QMessageBox.information(
+                self, "No Case", "No case directory to open.",
+            )
+
+    def closeEvent(self, event):
+        """Prompt if solver is running before closing."""
+        if self._openfoam_worker and self._openfoam_worker.isRunning():
+            reply = QMessageBox.question(
+                self, "Solver Running",
+                "OpenFOAM solver is still running. Stop and quit?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._on_cancel_solver()
+                self._openfoam_worker.wait(10000)
+            else:
+                event.ignore()
+                return
+        super().closeEvent(event)
+
+    def _on_repair_clean(self):
+        msg = self.engine.repair_clean()
+        self._lbl_repair_status.setText(msg)
+        self._centerline_mesh = None
+        self._refresh_patch_list()
+        self._refresh_display()
+        self._update_button_states()
+
+    def _on_repair_normals(self):
+        msg = self.engine.repair_normals()
+        self._lbl_repair_status.setText(msg)
+        self._centerline_mesh = None
+        self._refresh_patch_list()
+        self._refresh_display()
+        self._update_button_states()
+
+    def _on_reset_export_defaults(self):
+        """Reset all export settings spinboxes to template defaults."""
+        cfg = openfoam_case.load_template()
+        mesh = cfg["mesh"]
+        solver = cfg["solver"]
+
+        self._export_max_cell_size.setValue(mesh["maxCellSize"])
+        self._export_boundary_cell_size.setValue(mesh["boundaryCellSize"])
+        self._export_wall_cell_size.setValue(mesh["wallCellSize"])
+        self._export_n_layers.setValue(mesh["nLayers"])
+        self._export_thickness_ratio.setValue(mesh["thicknessRatio"])
+
+        self._export_end_time.setValue(solver["endTime"])
+        self._export_delta_t.setValue(solver["deltaT"])
+        self._export_write_interval.setValue(solver["writeInterval"])
+        self._export_max_co.setValue(solver["maxCo"])
+        self._export_max_delta_t.setValue(solver["maxDeltaT"])
+
+        self._export_nu.setValue(cfg["fluid"]["nu"])
+        self._export_cs.setValue(cfg["turbulence"]["Cs"])
+        self._export_velocity_mag.setValue(cfg["inlet"]["velocityMagnitude"])
+        self._export_n_procs.setValue(cfg["decompose"]["nProcs"])
+
+        self.status.showMessage("Export settings reset to template defaults.")
 
     def _build_menu(self):
         menu = self.menuBar()
@@ -1023,6 +1775,10 @@ class STLClipperApp(QMainWindow):
         self.btn_clear_cl.setEnabled(self._centerline_mesh is not None)
         self.btn_save_cl.setEnabled(self._centerline_mesh is not None)
 
+        # Repair buttons
+        self._btn_repair_clean.setEnabled(has_mesh)
+        self._btn_repair_normals.setEnabled(has_mesh)
+
     # ------------------------------------------------------------------
     # Load
     # ------------------------------------------------------------------
@@ -1045,6 +1801,7 @@ class STLClipperApp(QMainWindow):
         self._cancel_clip_widgets()
         self._centerline_mesh = None
         self._centerline_worker = None
+        self._lbl_repair_status.setText("Status: \u2014")
         self._refresh_display()
 
         fname = os.path.basename(filepath)
@@ -1144,8 +1901,8 @@ class STLClipperApp(QMainWindow):
         mesh = self.engine.get_wall_mesh()
         self._constraint_box_active = True
 
-        # Compute initial box state from mesh bounds
-        center = np.array(mesh.center, dtype=float)
+        # Compute initial box state — centered at current plane origin
+        center = np.array(self._current_plane_origin, dtype=float)
         bounds = np.array(mesh.bounds).reshape(3, 2)
         extents = bounds.ptp(axis=1)  # [dx, dy, dz]
         half_extents = extents * 0.3 / 2.0  # factor=0.3 matching old widget
@@ -1480,6 +2237,13 @@ class STLClipperApp(QMainWindow):
             planes.append((-axis.copy(), (center - axis * h).copy()))
         self._current_box_planes_data = planes
 
+        # Green sphere marker at box center
+        radius = np.min(self._box_half_extents) * 0.1
+        self.plotter.add_mesh(
+            pv.Sphere(center=center, radius=radius),
+            color="green", name="box_center_marker",
+        )
+
         self._update_preview()
 
     def _on_reset_box(self):
@@ -1512,6 +2276,7 @@ class STLClipperApp(QMainWindow):
         self._box_initial_half_extents = half_extents.copy()
 
         # Re-place VTK widget at reset bounds
+        self.plotter.remove_actor("box_center_marker")
         self.plotter.clear_box_widgets()
         box_bounds = [
             center[0] - half_extents[0], center[0] + half_extents[0],
@@ -1606,6 +2371,7 @@ class STLClipperApp(QMainWindow):
         if self._box_actor is not None:
             self.plotter.remove_actor(self._box_actor, render=False)
             self._box_actor = None
+        self.plotter.remove_actor("box_center_marker")
         self._box_center = None
         self._box_rotation_deg = None
         self._box_half_extents = None
@@ -1825,7 +2591,7 @@ class STLClipperApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_compute_centerline(self):
-        """Discover open profiles, map to inlet/outlet, launch VMTK with profileidlist."""
+        """Build capped surface + cap-centroid seeds, launch VMTK."""
         clips = self.engine.clips
         inlet_clips = [c for c in clips if "inlet" in c.name.lower()]
         outlet_clips = [c for c in clips if "outlet" in c.name.lower()]
@@ -1839,38 +2605,24 @@ class STLClipperApp(QMainWindow):
         if wall is None or wall.n_cells == 0:
             return
 
-        # Discover open-profile centers using the same capper vmtkCenterlines uses internally
-        from vmtk import vtkvmtk
-        capper = vtkvmtk.vtkvmtkCapPolyData()
-        capper.SetInputData(wall)
-        capper.SetDisplacement(0)
-        capper.SetInPlaneDisplacement(0)
-        capper.Update()
-        capped = capper.GetOutput()
-        cap_center_ids = capper.GetCapCenterIds()
+        # Cap the open wall mesh so VMTK's Voronoi diagram doesn't degenerate
+        capped = wall.copy()
+        for c in clips:
+            if c.cap_mesh is not None and c.cap_mesh.n_cells > 0:
+                capped = capped.merge(c.cap_mesh)
 
-        n_caps = cap_center_ids.GetNumberOfIds()
-        logger.info("Open profiles detected: %d", n_caps)
+        # Use cap centroids as seeds (guaranteed on surface); fall back to origin
+        source_pts = []
+        for c in inlet_clips:
+            pt = c.cap_mesh.center if (c.cap_mesh is not None and c.cap_mesh.n_cells > 0) else c.origin.tolist()
+            source_pts.extend(list(pt))
+        target_pts = []
+        for c in outlet_clips:
+            pt = c.cap_mesh.center if (c.cap_mesh is not None and c.cap_mesh.n_cells > 0) else c.origin.tolist()
+            target_pts.extend(list(pt))
+        logger.info("Seed points (cap centroids): source=%s, target=%s", source_pts, target_pts)
 
-        # Match each cap center to nearest inlet/outlet clip origin
-        source_ids, target_ids = [], []
-        for i in range(n_caps):
-            pt = np.array(capped.GetPoint(cap_center_ids.GetId(i)))
-            d_in = min((np.linalg.norm(pt - c.origin) for c in inlet_clips), default=float("inf"))
-            d_out = min((np.linalg.norm(pt - c.origin) for c in outlet_clips), default=float("inf"))
-            if d_in <= d_out:
-                source_ids.append(i)
-            else:
-                target_ids.append(i)
-        logger.info("Profile mapping: source_ids=%s, target_ids=%s", source_ids, target_ids)
-
-        if not source_ids or not target_ids:
-            QMessageBox.warning(self, "Centerline Error",
-                                "Could not map open profiles to inlet/outlet clips.")
-            return
-
-        # Pass the OPEN wall mesh — vmtkCenterlines with profileidlist caps internally
-        worker = CenterlineWorker(wall, source_ids, target_ids)
+        worker = CenterlineWorker(capped, source_pts, target_pts)
         worker.result_ready.connect(self._on_centerline_finished)
         worker.failed.connect(self._on_centerline_failed)
         worker.finished.connect(self._cleanup_centerline_worker)  # QThread built-in
@@ -1982,7 +2734,103 @@ class STLClipperApp(QMainWindow):
 
         # Update wall face count label
         n_wall = wall.n_cells if wall else 0
-        self.wall_label.setText(f"Wall: {n_wall:,} faces")
+        self._lbl_wall_faces.setText(f"Wall: {n_wall:,} faces")
+
+        # Update bounding box info
+        if self.engine.original_mesh is not None:
+            xmin, xmax, ymin, ymax, zmin, zmax = self.engine.original_mesh.bounds
+            dx, dy, dz = xmax - xmin, ymax - ymin, zmax - zmin
+            self._lbl_bounds.setText(f"Extents:  {dx:.1f} × {dy:.1f} × {dz:.1f}")
+        else:
+            self._lbl_bounds.setText("Extents: —")
+
+        # Update geometry quality indicators
+        quality = self.engine.geometry_quality()
+        self._boundary_mesh = quality["boundary_mesh"]
+        n_profiles = quality["open_profiles"]
+        n_edges = quality["open_edges"]
+        n_clips = len(self.engine.clips)
+
+        if n_profiles == 0 and n_clips == 0:
+            self._lbl_open_profiles.setText("Open profiles: —")
+            self._lbl_open_profiles.setStyleSheet("")
+        elif n_profiles == n_clips:
+            self._lbl_open_profiles.setText(
+                f"Open profiles: {n_profiles} (expected: {n_clips}) \u2713"
+            )
+            self._lbl_open_profiles.setStyleSheet("color: green;")
+        else:
+            self._lbl_open_profiles.setText(
+                f"Open profiles: {n_profiles} (expected: {n_clips}) \u2717"
+            )
+            self._lbl_open_profiles.setStyleSheet("color: red;")
+
+        self._lbl_open_edges.setText(f"Open edges: {n_edges}")
+
+        # Update non-manifold indicators
+        self._non_manifold_mesh = quality["non_manifold_mesh"]
+        n_nm = quality["non_manifold_edges"]
+        is_mf = quality["is_manifold"]
+
+        if n_nm == 0:
+            self._lbl_non_manifold.setText(f"Non-manifold edges: {n_nm} \u2713")
+            self._lbl_non_manifold.setStyleSheet("color: green;")
+        else:
+            self._lbl_non_manifold.setText(f"Non-manifold edges: {n_nm} \u2717")
+            self._lbl_non_manifold.setStyleSheet("color: red;")
+
+        if is_mf is None:
+            self._lbl_manifold.setText("Manifold: \u2014 (no clips)")
+            self._lbl_manifold.setStyleSheet("color: gray;")
+        elif is_mf:
+            self._lbl_manifold.setText("Manifold: \u2713")
+            self._lbl_manifold.setStyleSheet("color: green;")
+        else:
+            self._lbl_manifold.setText("Manifold: \u2717")
+            self._lbl_manifold.setStyleSheet("color: red;")
+
+        # Re-render boundary edges if toggle is on
+        if self._btn_show_boundary.isChecked() and self._boundary_mesh is not None:
+            self.plotter.add_mesh(
+                self._boundary_mesh, color="red", line_width=4,
+                name="boundary_edges",
+            )
+
+        # Re-render non-manifold edges if toggle is on
+        if self._btn_show_non_manifold.isChecked() and self._non_manifold_mesh is not None:
+            if self._non_manifold_mesh.n_cells > 0:
+                self.plotter.add_mesh(
+                    self._non_manifold_mesh, color="magenta", line_width=4,
+                    name="non_manifold_edges",
+                )
+
+        self.plotter.render()
+
+    def _on_toggle_boundary_edges(self):
+        """Toggle red boundary edge visualization in the 3D viewport."""
+        if self._btn_show_boundary.isChecked():
+            if self._boundary_mesh is not None and self._boundary_mesh.n_cells > 0:
+                self.plotter.add_mesh(
+                    self._boundary_mesh, color="red", line_width=4,
+                    name="boundary_edges",
+                )
+                self.plotter.render()
+        else:
+            self.plotter.remove_actor("boundary_edges")
+            self.plotter.render()
+
+    def _on_toggle_non_manifold(self):
+        """Toggle magenta non-manifold edge visualization in the 3D viewport."""
+        if self._btn_show_non_manifold.isChecked():
+            if self._non_manifold_mesh is not None and self._non_manifold_mesh.n_cells > 0:
+                self.plotter.add_mesh(
+                    self._non_manifold_mesh, color="magenta", line_width=4,
+                    name="non_manifold_edges",
+                )
+                self.plotter.render()
+        else:
+            self.plotter.remove_actor("non_manifold_edges")
+            self.plotter.render()
 
     # ------------------------------------------------------------------
     # View controls
@@ -2063,15 +2911,17 @@ class STLClipperApp(QMainWindow):
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
             return
+        sf = self._combo_scale.currentData()
         sep_dir = os.path.join(case_dir, "separate")
         try:
-            self.engine.export_separate_stl(sep_dir)
+            self.engine.export_separate_stl(sep_dir, scale_factor=sf)
             planes_path = os.path.join(case_dir, "clip_planes.json")
             self.engine.export_clip_planes(planes_path)
             files = [f"{c.name}.stl" for c in self.engine.clips] + ["wall.stl"]
             QMessageBox.information(
                 self, "Export Complete",
-                f"Exported {len(files)} files to:\n{sep_dir}\n\n"
+                f"Exported {len(files)} files to:\n{sep_dir}\n"
+                f"Scale factor: ×{sf}\n\n"
                 + "\n".join(files)
                 + f"\n\nClip planes JSON:\n{planes_path}",
             )
@@ -2084,14 +2934,16 @@ class STLClipperApp(QMainWindow):
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
             return
+        sf = self._combo_scale.currentData()
         filepath = os.path.join(case_dir, "boundary.stl")
         try:
-            self.engine.export_combined_stl(filepath)
+            self.engine.export_combined_stl(filepath, scale_factor=sf)
             planes_path = os.path.join(case_dir, "clip_planes.json")
             self.engine.export_clip_planes(planes_path)
             QMessageBox.information(
                 self, "Export Complete",
-                f"Combined STL saved to:\n{filepath}\n\n"
+                f"Combined STL saved to:\n{filepath}\n"
+                f"Scale factor: ×{sf}\n\n"
                 f"Clip planes JSON:\n{planes_path}\n\n"
                 f"Patches: {', '.join(c.name for c in self.engine.clips)}, wall",
             )
@@ -2104,11 +2956,48 @@ class STLClipperApp(QMainWindow):
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
             return
+        # Use scale from Export Settings tab (OF-specific)
+        sf = self._combo_scale_of.currentData()
         stl_filename = os.path.basename(self._loaded_filepath)
+
+        # Read all spinbox values into template_params dict
+        template_params = {
+            "mesh": {
+                "maxCellSize": self._export_max_cell_size.value(),
+                "boundaryCellSize": self._export_boundary_cell_size.value(),
+                "wallCellSize": self._export_wall_cell_size.value(),
+                "nLayers": self._export_n_layers.value(),
+                "thicknessRatio": self._export_thickness_ratio.value(),
+            },
+            "solver": {
+                "endTime": self._export_end_time.value(),
+                "deltaT": self._export_delta_t.value(),
+                "writeInterval": self._export_write_interval.value(),
+                "maxCo": self._export_max_co.value(),
+                "maxDeltaT": self._export_max_delta_t.value(),
+            },
+            "fluid": {
+                "nu": self._export_nu.value(),
+            },
+            "turbulence": {
+                "Cs": self._export_cs.value(),
+            },
+            "inlet": {
+                "velocityMagnitude": self._export_velocity_mag.value(),
+            },
+            "decompose": {
+                "nProcs": self._export_n_procs.value(),
+            },
+        }
+
         try:
             result = self.engine.export_openfoam_case(
                 case_dir, stl_filename, self._centerline_mesh,
+                scale_factor=sf,
+                template_params=template_params,
             )
+            self._last_case_dir = case_dir
+            self._run_case_label.setText(f"Case: {case_dir}")
             patches = ", ".join(c.name for c in self.engine.clips) + ", wall"
             # Summarise generated files by category
             bc_files = [k for k in ("p", "U", "nut") if k in result]
@@ -2116,19 +3005,26 @@ class STLClipperApp(QMainWindow):
                 k for k in result
                 if k not in ("stl_path", "planes_path", "p", "U", "nut",
                              "transportProperties", "turbulenceProperties",
-                             "massFlowRate.csv", "env.sh", "Allrun", "Allclean",
-                             ".foam", "visualize.py")
+                             "volumetricFlowRate.csv", "env.sh", "Allrun", "Allclean",
+                             "run_docker.sh", "diagnose_patches.py", "meshDict",
+                             ".foam", "visualize.py", "plot_residuals.py")
             ]
             QMessageBox.information(
                 self, "OpenFOAM Case Export Complete",
-                f"Case directory: {case_dir}\n\n"
+                f"Case directory: {case_dir}\n"
+                f"Scale factor: ×{sf}\n\n"
                 f"Patches: {patches}\n\n"
                 f"Boundary conditions (0/): {', '.join(bc_files)}\n"
                 f"System dictionaries: {', '.join(system_files)}\n"
-                f"Scripts: Allrun, Allclean, env.sh\n"
-                f"ParaView: visualize.py, .foam file\n\n"
-                f"Run: source env.sh && ./Allrun\n"
-                f"View: pvpython visualize.py",
+                f"Scripts: Allrun, Allclean, env.sh, run_docker.sh\n"
+                f"ParaView: visualize.py, .foam file\n"
+                f"Monitoring: plot_residuals.py\n\n"
+                f"Docker (recommended):\n"
+                f"  ./run_docker.sh\n\n"
+                f"Native OpenFOAM:\n"
+                f"  source env.sh && ./Allrun\n\n"
+                f"View: pvpython visualize.py\n"
+                f"Monitor: python plot_residuals.py  (or --headless)",
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))

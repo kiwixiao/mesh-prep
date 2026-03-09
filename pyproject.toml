@@ -15,10 +15,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-vmtk = ["vmtk"]
+centerline = ["vmtk"]
+run = ["PyFoam", "matplotlib"]
 
 [project.scripts]
 mesh-prep = "mesh_prep.stl_clipper:main"
 
 [tool.setuptools.packages.find]
 include = ["mesh_prep*"]
+
+[tool.setuptools.package-data]
+mesh_prep = ["templates/**/*"]

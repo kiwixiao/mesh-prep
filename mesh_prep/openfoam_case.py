@@ -5,11 +5,29 @@ Pure-function module that generates OpenFOAM dictionary files for LES blood
 flow simulation of aortic geometry.  No Qt dependencies — each function
 returns a plain string ready to be written to disk.
 
-Mesh pipeline: blockMesh → snappyHexMesh → checkMesh → pimpleFoam
+Mesh pipelines:
+  - pMesh (default):  cfMesh pMesh (Docker) → checkMesh → pimpleFoam
+  - snappyHexMesh:    blockMesh → snappyHexMesh → checkMesh → pimpleFoam
 """
 
+import json
 import math
+from pathlib import Path
 from typing import Optional
+
+
+# ── Template loading ────────────────────────────────────────────────
+
+def get_template_dir(template_name: str = "les_aorta") -> Path:
+    """Return path to the named template directory."""
+    return Path(__file__).parent / "templates" / template_name
+
+
+def load_template(template_name: str = "les_aorta") -> dict:
+    """Load and return the template config.json as a dict."""
+    config_path = get_template_dir(template_name) / "config.json"
+    with open(config_path) as f:
+        return json.load(f)
 
 def _of_key(name: str) -> str:
     """Quote an OpenFOAM dictionary key if it starts with a digit."""
@@ -357,8 +375,13 @@ def _generate_outlet_functions(outlet_patches: list[str], geo_name: str = "") ->
 def generate_control_dict(
     outlet_patches: Optional[list[str]] = None,
     geo_name: str = "",
+    end_time: float = 1.6,
+    delta_t: float = 1e-5,
+    write_interval: float = 0.01,
+    max_co: float = 2,
+    max_delta_t: float = 1e-3,
 ) -> str:
-    """pimpleFoam with adaptive time-stepping, maxCo=0.5, 2 cardiac cycles.
+    """pimpleFoam with adaptive time-stepping.
 
     Parameters
     ----------
@@ -367,6 +390,16 @@ def generate_control_dict(
         flow rate (phi) through each outlet patch at runtime.
     geo_name : str
         Geometry name prefix for patch names.
+    end_time : float
+        Simulation end time in seconds.
+    delta_t : float
+        Initial time step size.
+    write_interval : float
+        Write interval for adjustableRunTime.
+    max_co : float
+        Maximum Courant number for adaptive time-stepping.
+    max_delta_t : float
+        Maximum allowed time step.
     """
     outlet_block = ""
     if outlet_patches:
@@ -377,16 +410,16 @@ def generate_control_dict(
         + f"""
 application     pimpleFoam;
 
-startFrom       startTime;
+startFrom       latestTime;
 startTime       0;
 
 stopAt          endTime;
-endTime         1.6;    // 2 cardiac cycles (0.8 s each)
+endTime         {end_time};
 
-deltaT          1e-05;
+deltaT          {delta_t:.6g};
 
 writeControl    adjustableRunTime;
-writeInterval   0.01;
+writeInterval   {write_interval};
 
 purgeWrite      0;
 
@@ -401,8 +434,8 @@ timePrecision   6;
 runTimeModifiable true;
 
 adjustTimeStep  yes;
-maxCo           0.5;
-maxDeltaT       1e-03;
+maxCo           {max_co};
+maxDeltaT       {max_delta_t:.6g};
 
 functions
 {{
@@ -450,19 +483,19 @@ def generate_fv_schemes() -> str:
         + """
 ddtSchemes
 {
-    default         backward;
+    default         Euler;
 }
 
 gradSchemes
 {
-    default         Gauss linear;
+    default         cellLimited Gauss linear 1;
 }
 
 divSchemes
 {
     default         none;
-    div(phi,U)      Gauss LUST grad(U);
-    div(phi,nut)    Gauss limitedLinear 1;
+    div(phi,U)      bounded Gauss linearUpwind grad(U);
+    div(phi,nut)    bounded Gauss limitedLinear 1;
     div((nuEff*dev2(T(grad(U))))) Gauss linear;
 }
 
@@ -498,7 +531,13 @@ solvers
         solver          GAMG;
         smoother        GaussSeidel;
         tolerance       1e-06;
-        relTol          0.01;
+        relTol          0;
+        nCellsInCoarsestLevel 20;
+        agglomerator    faceAreaPair;
+        mergeLevels     1;
+        cacheAgglomeration true;
+        maxIter         100;
+        minIter         1;
     }
 
     pFinal
@@ -512,7 +551,7 @@ solvers
         solver          PBiCGStab;
         preconditioner  DILU;
         tolerance       1e-08;
-        relTol          0.1;
+        relTol          0.01;
     }
 
     "(U|nut)Final"
@@ -524,11 +563,36 @@ solvers
 
 PIMPLE
 {
-    nOuterCorrectors    2;
-    nCorrectors         1;
-    nNonOrthogonalCorrectors 0;
+    nOuterCorrectors    20;
+    nCorrectors         2;
+    nNonOrthogonalCorrectors 1;
     pRefCell            0;
     pRefValue           0;
+
+    residualControl
+    {
+        U
+        {
+            tolerance   1e-5;
+            relTol      0;
+        }
+        p
+        {
+            tolerance   1e-4;
+            relTol      0;
+        }
+    }
+}
+
+relaxationFactors
+{
+    equations
+    {
+        U               0.7;
+        UFinal          1;
+        p               0.2;
+        pFinal          1;
+    }
 }
 
 // ************************************************************************* //
@@ -550,61 +614,279 @@ method          scotch;
     )
 
 
-# ── constant/ dictionaries ───────────────────────────────────────────
+def generate_mesh_dict(
+    stl_filename: str,
+    patch_names: list[str],
+    max_cell_size: float = 0.8,
+    boundary_cell_size: float = 0.35,
+    num_layers: int = 3,
+    thickness_ratio: float = 0.5,
+    max_first_layer_thickness: float = 0.05,
+    wall_cell_size: Optional[float] = None,
+) -> str:
+    """cfMesh meshDict for polyhedral meshing with pMesh.
 
-def generate_transport_properties() -> str:
-    """Blood: kinematic viscosity nu = 3.3e-06 m^2/s (mu=3.5e-3 Pa.s, rho=1060 kg/m^3)."""
+    Parameters
+    ----------
+    stl_filename : str
+        Name of the multi-solid STL file in ``constant/triSurface/``.
+    patch_names : list[str]
+        All patch names (e.g. ``['inlet', 'outlet_1', 'outlet_2', 'wall']``).
+    max_cell_size : float
+        Global maximum cell size.
+    boundary_cell_size : float
+        Cell size on boundary surfaces.
+    num_layers : int
+        Number of boundary layer cells on wall patches.
+    thickness_ratio : float
+        Boundary layer expansion ratio.
+    max_first_layer_thickness : float
+        Maximum thickness of the first boundary layer cell.
+    wall_cell_size : float, optional
+        Local refinement cell size on wall patches. Defaults to
+        ``boundary_cell_size * 0.5`` when None.
+    """
+    if wall_cell_size is None:
+        wall_cell_size = boundary_cell_size * 0.5
+    stl_path = f'"constant/triSurface/{stl_filename}"'
+
+    # Wall patches get boundary layers and finer local refinement
+    wall_patches = [n for n in patch_names if classify_patch(n) == "wall"]
+
+    # Build patchBoundaryLayers entries for wall patches
+    bl_entries = []
+    for name in wall_patches:
+        bl_entries.append(
+            f"        {name}\n"
+            f"        {{\n"
+            f"            nLayers {num_layers};\n"
+            f"            thicknessRatio {thickness_ratio};\n"
+            f"            maxFirstLayerThickness {max_first_layer_thickness};\n"
+            f"        }}"
+        )
+    bl_block = "\n".join(bl_entries)
+
+    # Build renameBoundary entries — set correct patch types
+    # cfMesh expects a dictionary keyed by original patch name, not a list
+    rename_entries = []
+    for name in patch_names:
+        ptype = _patch_type(classify_patch(name))
+        rename_entries.append(
+            f"        {name}\n"
+            f"        {{\n"
+            f"            newName {name};\n"
+            f"            type {ptype};\n"
+            f"        }}"
+        )
+    rename_block = "\n".join(rename_entries)
+
+    # Build localRefinement on wall for finer surface resolution
+    refine_entries = []
+    for name in wall_patches:
+        refine_entries.append(
+            f"        {name}\n"
+            f"        {{\n"
+            f"            cellSize {wall_cell_size};\n"
+            f"        }}"
+        )
+    refine_block = "\n".join(refine_entries)
+
     return (
-        _header("dictionary", "transportProperties")
-        + """
-transportModel  Newtonian;
+        _header("dictionary", "meshDict")
+        + f"""
+surfaceFile {stl_path};
 
-nu              [0 2 -1 0 0 0 0] 3.3e-06;
+maxCellSize {max_cell_size};
+
+boundaryCellSize {boundary_cell_size};
+
+boundaryLayers
+{{
+    patchBoundaryLayers
+    {{
+{bl_block}
+    }}
+}}
+
+renameBoundary
+{{
+    defaultName fixedWalls;
+    defaultType wall;
+
+    newPatchNames
+    {{
+{rename_block}
+    }}
+}}
+
+localRefinement
+{{
+{refine_block}
+}}
 
 // ************************************************************************* //
 """
     )
 
 
-def generate_turbulence_properties() -> str:
-    """LES with Smagorinsky subgrid-scale model."""
+def generate_run_docker_sh() -> str:
+    """Docker wrapper script to run pMesh + solver via ``opencfd/openfoam-default:2512``.
+
+    Features:
+    - ``tee`` on every stage for log files (``log.pMesh``, ``log.pimpleFoam``, …)
+    - ``--name meshprep-<stage>`` on each container for external ``docker stop``
+    - ``stdbuf -oL`` for line-buffered output (prevents tee delay)
+    - ``trap`` handler to stop running containers on SIGTERM/SIGINT
+    - ``set -o pipefail`` so pipe failures propagate correctly
+    """
+    return f"""\
+#!/bin/bash
+# Run cfMesh pMesh + pimpleFoam inside Docker (OpenFOAM v2512)
+#
+# Usage: ./run_docker.sh [nprocs]
+#   nprocs  - number of CPU cores for parallel solve (default: 1 = serial)
+#
+# Examples:
+#   ./run_docker.sh        # serial
+#   ./run_docker.sh 8      # parallel on 8 cores
+#
+# Prerequisites:
+#   - Docker installed and running
+#   - Image: opencfd/openfoam-default:2512
+
+set -eo pipefail
+
+NPROCS="${{1:-1}}"
+CASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+IMAGE="opencfd/openfoam-default:2512"
+OF_BASHRC="source /usr/lib/openfoam/openfoam2512/etc/bashrc && cd /case"
+
+cleanup() {{
+    docker stop meshprep-pmesh meshprep-checkmesh meshprep-decompose meshprep-solver meshprep-reconstruct 2>/dev/null || true
+}}
+trap cleanup EXIT SIGTERM SIGINT
+
+echo "=== Pulling Docker image (if needed) ==="
+docker pull "$IMAGE"
+
+echo "=== Running pMesh ==="
+docker run --rm --name meshprep-pmesh \\
+    -v "$CASE_DIR":/case \\
+    -w /case \\
+    "$IMAGE" \\
+    bash -c "$OF_BASHRC && stdbuf -oL pMesh" 2>&1 | tee log.pMesh
+
+echo "=== Running checkMesh ==="
+docker run --rm --name meshprep-checkmesh \\
+    -v "$CASE_DIR":/case \\
+    -w /case \\
+    "$IMAGE" \\
+    bash -c "$OF_BASHRC && stdbuf -oL checkMesh" 2>&1 | tee log.checkMesh
+
+if [ "$NPROCS" -gt 1 ]; then
+    echo "=== Decomposing mesh for $NPROCS processors ==="
+    docker run --rm --name meshprep-decompose \\
+        -v "$CASE_DIR":/case \\
+        -w /case \\
+        "$IMAGE" \\
+        bash -c "$OF_BASHRC && stdbuf -oL decomposePar" 2>&1 | tee log.decomposePar
+
+    echo "=== Running pimpleFoam in parallel ($NPROCS cores) ==="
+    echo "    Log: $CASE_DIR/solver.log  (monitor with: tail -f solver.log)"
+    docker run --rm --name meshprep-solver \\
+        -v "$CASE_DIR":/case \\
+        -w /case \\
+        "$IMAGE" \\
+        bash -c "$OF_BASHRC && mpirun --allow-run-as-root -np $NPROCS pimpleFoam -parallel > /case/solver.log 2>&1"
+
+    echo "=== Reconstructing parallel results ==="
+    docker run --rm --name meshprep-reconstruct \\
+        -v "$CASE_DIR":/case \\
+        -w /case \\
+        "$IMAGE" \\
+        bash -c "$OF_BASHRC && stdbuf -oL reconstructPar" 2>&1 | tee log.reconstructPar
+else
+    echo "=== Running pimpleFoam (serial) ==="
+    echo "    Log: $CASE_DIR/solver.log  (monitor with: tail -f solver.log)"
+    docker run --rm --name meshprep-solver \\
+        -v "$CASE_DIR":/case \\
+        -w /case \\
+        "$IMAGE" \\
+        bash -c "$OF_BASHRC && pimpleFoam > /case/solver.log 2>&1"
+fi
+
+echo "=== Done ==="
+echo "Results in: $CASE_DIR"
+"""
+
+
+# ── constant/ dictionaries ───────────────────────────────────────────
+
+def generate_transport_properties(nu: float = 3.3e-6) -> str:
+    """Blood: kinematic viscosity (default nu = 3.3e-06 m^2/s).
+
+    Parameters
+    ----------
+    nu : float
+        Kinematic viscosity in m^2/s.
+    """
+    return (
+        _header("dictionary", "transportProperties")
+        + f"""
+transportModel  Newtonian;
+
+nu              [0 2 -1 0 0 0 0] {nu:.6g};
+
+// ************************************************************************* //
+"""
+    )
+
+
+def generate_turbulence_properties(cs: float = 0.1) -> str:
+    """LES with Smagorinsky subgrid-scale model.
+
+    Parameters
+    ----------
+    cs : float
+        Smagorinsky constant.
+    """
     return (
         _header("dictionary", "turbulenceProperties")
-        + """
+        + f"""
 simulationType  LES;
 
 LES
-{
+{{
     LESModel        Smagorinsky;
 
     SmagorinskyCoeffs
-    {
-        Cs              0.1;
-    }
+    {{
+        Cs              {cs};
+    }}
 
     delta           cubeRootVol;
 
     cubeRootVolCoeffs
-    {
+    {{
         deltaCoeff      1;
-    }
+    }}
 
     printCoeffs     on;
-}
+}}
 
 // ************************************************************************* //
 """
     )
 
 
-def generate_mass_flow_rate_csv() -> str:
-    """Template aortic pulsatile waveform (0.8 s period, ~20 points, values in kg/s).
+def generate_volumetric_flow_rate_csv() -> str:
+    """Template aortic pulsatile waveform (0.8 s period, ~20 points, values in m^3/s).
 
     This is a representative aortic flow waveform scaled for a typical
     descending aorta cross-section.  Replace with patient-specific data.
     """
     return """\
-time,massFlowRate
+time,volumetricFlowRate
 0.000,0.050
 0.040,0.080
 0.080,0.200
@@ -681,6 +963,7 @@ def generate_U(
     patch_names: list[str],
     inlet_normals: Optional[dict[str, tuple]] = None,
     geo_name: str = "",
+    velocity_magnitude: float = 0.3,
 ) -> str:
     """Velocity BC with constant velocity active and pulsatile commented.
 
@@ -691,9 +974,11 @@ def generate_U(
     inlet_normals : dict, optional
         {patch_name: (nx, ny, nz)} for inlet patches.  The normal points
         *outward* from the domain (STL/CFD convention).  Velocity is set in
-        the *opposite* direction (flow enters the domain).  Magnitude ~0.3 m/s.
+        the *opposite* direction (flow enters the domain).
     geo_name : str
         Geometry name prefix for patch names.
+    velocity_magnitude : float
+        Inlet velocity magnitude in m/s.
     """
     if inlet_normals is None:
         inlet_normals = {}
@@ -712,11 +997,11 @@ def generate_U(
             if normal is not None:
                 # Flow direction is opposite to the clip normal (into domain)
                 mag = math.sqrt(sum(c * c for c in normal)) or 1.0
-                vx = -normal[0] / mag * 0.3 + 0.0  # +0.0 avoids -0.0
-                vy = -normal[1] / mag * 0.3 + 0.0
-                vz = -normal[2] / mag * 0.3 + 0.0
+                vx = -normal[0] / mag * velocity_magnitude + 0.0  # +0.0 avoids -0.0
+                vy = -normal[1] / mag * velocity_magnitude + 0.0
+                vz = -normal[2] / mag * velocity_magnitude + 0.0
             else:
-                vx, vy, vz = 0.3, 0.0, 0.0
+                vx, vy, vz = velocity_magnitude, 0.0, 0.0
 
             entries.append(
                 f"    {full_name}\n"
@@ -727,15 +1012,15 @@ def generate_U(
                 f"\n"
                 f"        // === PULSATILE FLOW (uncomment below, comment out above) ===\n"
                 f"        // type            flowRateInletVelocity;\n"
-                f"        // massFlowRate    csvFile;\n"
-                f"        // massFlowRateCoeffs\n"
+                f"        // volumetricFlowRate csvFile;\n"
+                f"        // volumetricFlowRateCoeffs\n"
                 f"        // {{\n"
                 f"        //     nHeaderLine     1;\n"
                 f"        //     refColumn       0;\n"
                 f"        //     componentColumns (1);\n"
                 f"        //     separator       \",\";\n"
                 f"        //     mergeSeparators no;\n"
-                f"        //     file            \"massFlowRate.csv\";\n"
+                f"        //     file            \"volumetricFlowRate.csv\";\n"
                 f"        // }}\n"
                 f"        // value           uniform (0 0 0);\n"
                 f"    }}"
@@ -839,10 +1124,44 @@ source /Applications/OpenFOAM-v2412.app/Contents/Resources/etc/bashrc
 """
 
 
-def generate_allrun() -> str:
-    """Full mesh + solve pipeline:
-    blockMesh → snappyHexMesh → checkMesh → pimpleFoam
+def generate_allrun(meshing_method: str = "pmesh") -> str:
+    """Full mesh + solve pipeline.
+
+    Parameters
+    ----------
+    meshing_method : str
+        ``"pmesh"``  — cfMesh pMesh (default, Docker-based).
+        ``"snappy"`` — blockMesh + snappyHexMesh + digit-prefix sed fix.
     """
+    if meshing_method == "pmesh":
+        return _generate_allrun_pmesh()
+    return _generate_allrun_snappy()
+
+
+def _generate_allrun_pmesh() -> str:
+    return """\
+#!/bin/bash
+cd "${0%/*}" || exit 1    # Run from this directory
+source env.sh || { echo "Cannot source env.sh"; exit 1; }
+
+# Source OpenFOAM run functions
+. "$WM_PROJECT_DIR/bin/tools/RunFunctions"
+
+# pMesh requires cfMesh (not included in standard ESI OpenFOAM on macOS).
+# If pMesh is not available natively, use ./run_docker.sh instead.
+runApplication pMesh
+
+runApplication checkMesh
+runApplication pimpleFoam
+
+echo "Opening ParaView..."
+paraview --script=visualize.py &
+
+# ----------------------------------------------------------------- end-of-file
+"""
+
+
+def _generate_allrun_snappy() -> str:
     return """\
 #!/bin/bash
 cd "${0%/*}" || exit 1    # Run from this directory
@@ -858,7 +1177,7 @@ runApplication snappyHexMesh -overwrite
 # (snappyHexMesh writes them unquoted, but OpenFOAM parser reads leading digits as numbers)
 boundary="constant/polyMesh/boundary"
 if [ -f "$boundary" ]; then
-    sed -i.bak -E 's/^([[:space:]]+)([0-9][0-9]*_[a-zA-Z][a-zA-Z0-9_]*)/\1"\2"/' "$boundary"
+    sed -i.bak -E 's/^([[:space:]]+)([0-9][0-9]*_[a-zA-Z][a-zA-Z0-9_]*)/\\1"\\2"/' "$boundary"
     rm -f "${boundary}.bak"
 fi
 
@@ -872,8 +1191,14 @@ paraview --script=visualize.py &
 """
 
 
-def generate_allclean() -> str:
-    """Remove generated mesh, results, and logs."""
+def generate_allclean(meshing_method: str = "pmesh") -> str:
+    """Remove generated mesh, results, and logs.
+
+    Parameters
+    ----------
+    meshing_method : str
+        ``"pmesh"`` or ``"snappy"`` — cleanup is the same for both.
+    """
     return """\
 #!/bin/bash
 cd "${0%/*}" || exit 1    # Run from this directory
@@ -1019,6 +1344,7 @@ def generate_diagnose_patches_py(
     patch_names: list[str],
     inlet_normals: Optional[dict[str, tuple]] = None,
     geo_name: str = "",
+    velocity_magnitude: float = 0.3,
 ) -> str:
     """Generate a ParaView script to visualize boundary patches and inlet velocity.
 
@@ -1036,6 +1362,8 @@ def generate_diagnose_patches_py(
         {patch_name: (nx, ny, nz)} outward-pointing normals for inlets.
     geo_name : str
         Geometry name prefix for ParaView region paths.
+    velocity_magnitude : float
+        Inlet velocity magnitude in m/s.
     """
     if inlet_normals is None:
         inlet_normals = {}
@@ -1095,11 +1423,11 @@ def generate_diagnose_patches_py(
         normal = inlet_normals.get(name)
         if normal is not None:
             mag = math.sqrt(sum(c * c for c in normal)) or 1.0
-            vx = -normal[0] / mag * 0.3 + 0.0
-            vy = -normal[1] / mag * 0.3 + 0.0
-            vz = -normal[2] / mag * 0.3 + 0.0
+            vx = -normal[0] / mag * velocity_magnitude + 0.0
+            vy = -normal[1] / mag * velocity_magnitude + 0.0
+            vz = -normal[2] / mag * velocity_magnitude + 0.0
             vel_strs.append(
-                f"{name}: ({vx:.6f}, {vy:.6f}, {vz:.6f}) m/s  |U|=0.30 m/s"
+                f"{name}: ({vx:.6f}, {vy:.6f}, {vz:.6f}) m/s  |U|={velocity_magnitude:.2f} m/s"
             )
 
     vel_report = "\\n".join(vel_strs) if vel_strs else "No inlet normals provided"
@@ -1276,4 +1604,436 @@ print("\\nDone! Check diagnostics/ directory for:")
 print("  patches_*.png        - Colored boundary patches with inlet velocity arrows")
 print("  velocity_slice_*.png - Velocity magnitude + direction on mid-plane slice")
 print(f"\\nInlet BC velocity: {vel_report}")
+'''
+
+
+def generate_plot_residuals_py() -> str:
+    """Generate plot_residuals.py — solver convergence monitoring script.
+
+    The script is case-independent: it reads all settings from system/ files
+    at runtime.  Returns the full Python script as a string.
+    """
+    return r'''#!/usr/bin/env python
+"""Parse solver.log and auto-update residual plots every 30s.
+
+StarCCM+-style: x-axis is cumulative PIMPLE iteration (every outer iteration),
+so you see the sawtooth convergence within each timestep.
+
+Usage:
+    python plot_residuals.py                    # live window + PNG, update every 5s
+    python plot_residuals.py --headless         # PNG only (for background runs)
+    python plot_residuals.py --interval 10      # custom update interval in seconds
+"""
+
+import re
+import os
+import sys
+import time as pytime
+
+HEADLESS = "--headless" in sys.argv
+
+if HEADLESS:
+    import matplotlib
+    matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+LOG = "solver.log"
+OUT = "residuals.png"
+# Parse --interval N from command line, default 5s
+_interval_idx = next((i for i, a in enumerate(sys.argv) if a == "--interval"), None)
+INTERVAL = int(sys.argv[_interval_idx + 1]) if _interval_idx and _interval_idx + 1 < len(sys.argv) else 5
+CASE_NAME = os.path.basename(os.getcwd())
+
+
+def read_case_settings():
+    """Read simulation settings from system/ dict files."""
+    settings = {
+        "application": "unknown",
+        "end_time": None,
+        "delta_t": None,
+        "n_outer": 20,
+        "u_tol": None,
+        "p_tol": None,
+    }
+
+    # --- controlDict ---
+    cd = os.path.join("system", "controlDict")
+    if os.path.exists(cd):
+        with open(cd) as f:
+            for line in f:
+                line = line.strip()
+                m = re.match(r"application\s+(\S+);", line)
+                if m:
+                    settings["application"] = m.group(1)
+                    continue
+                m = re.match(r"endTime\s+([\d.e+-]+);", line)
+                if m:
+                    settings["end_time"] = float(m.group(1))
+                    continue
+                m = re.match(r"deltaT\s+([\d.e+-]+);", line)
+                if m:
+                    settings["delta_t"] = float(m.group(1))
+                    continue
+
+    # --- fvSolution ---
+    fv = os.path.join("system", "fvSolution")
+    if os.path.exists(fv):
+        with open(fv) as f:
+            text = f.read()
+        m = re.search(r"nOuterCorrectors\s+(\d+)", text)
+        if m:
+            settings["n_outer"] = int(m.group(1))
+        # Parse residualControl block — ESI uses "residualControl", Foundation uses "outerCorrectorResidualControl"
+        blk = re.search(
+            r"(?:outerCorrectorResidualControl|residualControl)\s*\{((?:[^{}]*\{[^{}]*\})*[^{}]*)\}",
+            text,
+        )
+        if blk:
+            body = blk.group(1)
+            # Find U { tolerance ...; } and p { tolerance ...; }
+            for var, key in [("U", "u_tol"), ("p", "p_tol")]:
+                vm = re.search(
+                    rf"\b{var}\s*\{{[^}}]*tolerance\s+([\d.e+-]+)",
+                    body,
+                )
+                if vm:
+                    settings[key] = float(vm.group(1))
+
+    return settings
+
+
+re_time = re.compile(r"^Time = ([\d.e+-]+)$")
+re_courant = re.compile(r"Courant Number mean: ([\d.e+-]+) max: ([\d.e+-]+)")
+re_cont = re.compile(r"time step continuity errors : sum local = ([\d.e+-]+), global = ([\d.e+-]+)")
+re_ux = re.compile(r'Solving for Ux, Initial residual = ([\d.e+-]+)')
+re_uy = re.compile(r'Solving for Uy, Initial residual = ([\d.e+-]+)')
+re_uz = re.compile(r'Solving for Uz, Initial residual = ([\d.e+-]+)')
+re_p = re.compile(r'Solving for p, Initial residual = ([\d.e+-]+)')
+re_pimple = re.compile(r'PIMPLE: iteration (\d+)')
+
+
+def parse_log():
+    """Parse solver.log, returning per-PIMPLE-iteration data (StarCCM+ style)."""
+    # Per cumulative iteration (every PIMPLE outer iter)
+    all_ux, all_uy, all_uz, all_p = [], [], [], []
+    cont_local = []
+    # Track timestep boundaries (cumulative iter index where each timestep starts)
+    ts_boundaries = []
+    # Per timestep
+    times, co_max, co_mean = [], [], []
+    pimple_iters = []
+
+    current_time = None
+    cum_iter = 0
+    ts_max_pimple = 0
+    # Buffer for current PIMPLE iteration within a timestep
+    iter_ux, iter_uy, iter_uz, iter_p = None, None, None, None
+
+    with open(LOG) as f:
+        for line in f:
+            m = re_time.match(line.strip())
+            if m:
+                # Flush previous timestep
+                if current_time is not None:
+                    times.append(current_time)
+                    pimple_iters.append(ts_max_pimple)
+                current_time = float(m.group(1))
+                ts_boundaries.append(cum_iter)
+                ts_max_pimple = 0
+                continue
+
+            m = re_pimple.search(line)
+            if m:
+                pimple_num = int(m.group(1))
+                ts_max_pimple = max(ts_max_pimple, pimple_num)
+                # Each PIMPLE iteration = one cumulative iteration
+                # Reset per-iter buffers
+                iter_ux, iter_uy, iter_uz, iter_p = None, None, None, None
+                continue
+
+            m = re_courant.search(line)
+            if m:
+                co_mean.append(float(m.group(1)))
+                co_max.append(float(m.group(2)))
+                continue
+
+            m = re_cont.search(line)
+            if m:
+                cont_local.append(float(m.group(1)))
+                continue
+
+            m = re_ux.search(line)
+            if m:
+                val = float(m.group(1))
+                if iter_ux is None:
+                    iter_ux = val
+                    all_ux.append(val)
+                    cum_iter = len(all_ux)
+                continue
+            m = re_uy.search(line)
+            if m:
+                val = float(m.group(1))
+                if iter_uy is None:
+                    iter_uy = val
+                    all_uy.append(val)
+                continue
+            m = re_uz.search(line)
+            if m:
+                val = float(m.group(1))
+                if iter_uz is None:
+                    iter_uz = val
+                    all_uz.append(val)
+                continue
+            m = re_p.search(line)
+            if m:
+                val = float(m.group(1))
+                if iter_p is None:
+                    iter_p = val
+                    all_p.append(val)
+                continue
+
+    # Flush last timestep
+    if current_time is not None:
+        times.append(current_time)
+        pimple_iters.append(ts_max_pimple)
+
+    return dict(
+        # Per cumulative PIMPLE iteration
+        all_ux=all_ux, all_uy=all_uy, all_uz=all_uz, all_p=all_p,
+        cont_local=cont_local,
+        ts_boundaries=ts_boundaries,
+        # Per timestep
+        times=times, co_max=co_max, co_mean=co_mean,
+        pimple_iters=pimple_iters,
+    )
+
+
+def _add_ts_lines(ax, boundaries, label=True):
+    """Add faint vertical lines at timestep boundaries."""
+    for i, b in enumerate(boundaries):
+        ax.axvline(x=b, color="gray", alpha=0.15, lw=0.5,
+                   label="timestep" if (i == 0 and label) else None)
+
+
+def _add_time_twin_axis(ax, bounds, times, n_iter):
+    """Add a twin x-axis on top showing simulation time [s]."""
+    if len(bounds) < 2 or len(times) < 2:
+        return
+    ax2 = ax.twiny()
+    # Pick ~6 evenly-spaced timesteps for tick labels
+    n_ticks = min(6, len(times))
+    indices = np.linspace(0, len(times) - 1, n_ticks, dtype=int)
+    tick_positions = [bounds[i] if i < len(bounds) else n_iter for i in indices]
+    tick_labels = [f"{times[i]:.4f}" for i in indices]
+    ax2.set_xlim(ax.get_xlim())
+    ax2.set_xticks(tick_positions)
+    ax2.set_xticklabels(tick_labels, fontsize=7)
+    ax2.set_xlabel("Time [s]", fontsize=8)
+
+
+def update_plot(fig, axes, d, settings):
+    """Clear and redraw all axes in-place."""
+    n_iter = len(d["all_ux"])
+    n_ts = len(d["times"])
+    if n_iter < 2:
+        return False
+
+    n_outer = settings["n_outer"]
+
+    # Remove twin axes from previous draw, then clear
+    for child_ax in fig.axes[:]:
+        if child_ax not in axes:
+            child_ax.remove()
+    for ax in axes:
+        ax.clear()
+
+    iters = np.arange(n_iter)
+    bounds = d["ts_boundaries"]
+
+    # Build dynamic title from case settings
+    app = settings["application"]
+    dt_str = f"dt={settings['delta_t']}" if settings["delta_t"] is not None else ""
+    end_str = f"/{settings['end_time']}s" if settings["end_time"] is not None else "s"
+    title = f"{CASE_NAME} - {app}"
+    if dt_str:
+        title += f"  |  {dt_str}"
+    title += f"  |  t={d['times'][-1]:.4f}{end_str}  |  {n_ts} steps  |  {n_iter} iters"
+
+    fig.suptitle(title, fontsize=13)
+
+    # Row 0: Ux, Uy, Uz residuals (one subplot each)
+    for i, (vals, name) in enumerate(
+        [(d["all_ux"], "Ux"), (d["all_uy"], "Uy"), (d["all_uz"], "Uz")]
+    ):
+        ax = axes[i]
+        n = min(len(vals), n_iter)
+        ax.semilogy(iters[:n], vals[:n], lw=0.8, alpha=0.9)
+        _add_ts_lines(ax, bounds)
+        if settings["u_tol"] is not None:
+            ax.axhline(y=settings["u_tol"], color="green", ls=":", alpha=0.5,
+                       label="target")
+            ax.legend(fontsize=7)
+        ax.set_ylabel("Residual")
+        ax.set_title(f"{name} Residual")
+        ax.grid(True, alpha=0.3)
+        _add_time_twin_axis(ax, bounds, d["times"], n_iter)
+        if i >= 1:
+            ax.set_xlabel("Cumulative PIMPLE iteration")
+
+    # Row 1 left: Pressure residual
+    ax = axes[3]
+    n = min(len(d["all_p"]), n_iter)
+    ax.semilogy(iters[:n], d["all_p"][:n], lw=0.8, alpha=0.9, color="C3")
+    _add_ts_lines(ax, bounds)
+    if settings["p_tol"] is not None:
+        ax.axhline(y=settings["p_tol"], color="green", ls=":", alpha=0.5,
+                   label="target")
+        ax.legend(fontsize=7)
+    ax.set_ylabel("Residual")
+    ax.set_title("Pressure Residual")
+    ax.set_xlabel("Cumulative PIMPLE iteration")
+    ax.grid(True, alpha=0.3)
+    _add_time_twin_axis(ax, bounds, d["times"], n_iter)
+
+    # Row 1 right: Continuity errors
+    ax = axes[4]
+    ax.semilogy(d["cont_local"], lw=0.6, alpha=0.7, color="C4")
+    ax.set_ylabel("Continuity Error")
+    ax.set_xlabel("Cumulative PIMPLE iteration")
+    ax.set_title("Continuity Errors (sum local)")
+    ax.grid(True, alpha=0.3)
+
+    # Row 1 right: Courant number (expanded to cumulative PIMPLE iter axis)
+    ax = axes[5]
+    nt = min(n_ts, len(d["co_max"]))
+    if nt > 0 and len(bounds) >= nt:
+        # Expand per-timestep Co to per-iteration using step function
+        co_max_exp, co_mean_exp = [], []
+        for ti in range(nt):
+            start = bounds[ti]
+            end = bounds[ti + 1] if ti + 1 < len(bounds) else n_iter
+            n_fill = end - start
+            co_max_exp.extend([d["co_max"][ti]] * n_fill)
+            co_mean_exp.extend([d["co_mean"][ti]] * n_fill)
+        x = np.arange(len(co_max_exp))
+        ax.plot(x, co_max_exp, label="Co max", color="red", lw=0.8)
+        ax.plot(x, co_mean_exp, label="Co mean", color="blue", lw=0.8)
+        _add_ts_lines(ax, bounds)
+    ax.set_ylabel("Courant Number")
+    ax.set_xlabel("Cumulative PIMPLE iteration")
+    ax.set_title("Courant Number")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # Row 2 right: PIMPLE outer iterations per timestep
+    ax = axes[6]
+    pi = d["pimple_iters"]
+    np_t = min(n_ts, len(pi))
+    if np_t > 1:
+        dt_w = (d["times"][1] - d["times"][0]) * 0.8
+        ax.bar(d["times"][:np_t], pi[:np_t], width=dt_w,
+               color="steelblue", alpha=0.7)
+    ax.set_ylabel("PIMPLE Outer Iters")
+    ax.set_xlabel("Time [s]")
+    ax.set_title(f"PIMPLE Outer Correctors (max={n_outer})")
+    ax.axhline(y=n_outer, color="red", ls="--", alpha=0.5,
+               label="nOuterCorrectors limit")
+    if settings["end_time"] is not None:
+        ax.axvline(x=settings["end_time"], color="purple", ls="--", alpha=0.5,
+                   label=f"endTime={settings['end_time']}")
+    ax.set_ylim(0, n_outer * 1.1)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3, axis="y")
+
+    if not HEADLESS:
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
+    plt.savefig(OUT, dpi=150, bbox_inches="tight")
+    if HEADLESS:
+        plt.close(fig)
+    return True
+
+
+def _create_figure():
+    fig = plt.figure(figsize=(16, 14))
+    gs = fig.add_gridspec(3, 3, hspace=0.38, wspace=0.3)
+    axes = [
+        fig.add_subplot(gs[0, 0]),  # Ux
+        fig.add_subplot(gs[0, 1]),  # Uy
+        fig.add_subplot(gs[0, 2]),  # Uz
+        fig.add_subplot(gs[1, 0]),  # p
+        fig.add_subplot(gs[1, 1]),  # continuity
+        fig.add_subplot(gs[1, 2]),  # courant
+        fig.add_subplot(gs[2, :]),  # PIMPLE iters (full width)
+    ]
+    return fig, axes
+
+
+def _sleep(seconds):
+    if HEADLESS:
+        pytime.sleep(seconds)
+    else:
+        plt.pause(seconds)
+
+
+def main():
+    settings = read_case_settings()
+
+    if not HEADLESS:
+        plt.ion()
+        fig, axes = _create_figure()
+        plt.show(block=False)
+
+    prev_size = 0
+    iteration = 0
+    while True:
+        if not HEADLESS and not plt.fignum_exists(fig.number):
+            print("Window closed. Exiting.")
+            break
+
+        if not os.path.exists(LOG):
+            print("Waiting for solver.log...")
+            _sleep(INTERVAL)
+            continue
+
+        cur_size = os.path.getsize(LOG)
+        if cur_size == prev_size and iteration > 0:
+            print(f"[{pytime.strftime('%H:%M:%S')}] No new data (log size {cur_size}). Solver done?")
+            d = parse_log()
+            if d["all_ux"]:
+                if HEADLESS:
+                    fig, axes = _create_figure()
+                update_plot(fig, axes, d, settings)
+                print(f"Final plot saved: t={d['times'][-1]:.4f}s, "
+                      f"{len(d['times'])} steps, {len(d['all_ux'])} iters")
+            break
+
+        prev_size = cur_size
+        d = parse_log()
+        if d["all_ux"]:
+            n_ts = len(d["times"])
+            n_it = len(d["all_ux"])
+            co_str = f"Co max={max(d['co_max']):.1f}" if d["co_max"] else ""
+            cont_str = f"cont={max(d['cont_local']):.1e}" if d["cont_local"] else ""
+            if HEADLESS:
+                fig, axes = _create_figure()
+            update_plot(fig, axes, d, settings)
+            print(f"[{pytime.strftime('%H:%M:%S')}] t={d['times'][-1]:.4f}s  "
+                  f"steps={n_ts}  iters={n_it}  {co_str}  {cont_str}  -> {OUT}")
+        else:
+            print(f"[{pytime.strftime('%H:%M:%S')}] No data parsed yet")
+
+        iteration += 1
+        _sleep(INTERVAL)
+
+    if not HEADLESS:
+        plt.ioff()
+        print("Done. Close window to exit.")
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()
 '''
