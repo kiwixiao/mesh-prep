@@ -206,6 +206,29 @@ class ClipDefinition:
     cap_kind: str = "closed"    # "closed": cap the cut (CFD); "open": leave a hole
 
 
+def _points_in_polygon(xs, ys, polygon):
+    """Vectorized even-odd (ray-casting) point-in-polygon test.
+
+    xs, ys : 1-D float arrays of point coordinates (same length N).
+    polygon: sequence of (x, y) vertices, length M >= 3.
+    Returns a boolean array (N,) — True where the point is inside the polygon.
+    """
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    poly = np.asarray(polygon, dtype=float)
+    inside = np.zeros(xs.shape, dtype=bool)
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        crosses = (yi > ys) != (yj > ys)
+        x_at_y = (xj - xi) * (ys - yi) / (yj - yi + 1e-30) + xi
+        inside ^= crosses & (xs < x_at_y)
+        j = i
+    return inside
+
+
 class STLClipperEngine:
     """
     Core mesh clipping logic — no Qt dependency.
