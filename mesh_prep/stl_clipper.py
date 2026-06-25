@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import types
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -244,6 +245,7 @@ class STLClipperEngine:
         self.original_mesh: Optional[pv.PolyData] = None
         self.clips: list[ClipDefinition] = []
         self._wall_mesh: Optional[pv.PolyData] = None
+        self._trim_history: deque = deque(maxlen=10)
 
     def load_stl(self, filepath: str) -> pv.PolyData:
         mesh = pv.read(filepath)
@@ -421,7 +423,7 @@ class STLClipperEngine:
     def recompute_all(self):
         """Apply all clips from the original mesh using box-scoped cutting."""
         if self.original_mesh is None:
-            return
+            return None
         working = self.original_mesh.copy()
         for clip_def in self.clips:
             try:
@@ -444,6 +446,44 @@ class STLClipperEngine:
             except RuntimeError:
                 clip_def.cap_mesh = pv.PolyData()
         self._wall_mesh = working
+        return self._wall_mesh
+
+    def trim_by_screen_polygon(self, polygon_xy, view_matrix, viewport):
+        """Permanently delete cells of original_mesh whose centroid projects
+        inside the freehand outline polygon_xy (through-model). Mutates the base
+        mesh and re-applies clips. Returns the new _wall_mesh, or None on a no-op.
+
+        polygon_xy : list[(x, y)] display-space points (logical pixels)
+        view_matrix: 4x4 array-like, world->clip (camera composite projection)
+        viewport   : (width, height) in logical pixels
+        Raises ValueError if the selection would delete the entire mesh.
+        """
+        if self.original_mesh is None:
+            return None
+        poly = np.asarray(polygon_xy, dtype=float)
+        if poly.shape[0] < 3:
+            return None
+        matrix = np.asarray(view_matrix, dtype=float).reshape(4, 4)
+        width, height = viewport
+        centers = self.original_mesh.cell_centers().points          # (N, 3)
+        n = centers.shape[0]
+        homog = np.hstack([centers, np.ones((n, 1))])               # (N, 4)
+        clip = homog @ matrix.T                                     # (N, 4)
+        w = clip[:, 3].copy()
+        w[w == 0] = 1e-12
+        ndc = clip[:, :3] / w[:, None]
+        disp_x = (ndc[:, 0] * 0.5 + 0.5) * width
+        disp_y = (ndc[:, 1] * 0.5 + 0.5) * height                  # bottom-left origin
+        inside = _points_in_polygon(disp_x, disp_y, poly)
+        n_inside = int(inside.sum())
+        if n_inside == 0:
+            return None
+        if n_inside == n:
+            raise ValueError("Trim would delete the entire mesh")
+        self._trim_history.append(self.original_mesh.copy())
+        keep_ids = np.where(~inside)[0]
+        self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
+        return self.recompute_all()
 
     def get_wall_mesh(self) -> Optional[pv.PolyData]:
         return self._wall_mesh
