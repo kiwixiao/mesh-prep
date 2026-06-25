@@ -1,0 +1,23 @@
+{
+  "name": "LES Aorta (Blood Flow)",
+  "simulation_type": "les",
+  "mesh": {
+    "maxCellSize": 0.0012,
+    "boundaryCellSize": 0.0005,
+    "wallCellSize": 0.00025,
+    "nLayers": 2,
+    "thicknessRatio": 0.5,
+    "maxFirstLayerThickness": 0.05
+  },
+  "solver": {
+    "endTime": 1.6,
+    "deltaT": 1e-5,
+    "writeInterval": 0.01,
+    "maxCo": 0.5,
+    "maxDeltaT": 1e-3
+  },
+  "fluid": { "nu": 3.3e-6 },
+  "turbulence": { "model": "Smagorinsky", "Cs": 0.1 },
+  "inlet": { "velocityMagnitude": 0.3 },
+  "decompose": { "nProcs": 12 }
+}

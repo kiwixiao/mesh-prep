@@ -1,0 +1,23 @@
+{
+  "name": "RANS Aorta (Blood Flow)",
+  "simulation_type": "rans",
+  "mesh": {
+    "maxCellSize": 0.0012,
+    "boundaryCellSize": 0.0005,
+    "wallCellSize": 0.00025,
+    "nLayers": 2,
+    "thicknessRatio": 0.5,
+    "maxFirstLayerThickness": 0.05
+  },
+  "solver": {
+    "endTime": 0.8,
+    "deltaT": 1e-4,
+    "writeInterval": 0.01,
+    "maxCo": 5,
+    "maxDeltaT": 1e-2
+  },
+  "fluid": { "nu": 3.3e-6 },
+  "turbulence": { "model": "kOmegaSST", "k": 3.375e-4, "omega": 30 },
+  "inlet": { "velocityMagnitude": 0.3 },
+  "decompose": { "nProcs": 12 }
+}

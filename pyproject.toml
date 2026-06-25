@@ -9,6 +9,7 @@ description = "Interactive STL boundary patch clipper for CFD mesh preparation"
 requires-python = ">=3.9"
 dependencies = [
     "numpy",
+    "PyQt5",
     "pyvista",
     "pyvistaqt",
     "vtk",
@@ -16,10 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 centerline = ["vmtk"]
-run = ["PyFoam", "matplotlib"]
+run = ["matplotlib"]
 
 [project.scripts]
 mesh-prep = "mesh_prep.stl_clipper:main"
+mesh-prep-create = "mesh_prep.create_case:main"
+mesh-render = "mesh_prep.render_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["mesh_prep*"]

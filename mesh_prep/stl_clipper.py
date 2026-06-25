@@ -203,6 +203,7 @@ class ClipDefinition:
     box_planes: list = field(default_factory=list)  # 6 planes as [(normal, point), ...]
     cap_mesh: Optional[pv.PolyData] = field(default=None, repr=False)
     color: tuple = (0.9, 0.2, 0.2)
+    cap_kind: str = "closed"    # "closed": cap the cut (CFD); "open": leave a hole
 
 
 class STLClipperEngine:
@@ -359,7 +360,10 @@ class STLClipperEngine:
         return result
 
     def add_clip(self, name: str, origin: np.ndarray, normal: np.ndarray,
-                 box_planes_data: list = None) -> ClipDefinition:
+                 box_planes_data: list = None,
+                 cap_kind: str = "closed") -> ClipDefinition:
+        if cap_kind not in ("closed", "open"):
+            raise ValueError(f"cap_kind must be 'closed' or 'open', got {cap_kind!r}")
         color = _color_for_name(name)
         clip_def = ClipDefinition(
             name=name,
@@ -367,10 +371,19 @@ class STLClipperEngine:
             normal=np.asarray(normal, dtype=float),
             box_planes=box_planes_data if box_planes_data else [],
             color=color,
+            cap_kind=cap_kind,
         )
         self.clips.append(clip_def)
         self.recompute_all()
         return clip_def
+
+    def set_cap_kind(self, index: int, cap_kind: str) -> None:
+        """Switch a clip between 'closed' (with cap) and 'open' (no cap)."""
+        if cap_kind not in ("closed", "open"):
+            raise ValueError(f"cap_kind must be 'closed' or 'open', got {cap_kind!r}")
+        if 0 <= index < len(self.clips):
+            self.clips[index].cap_kind = cap_kind
+            self.recompute_all()
 
     def remove_clip(self, index: int):
         if 0 <= index < len(self.clips):
@@ -397,10 +410,14 @@ class STLClipperEngine:
                     working = self.clip_with_plane(
                         working, clip_def.origin, clip_def.normal
                     )
-                clip_def.cap_mesh = self._generate_cap(
-                    self.original_mesh, clip_def.origin, clip_def.normal,
-                    clip_def.box_planes if clip_def.box_planes else None
-                )
+                if clip_def.cap_kind == "closed":
+                    clip_def.cap_mesh = self._generate_cap(
+                        self.original_mesh, clip_def.origin, clip_def.normal,
+                        clip_def.box_planes if clip_def.box_planes else None
+                    )
+                else:
+                    # Open profile: leave a hole at the cut, no cap mesh.
+                    clip_def.cap_mesh = None
             except RuntimeError:
                 clip_def.cap_mesh = pv.PolyData()
         self._wall_mesh = working
@@ -535,13 +552,67 @@ class STLClipperEngine:
         return "\n".join(lines) + "\n"
 
     def export_combined_stl(self, filepath: str, scale_factor: float = 1.0):
-        """Write a single ASCII STL with multiple solid blocks."""
+        """Write a single ASCII STL with multiple solid blocks.
+
+        Open-profile clips contribute no cap solid; their boundary is left as
+        an open hole on the wall solid.
+        """
         blocks = []
         for clip_def in self.clips:
+            if clip_def.cap_kind != "closed":
+                continue
             blocks.append(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name, scale_factor))
         blocks.append(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall", scale_factor))
         with open(filepath, "w") as f:
             f.write("".join(blocks))
+
+    def export_clipped_surface_stl(
+        self,
+        filepath: str,
+        scale_factor: float = 1.0,
+        solid_name: str = "clipped",
+    ) -> dict:
+        """Save the clipped surface as a SINGLE-solid ASCII STL.
+
+        The wall mesh is always included.  Closed-profile clips contribute
+        their caps merged into the same solid (creating a watertight surface
+        at those cuts).  Open-profile clips contribute nothing — their cut
+        leaves a hole on the wall.
+
+        Intended for downstream tools that expect a single triangulated
+        surface (e.g. VMTK), not multi-patch CFD meshers.
+
+        Returns a dict with face counts and clip categorisation.
+        """
+        if self._wall_mesh is None or self._wall_mesh.n_cells == 0:
+            raise RuntimeError("No wall mesh to export.")
+
+        # Use vtkAppendPolyData so the result stays a PolyData (merge() can
+        # promote to UnstructuredGrid, which _polydata_to_ascii_stl_block
+        # cannot consume).
+        appender = vtk.vtkAppendPolyData()
+        appender.AddInputData(self._wall_mesh)
+        n_caps = 0
+        for clip_def in self.clips:
+            if clip_def.cap_kind == "closed" \
+                    and clip_def.cap_mesh is not None \
+                    and clip_def.cap_mesh.n_cells > 0:
+                appender.AddInputData(clip_def.cap_mesh)
+                n_caps += 1
+        appender.Update()
+        combined = pv.wrap(appender.GetOutput())
+
+        block = self._polydata_to_ascii_stl_block(combined, solid_name, scale_factor)
+        with open(filepath, "w") as f:
+            f.write(block)
+
+        return {
+            "filepath": filepath,
+            "n_wall_cells": int(self._wall_mesh.n_cells),
+            "n_caps_merged": n_caps,
+            "n_open_clips": sum(1 for c in self.clips if c.cap_kind == "open"),
+            "n_total_cells": int(combined.n_cells),
+        }
 
     def export_clip_planes(self, filepath: str):
         """Save clip plane origins and normals as JSON."""
@@ -583,8 +654,9 @@ class STLClipperEngine:
         centerline_mesh=None,
         scale_factor: float = 1.0,
         template_params: dict = None,
+        simulation_type: str = "les",
     ) -> dict:
-        """Export a complete OpenFOAM LES case directory for cfMesh pMesh.
+        """Export a complete OpenFOAM case directory for cfMesh pMesh.
 
         Writes the multi-solid STL to ``constant/triSurface/``, generates
         ``system/meshDict`` for cfMesh pMesh, and ``run_docker.sh`` for
@@ -665,6 +737,7 @@ class STLClipperEngine:
                 write_interval=solver_p.get("writeInterval", 0.01),
                 max_co=solver_p.get("maxCo", 0.5),
                 max_delta_t=solver_p.get("maxDeltaT", 1e-3),
+                simulation_type=simulation_type,
             ),
             "decomposeParDict": openfoam_case.generate_decompose_par_dict(
                 n_procs=decomp_p.get("nProcs", 4),
@@ -673,7 +746,8 @@ class STLClipperEngine:
 
         # Copy static template files if template_params provided
         if template_params is not None:
-            tmpl_dir = openfoam_case.get_template_dir()
+            tmpl_name = "rans_aorta" if simulation_type == "rans" else "les_aorta"
+            tmpl_dir = openfoam_case.get_template_dir(tmpl_name)
             for static_name in ("fvSchemes", "fvSolution", "meshQualityDict"):
                 src = tmpl_dir / static_name
                 if src.exists():
@@ -681,8 +755,12 @@ class STLClipperEngine:
                     shutil.copy2(str(src), dst)
                     written[static_name] = dst
         else:
-            system_files["fvSchemes"] = openfoam_case.generate_fv_schemes()
-            system_files["fvSolution"] = openfoam_case.generate_fv_solution()
+            system_files["fvSchemes"] = openfoam_case.generate_fv_schemes(
+                simulation_type=simulation_type,
+            )
+            system_files["fvSolution"] = openfoam_case.generate_fv_solution(
+                simulation_type=simulation_type,
+            )
             system_files["meshQualityDict"] = openfoam_case.generate_mesh_quality_dict()
 
         for name, content in system_files.items():
@@ -697,6 +775,7 @@ class STLClipperEngine:
                 nu=fluid_p.get("nu", 3.3e-6),
             ),
             "turbulenceProperties": openfoam_case.generate_turbulence_properties(
+                simulation_type=simulation_type,
                 cs=turb_p.get("Cs", 0.1),
             ),
         }
@@ -709,7 +788,7 @@ class STLClipperEngine:
         # volumetricFlowRate.csv — copy from template if available, else generate
         csv_path = os.path.join(dirs["constant"], "volumetricFlowRate.csv")
         if template_params is not None:
-            tmpl_csv = openfoam_case.get_template_dir() / "volumetricFlowRate.csv"
+            tmpl_csv = tmpl_dir / "volumetricFlowRate.csv"
             if tmpl_csv.exists():
                 shutil.copy2(str(tmpl_csv), csv_path)
             else:
@@ -727,9 +806,22 @@ class STLClipperEngine:
             "U": openfoam_case.generate_U(
                 patch_names, inlet_normals, geo_name="",
                 velocity_magnitude=vel_mag,
+                simulation_type=simulation_type,
             ),
-            "nut": openfoam_case.generate_nut(patch_names, geo_name=""),
+            "nut": openfoam_case.generate_nut(
+                patch_names, geo_name="",
+                simulation_type=simulation_type,
+            ),
         }
+        if simulation_type == "rans":
+            bc_files["k"] = openfoam_case.generate_k(
+                patch_names, geo_name="",
+                k_value=turb_p.get("k", 3.375e-4),
+            )
+            bc_files["omega"] = openfoam_case.generate_omega(
+                patch_names, geo_name="",
+                omega_value=turb_p.get("omega", 30),
+            )
         for name, content in bc_files.items():
             path = os.path.join(dirs["zero"], name)
             with open(path, "w") as f:
@@ -792,9 +884,14 @@ class STLClipperEngine:
         return written
 
     def export_separate_stl(self, output_dir: str, scale_factor: float = 1.0):
-        """Write one STL file per patch into output_dir."""
+        """Write one STL file per patch into output_dir.
+
+        Open-profile clips contribute no cap file.
+        """
         os.makedirs(output_dir, exist_ok=True)
         for clip_def in self.clips:
+            if clip_def.cap_kind != "closed":
+                continue
             path = os.path.join(output_dir, f"{clip_def.name}.stl")
             with open(path, "w") as f:
                 f.write(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name, scale_factor))
@@ -861,6 +958,7 @@ class STLClipperApp(QMainWindow):
         # 3D viewport
         self.plotter = QtInteractor(central)
         self.plotter.set_background("black")
+        self.plotter.enable_parallel_projection()
 
         # Tabbed control panel
         self._tab_widget = QTabWidget()
@@ -1111,14 +1209,28 @@ class STLClipperApp(QMainWindow):
         # ── Geometry Info panel ──
         geo_box = QGroupBox("Geometry Info")
         geo_lay = QVBoxLayout()
-        self._lbl_bounds = QLabel("Extents: —")
-        geo_lay.addWidget(self._lbl_bounds)
+        self._lbl_bounds_x = QLabel("X: —")
+        self._lbl_bounds_y = QLabel("Y: —")
+        self._lbl_bounds_z = QLabel("Z: —")
+        geo_lay.addWidget(self._lbl_bounds_x)
+        geo_lay.addWidget(self._lbl_bounds_y)
+        geo_lay.addWidget(self._lbl_bounds_z)
         self._lbl_wall_faces = QLabel("Wall: — faces")
         geo_lay.addWidget(self._lbl_wall_faces)
         self._lbl_open_profiles = QLabel("Open profiles: —")
         geo_lay.addWidget(self._lbl_open_profiles)
         self._lbl_open_edges = QLabel("Open edges: —")
         geo_lay.addWidget(self._lbl_open_edges)
+        self._btn_show_mesh_edges = QPushButton("Show Surface Mesh")
+        self._btn_show_mesh_edges.setCheckable(True)
+        self._btn_show_mesh_edges.setChecked(False)
+        self._btn_show_mesh_edges.clicked.connect(self._on_toggle_mesh_edges)
+        geo_lay.addWidget(self._btn_show_mesh_edges)
+        self._btn_opaque_wall = QPushButton("Opaque Wall")
+        self._btn_opaque_wall.setCheckable(True)
+        self._btn_opaque_wall.setChecked(False)
+        self._btn_opaque_wall.clicked.connect(self._on_toggle_opaque_wall)
+        geo_lay.addWidget(self._btn_opaque_wall)
         self._btn_show_boundary = QPushButton("Show Boundary Edges")
         self._btn_show_boundary.setCheckable(True)
         self._btn_show_boundary.setChecked(False)
@@ -1138,13 +1250,17 @@ class STLClipperApp(QMainWindow):
 
         panel.addWidget(self._separator("STL Export"))
 
-        # Scale factor dropdown (for STL-only exports on this tab)
-        self._combo_scale = QComboBox()
-        self._combo_scale.addItem("mm → m  (×0.001)", 0.001)
-        self._combo_scale.addItem("cm → m  (×0.01)",  0.01)
-        self._combo_scale.addItem("m → m   (×1.0)",   1.0)
-        self._combo_scale.setCurrentIndex(0)
-        panel.addWidget(self._combo_scale)
+        # Scale factor input (for STL-only exports on this tab).
+        # Applied uniformly to all vertex coordinates on export.
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("Scale factor ×"))
+        self._spin_scale = QDoubleSpinBox()
+        self._spin_scale.setRange(1e-6, 1e6)
+        self._spin_scale.setDecimals(6)
+        self._spin_scale.setSingleStep(0.1)
+        self._spin_scale.setValue(0.001)
+        scale_row.addWidget(self._spin_scale)
+        panel.addLayout(scale_row)
 
         self.btn_export_sep = QPushButton("Export Separate STLs")
         self.btn_export_sep.clicked.connect(self._on_export_separate)
@@ -1153,6 +1269,13 @@ class STLClipperApp(QMainWindow):
         self.btn_export_comb = QPushButton("Export Combined STL")
         self.btn_export_comb.clicked.connect(self._on_export_combined)
         panel.addWidget(self.btn_export_comb)
+
+        # Standalone multi-solid STL save — same file format OpenFOAM consumes
+        # (one ``solid <name>`` block per cap + one ``solid wall``), but picks
+        # any output path without creating a case directory or writing JSON.
+        self.btn_save_of_stl = QPushButton("Save OpenFOAM STL...")
+        self.btn_save_of_stl.clicked.connect(self._on_save_openfoam_stl)
+        panel.addWidget(self.btn_save_of_stl)
 
         panel.addWidget(self._separator("Centerline"))
 
@@ -1191,13 +1314,16 @@ class STLClipperApp(QMainWindow):
 
         panel.addStretch()
 
-        # ── Tab 2: Export Settings ──
+        # ── Tab 2: Clip & Save STL (non-CFD use) ──
+        self._build_clip_save_tab()
+
+        # ── Tab 3: Export Settings ──
         self._build_export_settings_tab()
 
-        # ── Tab 3: Mesh Repair ──
+        # ── Tab 4: Mesh Repair ──
         self._build_repair_tab()
 
-        # ── Tab 4: Run OpenFOAM (Beta) ──
+        # ── Tab 5: Run OpenFOAM (Beta) ──
         self._build_run_tab()
 
         # Draggable splitter between viewport and tab panel
@@ -1229,15 +1355,28 @@ class STLClipperApp(QMainWindow):
         scroll.setWidget(tab2_widget)
         self._tab_widget.addTab(scroll, "Export Settings")
 
+        # --- Simulation Type ---
+        sim_box = QGroupBox("Simulation Type")
+        sim_lay = QVBoxLayout()
+        self._combo_sim_type = QComboBox()
+        self._combo_sim_type.addItem("LES (Smagorinsky)", "les")
+        self._combo_sim_type.addItem("RANS (k-omega SST)", "rans")
+        self._combo_sim_type.currentIndexChanged.connect(self._on_sim_type_changed)
+        sim_lay.addWidget(self._combo_sim_type)
+        sim_box.setLayout(sim_lay)
+        tab2.addWidget(sim_box)
+
         # --- Scale ---
+        # Uniform scale factor applied to all STL vertex coordinates on export.
         scale_box = QGroupBox("Scale")
-        scale_lay = QVBoxLayout()
-        self._combo_scale_of = QComboBox()
-        self._combo_scale_of.addItem("mm → m  (×0.001)", 0.001)
-        self._combo_scale_of.addItem("cm → m  (×0.01)",  0.01)
-        self._combo_scale_of.addItem("m → m   (×1.0)",   1.0)
-        self._combo_scale_of.setCurrentIndex(0)
-        scale_lay.addWidget(self._combo_scale_of)
+        scale_lay = QHBoxLayout()
+        scale_lay.addWidget(QLabel("Scale factor ×"))
+        self._spin_scale_of = QDoubleSpinBox()
+        self._spin_scale_of.setRange(1e-6, 1e6)
+        self._spin_scale_of.setDecimals(6)
+        self._spin_scale_of.setSingleStep(0.1)
+        self._spin_scale_of.setValue(0.001)
+        scale_lay.addWidget(self._spin_scale_of)
         scale_box.setLayout(scale_lay)
         tab2.addWidget(scale_box)
 
@@ -1358,6 +1497,8 @@ class STLClipperApp(QMainWindow):
         turb_box = QGroupBox("Turbulence")
         turb_lay = QVBoxLayout()
 
+        # LES: Smagorinsky Cs
+        self._lbl_cs = QLabel("Cs:")
         self._export_cs = QDoubleSpinBox()
         self._export_cs.setRange(0.01, 1.0)
         self._export_cs.setDecimals(3)
@@ -1365,11 +1506,43 @@ class STLClipperApp(QMainWindow):
         self._export_cs.setValue(cfg["turbulence"]["Cs"])
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Cs:"))
+        row.addWidget(self._lbl_cs)
         row.addWidget(self._export_cs)
         turb_lay.addLayout(row)
+
+        # RANS: k and omega (hidden by default)
+        self._lbl_k = QLabel("k:")
+        self._export_k = QDoubleSpinBox()
+        self._export_k.setRange(1e-8, 1.0)
+        self._export_k.setDecimals(6)
+        self._export_k.setSingleStep(1e-4)
+        self._export_k.setValue(3.375e-4)
+
+        row = QHBoxLayout()
+        row.addWidget(self._lbl_k)
+        row.addWidget(self._export_k)
+        turb_lay.addLayout(row)
+
+        self._lbl_omega = QLabel("omega:")
+        self._export_omega = QDoubleSpinBox()
+        self._export_omega.setRange(0.01, 10000.0)
+        self._export_omega.setDecimals(2)
+        self._export_omega.setSingleStep(1.0)
+        self._export_omega.setValue(30.0)
+
+        row = QHBoxLayout()
+        row.addWidget(self._lbl_omega)
+        row.addWidget(self._export_omega)
+        turb_lay.addLayout(row)
+
         turb_box.setLayout(turb_lay)
         tab2.addWidget(turb_box)
+
+        # Hide RANS fields by default (LES is initial selection)
+        self._lbl_k.hide()
+        self._export_k.hide()
+        self._lbl_omega.hide()
+        self._export_omega.hide()
 
         # --- Inlet ---
         inlet_box = QGroupBox("Inlet")
@@ -1415,6 +1588,187 @@ class STLClipperApp(QMainWindow):
         tab2.addLayout(btn_row)
 
         tab2.addStretch()
+
+    def _build_clip_save_tab(self):
+        """Build the 'Clip & Save STL' tab.
+
+        Reuses the existing Clipping tab's pickers — this tab only displays
+        the current clips with a per-clip Open/Closed selector and a Save
+        button.  The output is a generic multi-solid ASCII STL with no
+        OpenFOAM case scaffolding.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tab_widget = QWidget()
+        tab_layout = QVBoxLayout(tab_widget)
+        scroll.setWidget(tab_widget)
+        self._tab_widget.addTab(scroll, "Clip & Save STL")
+
+        intro = QLabel(
+            "Save the clipped surface as a single-solid STL for downstream\n"
+            "tools (e.g. VMTK).  For each clip choose:\n"
+            "  • Open (no cap) — leaves a hole at the cut.\n"
+            "  • Closed (cap) — merges a cap into the surface (watertight there)."
+        )
+        intro.setWordWrap(True)
+        tab_layout.addWidget(intro)
+
+        self._clip_save_list_box = QGroupBox("Clips")
+        self._clip_save_list_layout = QVBoxLayout()
+        self._clip_save_list_layout.setSpacing(4)
+        self._clip_save_list_box.setLayout(self._clip_save_list_layout)
+        tab_layout.addWidget(self._clip_save_list_box)
+
+        # Per-row combo boxes are tracked so we can detach signals on refresh.
+        self._clip_save_combos: list = []
+
+        # Independent scale factor for this tab — default 1.0 preserves the
+        # original STL units (e.g. keeps mm input as mm on output).  The
+        # Clipping tab's separate scale (default 0.001 for CFD mm→m) is
+        # unaffected.
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("Scale factor ×"))
+        self._spin_scale_save = QDoubleSpinBox()
+        self._spin_scale_save.setRange(1e-6, 1e6)
+        self._spin_scale_save.setDecimals(6)
+        self._spin_scale_save.setSingleStep(0.1)
+        self._spin_scale_save.setValue(1.0)
+        self._spin_scale_save.setToolTip(
+            "Multiplier applied to all vertex coordinates on save.\n"
+            "1.0 = preserve original STL units (recommended for VMTK etc.).\n"
+            "0.001 = mm → m (CFD/OpenFOAM convention)."
+        )
+        scale_row.addWidget(self._spin_scale_save)
+        tab_layout.addLayout(scale_row)
+
+        self.btn_save_clipped_stl = QPushButton("Save Clipped STL...")
+        self.btn_save_clipped_stl.clicked.connect(self._on_save_clipped_stl)
+        tab_layout.addWidget(self.btn_save_clipped_stl)
+
+        self._clip_save_status = QLabel("Status: —")
+        self._clip_save_status.setWordWrap(True)
+        tab_layout.addWidget(self._clip_save_status)
+
+        tab_layout.addStretch()
+
+        # Initial population (engine has no clips yet, so just shows placeholder).
+        self._refresh_clip_save_list()
+
+    def _refresh_clip_save_list(self):
+        """Rebuild the per-clip rows in the 'Clip & Save STL' tab.
+
+        Safe to call before the tab has been built (early in _build_ui) — it
+        no-ops when the layout isn't ready yet.
+        """
+        if not hasattr(self, "_clip_save_list_layout"):
+            return
+
+        # Detach signals before deleting widgets to avoid spurious callbacks.
+        for combo in self._clip_save_combos:
+            try:
+                combo.currentIndexChanged.disconnect()
+            except TypeError:
+                pass
+        self._clip_save_combos.clear()
+
+        while self._clip_save_list_layout.count():
+            item = self._clip_save_list_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        if not self.engine.clips:
+            placeholder = QLabel("(no clips — add some on the Clipping tab)")
+            placeholder.setStyleSheet("color: #888;")
+            self._clip_save_list_layout.addWidget(placeholder)
+            self.btn_save_clipped_stl.setEnabled(False)
+            return
+
+        self.btn_save_clipped_stl.setEnabled(True)
+
+        for idx, clip_def in enumerate(self.engine.clips):
+            row_widget = QWidget()
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+
+            r, g, b = [int(c * 255) for c in clip_def.color]
+            swatch = QLabel("  ")
+            swatch.setFixedWidth(14)
+            swatch.setFixedHeight(14)
+            swatch.setStyleSheet(
+                f"background-color: rgb({r},{g},{b}); border: 1px solid #444;"
+            )
+            row.addWidget(swatch)
+
+            n = clip_def.cap_mesh.n_cells if clip_def.cap_mesh else 0
+            face_info = f"{n:,} cap faces" if clip_def.cap_kind == "closed" else "no cap"
+            lbl = QLabel(f"{clip_def.name}  ({face_info})")
+            lbl.setMinimumWidth(180)
+            row.addWidget(lbl, stretch=1)
+
+            combo = QComboBox()
+            combo.addItem("Closed (cap)", "closed")
+            combo.addItem("Open (no cap)", "open")
+            combo.setCurrentIndex(0 if clip_def.cap_kind == "closed" else 1)
+            combo.currentIndexChanged.connect(
+                lambda i, _idx=idx: self._on_cap_kind_changed(_idx, i)
+            )
+            self._clip_save_combos.append(combo)
+            row.addWidget(combo)
+
+            self._clip_save_list_layout.addWidget(row_widget)
+
+    def _on_cap_kind_changed(self, idx: int, combo_index: int):
+        """Slot for per-clip Open/Closed combo box."""
+        kind = "closed" if combo_index == 0 else "open"
+        if idx < 0 or idx >= len(self.engine.clips):
+            return
+        if self.engine.clips[idx].cap_kind == kind:
+            return
+        self.engine.set_cap_kind(idx, kind)
+        # _refresh_patch_list calls _refresh_clip_save_list internally.
+        self._refresh_patch_list()
+        self._refresh_display()
+
+    def _on_save_clipped_stl(self):
+        """File-dialog save of a single-solid STL with current open/closed mix."""
+        if not self.engine.clips:
+            QMessageBox.warning(self, "No Clips", "Add at least one clip first.")
+            return
+        default_name = "clipped.stl"
+        if self._loaded_filepath:
+            stem = os.path.splitext(os.path.basename(self._loaded_filepath))[0]
+            default_name = f"{stem}_clipped.stl"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Clipped STL", default_name, "STL files (*.stl)"
+        )
+        if not filepath:
+            return
+        if not filepath.lower().endswith(".stl"):
+            filepath += ".stl"
+        sf = self._spin_scale_save.value()
+        try:
+            result = self.engine.export_clipped_surface_stl(filepath, scale_factor=sf)
+            opened = [c.name for c in self.engine.clips if c.cap_kind == "open"]
+            closed = [c.name for c in self.engine.clips if c.cap_kind == "closed"]
+            self._clip_save_status.setText(
+                f"Saved: {os.path.basename(filepath)}  "
+                f"({result['n_total_cells']:,} faces, "
+                f"{result['n_caps_merged']} caps merged, "
+                f"{result['n_open_clips']} open)"
+            )
+            QMessageBox.information(
+                self, "Saved",
+                f"Single-solid STL saved to:\n{filepath}\n"
+                f"Scale factor: ×{sf}\n"
+                f"Total faces: {result['n_total_cells']:,}\n\n"
+                f"Open (hole) clips: {', '.join(opened) if opened else 'none'}\n"
+                f"Closed (merged-cap) clips: {', '.join(closed) if closed else 'none'}",
+            )
+        except Exception as e:
+            self._clip_save_status.setText(f"Error: {e}")
+            QMessageBox.critical(self, "Save Error", str(e))
 
     def _build_repair_tab(self):
         """Build Tab 3 with mesh repair operations."""
@@ -1545,9 +1899,7 @@ class STLClipperApp(QMainWindow):
         time_dirs = [
             d for d in os.listdir(self._last_case_dir)
             if os.path.isdir(os.path.join(self._last_case_dir, d))
-            and d not in ("0", "constant", "system", "processor0",
-                          "processor1", "processor2", "processor3",
-                          "__pycache__")
+            and d not in ("0", "constant", "system", "__pycache__")
             and not d.startswith(".")
         ]
         # Filter to numeric directory names (OpenFOAM time dirs)
@@ -1606,7 +1958,7 @@ class STLClipperApp(QMainWindow):
         """Solver failed or was cancelled."""
         self._btn_run_solver.setEnabled(True)
         self._btn_cancel_solver.setEnabled(False)
-        self._run_stage_label.setText(f"Stage: FAILED")
+        self._run_stage_label.setText("Stage: FAILED")
         self._openfoam_worker = None
         if msg != "Cancelled by user":
             QMessageBox.critical(self, "Solver Error", msg)
@@ -1659,9 +2011,42 @@ class STLClipperApp(QMainWindow):
         self._refresh_display()
         self._update_button_states()
 
+    def _on_sim_type_changed(self, index: int):
+        """Switch UI between LES and RANS turbulence parameters."""
+        sim_type = self._combo_sim_type.currentData()
+        is_rans = sim_type == "rans"
+
+        # Toggle LES vs RANS turbulence widgets
+        self._lbl_cs.setVisible(not is_rans)
+        self._export_cs.setVisible(not is_rans)
+        self._lbl_k.setVisible(is_rans)
+        self._export_k.setVisible(is_rans)
+        self._lbl_omega.setVisible(is_rans)
+        self._export_omega.setVisible(is_rans)
+
+        # Load defaults from the appropriate template
+        tmpl_name = "rans_aorta" if is_rans else "les_aorta"
+        cfg = openfoam_case.load_template(tmpl_name)
+        solver = cfg["solver"]
+        self._export_delta_t.setValue(solver["deltaT"])
+        self._export_max_co.setValue(solver["maxCo"])
+        self._export_max_delta_t.setValue(solver["maxDeltaT"])
+        self._export_end_time.setValue(solver["endTime"])
+
+        if is_rans:
+            turb = cfg["turbulence"]
+            self._export_k.setValue(turb.get("k", 3.375e-4))
+            self._export_omega.setValue(turb.get("omega", 30.0))
+        else:
+            self._export_cs.setValue(cfg["turbulence"].get("Cs", 0.1))
+
+        self.status.showMessage(f"Switched to {cfg['name']} template.")
+
     def _on_reset_export_defaults(self):
         """Reset all export settings spinboxes to template defaults."""
-        cfg = openfoam_case.load_template()
+        sim_type = self._combo_sim_type.currentData()
+        tmpl_name = "rans_aorta" if sim_type == "rans" else "les_aorta"
+        cfg = openfoam_case.load_template(tmpl_name)
         mesh = cfg["mesh"]
         solver = cfg["solver"]
 
@@ -1678,11 +2063,17 @@ class STLClipperApp(QMainWindow):
         self._export_max_delta_t.setValue(solver["maxDeltaT"])
 
         self._export_nu.setValue(cfg["fluid"]["nu"])
-        self._export_cs.setValue(cfg["turbulence"]["Cs"])
         self._export_velocity_mag.setValue(cfg["inlet"]["velocityMagnitude"])
         self._export_n_procs.setValue(cfg["decompose"]["nProcs"])
 
-        self.status.showMessage("Export settings reset to template defaults.")
+        if sim_type == "rans":
+            turb = cfg["turbulence"]
+            self._export_k.setValue(turb.get("k", 3.375e-4))
+            self._export_omega.setValue(turb.get("omega", 30.0))
+        else:
+            self._export_cs.setValue(cfg["turbulence"].get("Cs", 0.1))
+
+        self.status.showMessage(f"Export settings reset to {cfg['name']} defaults.")
 
     def _build_menu(self):
         menu = self.menuBar()
@@ -1766,6 +2157,7 @@ class STLClipperApp(QMainWindow):
         self.btn_export_foam.setEnabled(has_clips)
         self.btn_export_sep.setEnabled(has_clips)
         self.btn_export_comb.setEnabled(has_clips)
+        self.btn_save_of_stl.setEnabled(has_clips)
 
         # Centerline buttons
         has_inlet = any("inlet" in c.name.lower() for c in self.engine.clips)
@@ -2585,6 +2977,8 @@ class STLClipperApp(QMainWindow):
             item.setForeground(Qt.black)
             item.setBackground(QColor(r, g, b, 60))
             self.patch_list.addItem(item)
+        # Keep the 'Clip & Save STL' tab's list in sync — same source of truth.
+        self._refresh_clip_save_list()
 
     # ------------------------------------------------------------------
     # Centerline
@@ -2694,10 +3088,13 @@ class STLClipperApp(QMainWindow):
             self.plotter.render()
             return
 
-        # Wall mesh — semi-transparent gray
+        # Wall mesh — optionally opaque, optionally with surface mesh edges
+        show_mesh = self._btn_show_mesh_edges.isChecked()
+        wall_opacity = 1.0 if self._btn_opaque_wall.isChecked() else 0.4
         self.plotter.add_mesh(
-            wall, color=WALL_COLOR, opacity=0.4,
-            show_edges=False, name="wall",
+            wall, color=WALL_COLOR, opacity=wall_opacity,
+            show_edges=show_mesh, edge_color="black", line_width=0.5,
+            name="wall",
         )
 
         # Cap patches — name-based colors with white edges for visibility
@@ -2736,13 +3133,17 @@ class STLClipperApp(QMainWindow):
         n_wall = wall.n_cells if wall else 0
         self._lbl_wall_faces.setText(f"Wall: {n_wall:,} faces")
 
-        # Update bounding box info
+        # Update bounding box info — show raw min..max per axis + extent
         if self.engine.original_mesh is not None:
             xmin, xmax, ymin, ymax, zmin, zmax = self.engine.original_mesh.bounds
             dx, dy, dz = xmax - xmin, ymax - ymin, zmax - zmin
-            self._lbl_bounds.setText(f"Extents:  {dx:.1f} × {dy:.1f} × {dz:.1f}")
+            self._lbl_bounds_x.setText(f"X: {xmin:.4g} .. {xmax:.4g}  [{dx:.4g}]")
+            self._lbl_bounds_y.setText(f"Y: {ymin:.4g} .. {ymax:.4g}  [{dy:.4g}]")
+            self._lbl_bounds_z.setText(f"Z: {zmin:.4g} .. {zmax:.4g}  [{dz:.4g}]")
         else:
-            self._lbl_bounds.setText("Extents: —")
+            self._lbl_bounds_x.setText("X: —")
+            self._lbl_bounds_y.setText("Y: —")
+            self._lbl_bounds_z.setText("Z: —")
 
         # Update geometry quality indicators
         quality = self.engine.geometry_quality()
@@ -2790,7 +3191,7 @@ class STLClipperApp(QMainWindow):
             self._lbl_manifold.setStyleSheet("color: red;")
 
         # Re-render boundary edges if toggle is on
-        if self._btn_show_boundary.isChecked() and self._boundary_mesh is not None:
+        if self._btn_show_boundary.isChecked() and self._boundary_mesh is not None and self._boundary_mesh.n_cells > 0:
             self.plotter.add_mesh(
                 self._boundary_mesh, color="red", line_width=4,
                 name="boundary_edges",
@@ -2805,6 +3206,14 @@ class STLClipperApp(QMainWindow):
                 )
 
         self.plotter.render()
+
+    def _on_toggle_mesh_edges(self):
+        """Toggle surface mesh edge visualization on the wall."""
+        self._refresh_display()
+
+    def _on_toggle_opaque_wall(self):
+        """Toggle wall opacity between transparent (0.4) and opaque (1.0)."""
+        self._refresh_display()
 
     def _on_toggle_boundary_edges(self):
         """Toggle red boundary edge visualization in the 3D viewport."""
@@ -2911,7 +3320,7 @@ class STLClipperApp(QMainWindow):
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
             return
-        sf = self._combo_scale.currentData()
+        sf = self._spin_scale.value()
         sep_dir = os.path.join(case_dir, "separate")
         try:
             self.engine.export_separate_stl(sep_dir, scale_factor=sf)
@@ -2934,7 +3343,7 @@ class STLClipperApp(QMainWindow):
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
             return
-        sf = self._combo_scale.currentData()
+        sf = self._spin_scale.value()
         filepath = os.path.join(case_dir, "boundary.stl")
         try:
             self.engine.export_combined_stl(filepath, scale_factor=sf)
@@ -2950,6 +3359,33 @@ class STLClipperApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
 
+    def _on_save_openfoam_stl(self):
+        if not self.engine.clips:
+            return
+        default_name = "boundary.stl"
+        if self._loaded_filepath:
+            stem = os.path.splitext(os.path.basename(self._loaded_filepath))[0]
+            default_name = f"{stem}_of.stl"
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save OpenFOAM multi-solid STL", default_name, "STL files (*.stl)"
+        )
+        if not filepath:
+            return
+        if not filepath.lower().endswith(".stl"):
+            filepath += ".stl"
+        sf = self._spin_scale.value()
+        try:
+            self.engine.export_combined_stl(filepath, scale_factor=sf)
+            patches = ", ".join(c.name for c in self.engine.clips) + ", wall"
+            QMessageBox.information(
+                self, "Saved",
+                f"Multi-solid STL saved to:\n{filepath}\n"
+                f"Scale factor: \u00d7{sf}\n\n"
+                f"Solids: {patches}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
+
     def _on_export_openfoam(self):
         if not self.engine.clips or self._loaded_filepath is None:
             return
@@ -2957,10 +3393,16 @@ class STLClipperApp(QMainWindow):
         if not case_dir:
             return
         # Use scale from Export Settings tab (OF-specific)
-        sf = self._combo_scale_of.currentData()
+        sf = self._spin_scale_of.value()
         stl_filename = os.path.basename(self._loaded_filepath)
 
         # Read all spinbox values into template_params dict
+        simulation_type = self._combo_sim_type.currentData()
+        turb_params = {"Cs": self._export_cs.value()}
+        if simulation_type == "rans":
+            turb_params["k"] = self._export_k.value()
+            turb_params["omega"] = self._export_omega.value()
+
         template_params = {
             "mesh": {
                 "maxCellSize": self._export_max_cell_size.value(),
@@ -2979,9 +3421,7 @@ class STLClipperApp(QMainWindow):
             "fluid": {
                 "nu": self._export_nu.value(),
             },
-            "turbulence": {
-                "Cs": self._export_cs.value(),
-            },
+            "turbulence": turb_params,
             "inlet": {
                 "velocityMagnitude": self._export_velocity_mag.value(),
             },
@@ -2995,12 +3435,13 @@ class STLClipperApp(QMainWindow):
                 case_dir, stl_filename, self._centerline_mesh,
                 scale_factor=sf,
                 template_params=template_params,
+                simulation_type=simulation_type,
             )
             self._last_case_dir = case_dir
             self._run_case_label.setText(f"Case: {case_dir}")
             patches = ", ".join(c.name for c in self.engine.clips) + ", wall"
             # Summarise generated files by category
-            bc_files = [k for k in ("p", "U", "nut") if k in result]
+            bc_files = [k for k in ("p", "U", "nut", "k", "omega") if k in result]
             system_files = [
                 k for k in result
                 if k not in ("stl_path", "planes_path", "p", "U", "nut",

@@ -62,7 +62,7 @@ conda install -y -c conda-forge vmtk -q
 # ---------- Install mesh-prep + GUI deps via pip ----------
 echo ""
 echo "Installing pyvista, pyvistaqt, and mesh-prep..."
-pip install pyvista qtpy -q
+pip install pyvista qtpy PyQt5 -q
 pip install pyvistaqt --no-deps -q
 pip install -e "$SCRIPT_DIR" -q
 

@@ -54,6 +54,19 @@ def _header(class_: str, object_: str) -> str:
     return _HEADER_TEMPLATE.format(class_=class_, object_=object_)
 
 
+def _of_val(v: float) -> str:
+    """Format a float for OpenFOAM: use scientific notation for |v| < 0.01."""
+    if v == 0:
+        return "0"
+    if abs(v) < 0.01:
+        # Scientific notation, strip trailing zeros from mantissa
+        s = f"{v:.6e}"
+        mantissa, exp = s.split("e")
+        mantissa = mantissa.rstrip("0").rstrip(".")
+        return f"{mantissa}e{exp}"
+    return f"{v:.6g}"
+
+
 # ── Patch classifier ─────────────────────────────────────────────────
 
 def classify_patch(name: str) -> str:
@@ -335,8 +348,13 @@ relaxed
     )
 
 
-def _generate_outlet_functions(outlet_patches: list[str], geo_name: str = "") -> str:
-    """Generate surfaceFieldValue function objects for outlet flow rates.
+def _generate_outlet_functions(
+    outlet_patches: list[str],
+    geo_name: str = "",
+    include_pressure: bool = False,
+    flow_write_interval: int = 100,
+) -> str:
+    """Generate surfaceFieldValue function objects for outlet monitoring.
 
     Parameters
     ----------
@@ -344,11 +362,12 @@ def _generate_outlet_functions(outlet_patches: list[str], geo_name: str = "") ->
         Outlet patch names (e.g. ['outlet_1', 'outlet_2']).
     geo_name : str
         Geometry name prefix for patch names.
-
-    Returns
-    -------
-    str
-        OpenFOAM function-object entries (without outer braces).
+    include_pressure : bool
+        Also emit ``outletPressure_<name>`` entries with areaAverage on p
+        (RANS style). When False, only flow-rate (``sum phi``) entries are
+        emitted — existing LES behaviour.
+    flow_write_interval : int
+        timeStep interval for the flow-rate probes.
     """
     entries = []
     for name in outlet_patches:
@@ -360,7 +379,7 @@ def _generate_outlet_functions(outlet_patches: list[str], geo_name: str = "") ->
             f"        type            surfaceFieldValue;\n"
             f"        libs            (fieldFunctionObjects);\n"
             f"        writeControl    timeStep;\n"
-            f"        writeInterval   100;\n"
+            f"        writeInterval   {flow_write_interval};\n"
             f"        surfaceFormat   vtk;\n"
             f"        regionType      patch;\n"
             f"        name            {_of_key(full_name)};\n"
@@ -369,6 +388,22 @@ def _generate_outlet_functions(outlet_patches: list[str], geo_name: str = "") ->
             f"        fields          (phi);\n"
             f"    }}"
         )
+        if include_pressure:
+            entries.append(
+                f"\n"
+                f"    outletPressure_{name}\n"
+                f"    {{\n"
+                f"        type            surfaceFieldValue;\n"
+                f"        libs            (fieldFunctionObjects);\n"
+                f"        writeControl    timeStep;\n"
+                f"        writeInterval   1;\n"
+                f"        regionType      patch;\n"
+                f"        name            {_of_key(full_name)};\n"
+                f"        operation       areaAverage;\n"
+                f"        writeFields     false;\n"
+                f"        fields          (p);\n"
+                f"    }}"
+            )
     return "\n".join(entries)
 
 
@@ -380,31 +415,125 @@ def generate_control_dict(
     write_interval: float = 0.01,
     max_co: float = 2,
     max_delta_t: float = 1e-3,
+    simulation_type: str = "les",
+    field_avg_start: Optional[float] = None,
 ) -> str:
-    """pimpleFoam with adaptive time-stepping.
+    """pimpleFoam controlDict.
+
+    LES: adjustive-timestep + adjustableRunTime writes.
+    RANS: fixed dt, timestep-based writes, extra function objects
+    (solverInfo, CourantNo, outletPressure_<name>).
 
     Parameters
     ----------
     outlet_patches : list[str], optional
-        If provided, adds surfaceFieldValue function objects that compute
-        flow rate (phi) through each outlet patch at runtime.
-    geo_name : str
-        Geometry name prefix for patch names.
+        Adds surfaceFieldValue probes on each outlet (flow; pressure for RANS).
     end_time : float
-        Simulation end time in seconds.
+        Simulation end time (s).
     delta_t : float
-        Initial time step size.
+        Time step (s). Fixed for RANS, initial for LES.
     write_interval : float
-        Write interval for adjustableRunTime.
-    max_co : float
-        Maximum Courant number for adaptive time-stepping.
-    max_delta_t : float
-        Maximum allowed time step.
+        Write interval in seconds. Converted to timestep count for RANS.
+    max_co, max_delta_t : float
+        Adaptive-timestep parameters (LES only).
+    simulation_type : str
+        ``"les"`` or ``"rans"``.
+    field_avg_start : float, optional
+        Time (s) at which fieldAverage1 starts accumulating. Default None
+        (starts at t=0).
     """
+    wall_patch = _of_key(f"{geo_name}_wall") if geo_name else "wall"
+
+    if simulation_type == "rans":
+        outlet_block = ""
+        if outlet_patches:
+            outlet_block = _generate_outlet_functions(
+                outlet_patches, geo_name,
+                include_pressure=True, flow_write_interval=1,
+            )
+        write_steps = max(1, int(round(write_interval / delta_t)))
+        timestart_line = (
+            f"        timeStart       {field_avg_start:.6g};\n"
+            if field_avg_start is not None else ""
+        )
+        return (
+            _header("dictionary", "controlDict")
+            + f"""
+application     pimpleFoam;
+
+startFrom       startTime;
+startTime       0;
+
+stopAt          endTime;
+endTime         {end_time};
+
+deltaT          {delta_t:.6g};
+
+writeControl    timeStep;
+writeInterval   {write_steps};
+
+purgeWrite      0;
+
+writeFormat     binary;
+writePrecision  8;
+
+writeCompression off;
+
+timeFormat      general;
+timePrecision   6;
+
+runTimeModifiable true;
+
+adjustTimeStep  no;
+
+functions
+{{
+    fieldAverage1
+    {{
+        type            fieldAverage;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+{timestart_line}        fields
+        (
+            U {{ mean on; prime2Mean on;  base time; }}
+            p {{ mean on; prime2Mean off; base time; }}
+        );
+    }}
+
+    wallShearStress1
+    {{
+        type            wallShearStress;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+        patches         ({wall_patch});
+    }}
+
+    solverInfo
+    {{
+        type            solverInfo;
+        libs            (utilityFunctionObjects);
+        writeControl    timeStep;
+        writeInterval   1;
+        fields          (U p k omega);
+    }}
+
+    CourantNo
+    {{
+        type            CourantNo;
+        libs            (fieldFunctionObjects);
+        writeControl    writeTime;
+    }}
+{outlet_block}
+}}
+
+// ************************************************************************* //
+"""
+        )
+
+    # LES — adjustive timestep, adjustableRunTime writes
     outlet_block = ""
     if outlet_patches:
         outlet_block = _generate_outlet_functions(outlet_patches, geo_name)
-
     return (
         _header("dictionary", "controlDict")
         + f"""
@@ -466,7 +595,7 @@ functions
         type            wallShearStress;
         libs            (fieldFunctionObjects);
         writeControl    writeTime;
-        patches         ({_of_key(f'{geo_name}_wall') if geo_name else 'wall'});
+        patches         ({wall_patch});
     }}
 {outlet_block}
 }}
@@ -476,14 +605,23 @@ functions
     )
 
 
-def generate_fv_schemes() -> str:
-    """LES-appropriate discretisation schemes."""
-    return (
-        _header("dictionary", "fvSchemes")
-        + """
+def generate_fv_schemes(simulation_type: str = "les") -> str:
+    """Discretisation schemes.
+
+    Parameters
+    ----------
+    simulation_type : str
+        ``"les"`` uses backward ddt and LUST for U (low-dissipation LES).
+        ``"rans"`` uses Euler ddt, bounded linearUpwind for U, adds
+        div(phi,k), div(phi,omega), and wallDist blocks.
+    """
+    if simulation_type == "rans":
+        return (
+            _header("dictionary", "fvSchemes")
+            + """
 ddtSchemes
 {
-    default         Euler;
+    default         backward;
 }
 
 gradSchemes
@@ -495,7 +633,54 @@ divSchemes
 {
     default         none;
     div(phi,U)      bounded Gauss linearUpwind grad(U);
-    div(phi,nut)    bounded Gauss limitedLinear 1;
+    div(phi,k)      bounded Gauss upwind;
+    div(phi,omega)  bounded Gauss upwind;
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;
+}
+
+laplacianSchemes
+{
+    default         Gauss linear limited corrected 0.5;
+}
+
+interpolationSchemes
+{
+    default         linear;
+}
+
+snGradSchemes
+{
+    default         limited corrected 0.5;
+}
+
+wallDist
+{
+    method          meshWave;
+}
+
+// ************************************************************************* //
+"""
+        )
+
+    # LES — matches les_aorta/fvSchemes
+    return (
+        _header("dictionary", "fvSchemes")
+        + """
+ddtSchemes
+{
+    default         backward;
+}
+
+gradSchemes
+{
+    default         Gauss linear;
+}
+
+divSchemes
+{
+    default         none;
+    div(phi,U)      Gauss LUST grad(U);
+    div(phi,nut)    Gauss limitedLinear 1;
     div((nuEff*dev2(T(grad(U))))) Gauss linear;
 }
 
@@ -519,11 +704,21 @@ snGradSchemes
     )
 
 
-def generate_fv_solution() -> str:
-    """PIMPLE loop settings for LES."""
-    return (
-        _header("dictionary", "fvSolution")
-        + """
+def generate_fv_solution(simulation_type: str = "les") -> str:
+    """PIMPLE loop settings.
+
+    Parameters
+    ----------
+    simulation_type : str
+        ``"les"`` uses 2 outer correctors, no residualControl/relaxation
+        (matches les_aorta/fvSolution).
+        ``"rans"`` adds k/omega solver block, residualControl, and
+        relaxation factors (matches rans_aorta/fvSolution).
+    """
+    if simulation_type == "rans":
+        return (
+            _header("dictionary", "fvSolution")
+            + """
 solvers
 {
     p
@@ -531,7 +726,7 @@ solvers
         solver          GAMG;
         smoother        GaussSeidel;
         tolerance       1e-06;
-        relTol          0;
+        relTol          0.01;
         nCellsInCoarsestLevel 20;
         agglomerator    faceAreaPair;
         mergeLevels     1;
@@ -546,12 +741,88 @@ solvers
         relTol          0;
     }
 
-    "(U|nut)"
+    Phi
+    {
+        $p;
+    }
+
+    "(U|k|omega|nut)"
     {
         solver          PBiCGStab;
         preconditioner  DILU;
         tolerance       1e-08;
         relTol          0.01;
+    }
+
+    "(U|k|omega|nut)Final"
+    {
+        $U;
+        relTol          0;
+    }
+}
+
+PIMPLE
+{
+    nOuterCorrectors    5;
+    nCorrectors         2;
+    nNonOrthogonalCorrectors 1;
+    consistent          yes;
+
+    residualControl
+    {
+        U   { tolerance 1e-4; relTol 0; }
+        p   { tolerance 1e-3; relTol 0; }
+    }
+}
+
+relaxationFactors
+{
+    fields
+    {
+        p               0.5;
+        pFinal          1.0;
+    }
+    equations
+    {
+        U               0.7;
+        UFinal          1;
+        k               0.7;
+        kFinal          1;
+        omega           0.7;
+        omegaFinal      1;
+    }
+}
+
+// ************************************************************************* //
+"""
+        )
+
+    # LES — matches les_aorta/fvSolution
+    return (
+        _header("dictionary", "fvSolution")
+        + """
+solvers
+{
+    p
+    {
+        solver          GAMG;
+        smoother        GaussSeidel;
+        tolerance       1e-06;
+        relTol          0.01;
+    }
+
+    pFinal
+    {
+        $p;
+        relTol          0;
+    }
+
+    "(U|nut)"
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-08;
+        relTol          0.1;
     }
 
     "(U|nut)Final"
@@ -563,36 +834,11 @@ solvers
 
 PIMPLE
 {
-    nOuterCorrectors    20;
-    nCorrectors         2;
-    nNonOrthogonalCorrectors 1;
+    nOuterCorrectors    2;
+    nCorrectors         1;
+    nNonOrthogonalCorrectors 0;
     pRefCell            0;
     pRefValue           0;
-
-    residualControl
-    {
-        U
-        {
-            tolerance   1e-5;
-            relTol      0;
-        }
-        p
-        {
-            tolerance   1e-4;
-            relTol      0;
-        }
-    }
-}
-
-relaxationFactors
-{
-    equations
-    {
-        U               0.7;
-        UFinal          1;
-        p               0.2;
-        pFinal          1;
-    }
 }
 
 // ************************************************************************* //
@@ -646,14 +892,13 @@ def generate_mesh_dict(
         Local refinement cell size on wall patches. Defaults to
         ``boundary_cell_size * 0.5`` when None.
     """
-    if wall_cell_size is None:
-        wall_cell_size = boundary_cell_size * 0.5
     stl_path = f'"constant/triSurface/{stl_filename}"'
 
-    # Wall patches get boundary layers and finer local refinement
     wall_patches = [n for n in patch_names if classify_patch(n) == "wall"]
+    non_wall = [n for n in patch_names if classify_patch(n) != "wall"]
 
-    # Build patchBoundaryLayers entries for wall patches
+    # patchBoundaryLayers: walls get full layer spec + allowDiscontinuity;
+    # inlets/outlets get explicit nLayers 0 so pMesh never adds layers there.
     bl_entries = []
     for name in wall_patches:
         bl_entries.append(
@@ -662,12 +907,19 @@ def generate_mesh_dict(
             f"            nLayers {num_layers};\n"
             f"            thicknessRatio {thickness_ratio};\n"
             f"            maxFirstLayerThickness {max_first_layer_thickness};\n"
+            f"            allowDiscontinuity 1;\n"
+            f"        }}"
+        )
+    for name in non_wall:
+        bl_entries.append(
+            f"        {name}\n"
+            f"        {{\n"
+            f"            nLayers 0;\n"
             f"        }}"
         )
     bl_block = "\n".join(bl_entries)
 
-    # Build renameBoundary entries — set correct patch types
-    # cfMesh expects a dictionary keyed by original patch name, not a list
+    # renameBoundary: cfMesh expects a dict keyed by original patch name
     rename_entries = []
     for name in patch_names:
         ptype = _patch_type(classify_patch(name))
@@ -680,16 +932,26 @@ def generate_mesh_dict(
         )
     rename_block = "\n".join(rename_entries)
 
-    # Build localRefinement on wall for finer surface resolution
-    refine_entries = []
-    for name in wall_patches:
-        refine_entries.append(
-            f"        {name}\n"
-            f"        {{\n"
-            f"            cellSize {wall_cell_size};\n"
-            f"        }}"
+    # localRefinement is only emitted when the caller explicitly asks for a
+    # finer wall cell size. Omitting it matches the demo RANS case, where
+    # walls mesh at boundaryCellSize.
+    refine_section = ""
+    if wall_cell_size is not None and wall_cell_size < boundary_cell_size:
+        refine_entries = []
+        for name in wall_patches:
+            refine_entries.append(
+                f"        {name}\n"
+                f"        {{\n"
+                f"            cellSize {wall_cell_size};\n"
+                f"        }}"
+            )
+        refine_block = "\n".join(refine_entries)
+        refine_section = (
+            "localRefinement\n"
+            "{\n"
+            f"{refine_block}\n"
+            "}\n\n"
         )
-    refine_block = "\n".join(refine_entries)
 
     return (
         _header("dictionary", "meshDict")
@@ -702,6 +964,9 @@ boundaryCellSize {boundary_cell_size};
 
 boundaryLayers
 {{
+    optimiseLayer 1;
+    untangleLayers 1;
+
     patchBoundaryLayers
     {{
 {bl_block}
@@ -719,12 +984,7 @@ renameBoundary
     }}
 }}
 
-localRefinement
-{{
-{refine_block}
-}}
-
-// ************************************************************************* //
+{refine_section}// ************************************************************************* //
 """
     )
 
@@ -842,14 +1102,38 @@ nu              [0 2 -1 0 0 0 0] {nu:.6g};
     )
 
 
-def generate_turbulence_properties(cs: float = 0.1) -> str:
-    """LES with Smagorinsky subgrid-scale model.
+def generate_turbulence_properties(
+    simulation_type: str = "les",
+    cs: float = 0.1,
+) -> str:
+    """Turbulence model configuration.
 
     Parameters
     ----------
+    simulation_type : str
+        ``"les"`` for Smagorinsky LES, ``"rans"`` for kOmegaSST RANS.
     cs : float
-        Smagorinsky constant.
+        Smagorinsky constant (only used when simulation_type is ``"les"``).
     """
+    if simulation_type == "rans":
+        return (
+            _header("dictionary", "turbulenceProperties")
+            + """
+simulationType  RAS;
+
+RAS
+{
+    RASModel        kOmegaSST;
+
+    turbulence      on;
+
+    printCoeffs     on;
+}
+
+// ************************************************************************* //
+"""
+        )
+
     return (
         _header("dictionary", "turbulenceProperties")
         + f"""
@@ -922,7 +1206,7 @@ def generate_p(patch_names: list[str], geo_name: str = "") -> str:
         "    }"
     ]
     for name in patch_names:
-        full_name = _of_key(f"{geo_name}_{name}") if geo_name else name
+        full_name = _of_key(f"{geo_name}_{name}" if geo_name else name)
         kind = classify_patch(name)
         if kind == "outlet":
             entries.append(
@@ -964,21 +1248,29 @@ def generate_U(
     inlet_normals: Optional[dict[str, tuple]] = None,
     geo_name: str = "",
     velocity_magnitude: float = 0.3,
+    simulation_type: str = "les",
+    flow_rate_csv: str = "constant/volumetricFlowRate.csv",
 ) -> str:
-    """Velocity BC with constant velocity active and pulsatile commented.
+    """Velocity BC.
+
+    LES default: constant fixedValue inlet with pulsatile commented; outlets
+    zeroGradient. RANS: pulsatile flowRateInletVelocity active; outlets
+    inletOutlet (safer against backflow through WK3-pressurised outlets).
 
     Parameters
     ----------
     patch_names : list[str]
         All patch names (raw, without geometry prefix).
     inlet_normals : dict, optional
-        {patch_name: (nx, ny, nz)} for inlet patches.  The normal points
-        *outward* from the domain (STL/CFD convention).  Velocity is set in
-        the *opposite* direction (flow enters the domain).
+        {patch_name: (nx, ny, nz)} for inlet patches. Outward normal.
     geo_name : str
         Geometry name prefix for patch names.
     velocity_magnitude : float
-        Inlet velocity magnitude in m/s.
+        Inlet velocity magnitude in m/s (LES constant-velocity branch only).
+    simulation_type : str
+        ``"les"`` or ``"rans"``.
+    flow_rate_csv : str
+        Relative path (from case root) to the volumetric flow rate CSV.
     """
     if inlet_normals is None:
         inlet_normals = {}
@@ -990,48 +1282,75 @@ def generate_U(
         "    }"
     ]
     for name in patch_names:
-        full_name = _of_key(f"{geo_name}_{name}") if geo_name else name
+        full_name = _of_key(f"{geo_name}_{name}" if geo_name else name)
         kind = classify_patch(name)
         if kind == "inlet":
-            normal = inlet_normals.get(name)
-            if normal is not None:
-                # Flow direction is opposite to the clip normal (into domain)
-                mag = math.sqrt(sum(c * c for c in normal)) or 1.0
-                vx = -normal[0] / mag * velocity_magnitude + 0.0  # +0.0 avoids -0.0
-                vy = -normal[1] / mag * velocity_magnitude + 0.0
-                vz = -normal[2] / mag * velocity_magnitude + 0.0
+            if simulation_type == "rans":
+                entries.append(
+                    f"    {full_name}\n"
+                    f"    {{\n"
+                    f"        type            flowRateInletVelocity;\n"
+                    f"        volumetricFlowRate csvFile;\n"
+                    f"        volumetricFlowRateCoeffs\n"
+                    f"        {{\n"
+                    f"            nHeaderLine     1;\n"
+                    f"            refColumn       0;\n"
+                    f"            componentColumns (1);\n"
+                    f"            separator       \",\";\n"
+                    f"            mergeSeparators no;\n"
+                    f"            file            \"{flow_rate_csv}\";\n"
+                    f"        }}\n"
+                    f"        value           uniform (0 0 0);\n"
+                    f"    }}"
+                )
             else:
-                vx, vy, vz = velocity_magnitude, 0.0, 0.0
-
-            entries.append(
-                f"    {full_name}\n"
-                f"    {{\n"
-                f"        // === CONSTANT VELOCITY (active) ===\n"
-                f"        type            fixedValue;\n"
-                f"        value           uniform ({vx:.6f} {vy:.6f} {vz:.6f});\n"
-                f"\n"
-                f"        // === PULSATILE FLOW (uncomment below, comment out above) ===\n"
-                f"        // type            flowRateInletVelocity;\n"
-                f"        // volumetricFlowRate csvFile;\n"
-                f"        // volumetricFlowRateCoeffs\n"
-                f"        // {{\n"
-                f"        //     nHeaderLine     1;\n"
-                f"        //     refColumn       0;\n"
-                f"        //     componentColumns (1);\n"
-                f"        //     separator       \",\";\n"
-                f"        //     mergeSeparators no;\n"
-                f"        //     file            \"volumetricFlowRate.csv\";\n"
-                f"        // }}\n"
-                f"        // value           uniform (0 0 0);\n"
-                f"    }}"
-            )
+                normal = inlet_normals.get(name)
+                if normal is not None:
+                    mag = math.sqrt(sum(c * c for c in normal)) or 1.0
+                    vx = -normal[0] / mag * velocity_magnitude + 0.0
+                    vy = -normal[1] / mag * velocity_magnitude + 0.0
+                    vz = -normal[2] / mag * velocity_magnitude + 0.0
+                else:
+                    vx, vy, vz = velocity_magnitude, 0.0, 0.0
+                entries.append(
+                    f"    {full_name}\n"
+                    f"    {{\n"
+                    f"        // === CONSTANT VELOCITY (active) ===\n"
+                    f"        type            fixedValue;\n"
+                    f"        value           uniform ({vx:.6f} {vy:.6f} {vz:.6f});\n"
+                    f"\n"
+                    f"        // === PULSATILE FLOW (uncomment below, comment out above) ===\n"
+                    f"        // type            flowRateInletVelocity;\n"
+                    f"        // volumetricFlowRate csvFile;\n"
+                    f"        // volumetricFlowRateCoeffs\n"
+                    f"        // {{\n"
+                    f"        //     nHeaderLine     1;\n"
+                    f"        //     refColumn       0;\n"
+                    f"        //     componentColumns (1);\n"
+                    f"        //     separator       \",\";\n"
+                    f"        //     mergeSeparators no;\n"
+                    f"        //     file            \"{flow_rate_csv}\";\n"
+                    f"        // }}\n"
+                    f"        // value           uniform (0 0 0);\n"
+                    f"    }}"
+                )
         elif kind == "outlet":
-            entries.append(
-                f"    {full_name}\n"
-                f"    {{\n"
-                f"        type            zeroGradient;\n"
-                f"    }}"
-            )
+            if simulation_type == "rans":
+                entries.append(
+                    f"    {full_name}\n"
+                    f"    {{\n"
+                    f"        type            inletOutlet;\n"
+                    f"        inletValue      uniform (0 0 0);\n"
+                    f"        value           uniform (0 0 0);\n"
+                    f"    }}"
+                )
+            else:
+                entries.append(
+                    f"    {full_name}\n"
+                    f"    {{\n"
+                    f"        type            zeroGradient;\n"
+                    f"    }}"
+                )
         else:
             entries.append(
                 f"    {full_name}\n"
@@ -1059,8 +1378,18 @@ boundaryField
     )
 
 
-def generate_nut(patch_names: list[str], geo_name: str = "") -> str:
-    """Subgrid-scale viscosity BC for LES."""
+def generate_nut(
+    patch_names: list[str],
+    geo_name: str = "",
+    simulation_type: str = "les",
+) -> str:
+    """Turbulent viscosity BC.
+
+    LES uses ``nutUSpaldingWallFunction`` (continuous across y+ regions).
+    RANS (kOmegaSST with wall functions) uses ``nutkWallFunction``.
+    """
+    wall_fn = "nutkWallFunction" if simulation_type == "rans" else "nutUSpaldingWallFunction"
+
     entries = [
         "    allBoundary\n"
         "    {\n"
@@ -1069,13 +1398,13 @@ def generate_nut(patch_names: list[str], geo_name: str = "") -> str:
         "    }"
     ]
     for name in patch_names:
-        full_name = _of_key(f"{geo_name}_{name}") if geo_name else name
+        full_name = _of_key(f"{geo_name}_{name}" if geo_name else name)
         kind = classify_patch(name)
         if kind == "wall":
             entries.append(
                 f"    {full_name}\n"
                 f"    {{\n"
-                f"        type            nutUSpaldingWallFunction;\n"
+                f"        type            {wall_fn};\n"
                 f"        value           uniform 0;\n"
                 f"    }}"
             )
@@ -1096,6 +1425,142 @@ def generate_nut(patch_names: list[str], geo_name: str = "") -> str:
 dimensions      [0 2 -1 0 0 0 0];
 
 internalField   uniform 0;
+
+boundaryField
+{{
+{patches_block}
+}}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def generate_k(
+    patch_names: list[str],
+    geo_name: str = "",
+    k_value: float = 3.375e-4,
+) -> str:
+    """Turbulent kinetic energy BC for RANS (kOmegaSST).
+
+    Parameters
+    ----------
+    patch_names : list[str]
+        All patch names (raw, without geometry prefix).
+    geo_name : str
+        Geometry name prefix for patch names.
+    k_value : float
+        Uniform k value for inlet and initial field.
+    """
+    entries = [
+        "    allBoundary\n"
+        "    {\n"
+        "        type            zeroGradient;\n"
+        "    }"
+    ]
+    for name in patch_names:
+        full_name = _of_key(f"{geo_name}_{name}" if geo_name else name)
+        kind = classify_patch(name)
+        if kind == "inlet":
+            entries.append(
+                f"    {full_name}\n"
+                f"    {{\n"
+                f"        type            fixedValue;\n"
+                f"        value           uniform {_of_val(k_value)};\n"
+                f"    }}"
+            )
+        elif kind == "wall":
+            entries.append(
+                f"    {full_name}\n"
+                f"    {{\n"
+                f"        type            kqRWallFunction;\n"
+                f"        value           uniform {_of_val(k_value)};\n"
+                f"    }}"
+            )
+        else:
+            entries.append(
+                f"    {full_name}\n"
+                f"    {{\n"
+                f"        type            zeroGradient;\n"
+                f"    }}"
+            )
+
+    patches_block = "\n\n".join(entries)
+
+    return (
+        _header("volScalarField", "k")
+        + f"""
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform {_of_val(k_value)};
+
+boundaryField
+{{
+{patches_block}
+}}
+
+// ************************************************************************* //
+"""
+    )
+
+
+def generate_omega(
+    patch_names: list[str],
+    geo_name: str = "",
+    omega_value: float = 30,
+) -> str:
+    """Specific dissipation rate BC for RANS (kOmegaSST).
+
+    Parameters
+    ----------
+    patch_names : list[str]
+        All patch names (raw, without geometry prefix).
+    geo_name : str
+        Geometry name prefix for patch names.
+    omega_value : float
+        Uniform omega value for inlet and initial field.
+    """
+    entries = [
+        "    allBoundary\n"
+        "    {\n"
+        "        type            zeroGradient;\n"
+        "    }"
+    ]
+    for name in patch_names:
+        full_name = _of_key(f"{geo_name}_{name}" if geo_name else name)
+        kind = classify_patch(name)
+        if kind == "inlet":
+            entries.append(
+                f"    {full_name}\n"
+                f"    {{\n"
+                f"        type            fixedValue;\n"
+                f"        value           uniform {_of_val(omega_value)};\n"
+                f"    }}"
+            )
+        elif kind == "wall":
+            entries.append(
+                f"    {full_name}\n"
+                f"    {{\n"
+                f"        type            omegaWallFunction;\n"
+                f"        value           uniform {_of_val(omega_value)};\n"
+                f"    }}"
+            )
+        else:
+            entries.append(
+                f"    {full_name}\n"
+                f"    {{\n"
+                f"        type            zeroGradient;\n"
+                f"    }}"
+            )
+
+    patches_block = "\n\n".join(entries)
+
+    return (
+        _header("volScalarField", "omega")
+        + f"""
+dimensions      [0 0 -1 0 0 0 0];
+
+internalField   uniform {_of_val(omega_value)};
 
 boundaryField
 {{
@@ -1294,7 +1759,7 @@ foamDisplay.Opacity = 0.35
 try:
     ColorBy(foamDisplay, ('CELLS', 'wallShearStress', 'Magnitude'))
     wssLUT = GetColorTransferFunction('wallShearStress')
-    wssLUT.ApplyPreset('Cool to Warm', True)
+    wssLUT.ApplyPreset('Fast', True)
     foamDisplay.SetScalarBarVisibility(renderView, True)
     wssBar = GetScalarBar(wssLUT, renderView)
     wssBar.Title = 'Wall Shear Stress'
@@ -1711,6 +2176,8 @@ re_ux = re.compile(r'Solving for Ux, Initial residual = ([\d.e+-]+)')
 re_uy = re.compile(r'Solving for Uy, Initial residual = ([\d.e+-]+)')
 re_uz = re.compile(r'Solving for Uz, Initial residual = ([\d.e+-]+)')
 re_p = re.compile(r'Solving for p, Initial residual = ([\d.e+-]+)')
+re_k = re.compile(r'Solving for k, Initial residual = ([\d.e+-]+)')
+re_omega = re.compile(r'Solving for omega, Initial residual = ([\d.e+-]+)')
 re_pimple = re.compile(r'PIMPLE: iteration (\d+)')
 
 
@@ -1718,6 +2185,7 @@ def parse_log():
     """Parse solver.log, returning per-PIMPLE-iteration data (StarCCM+ style)."""
     # Per cumulative iteration (every PIMPLE outer iter)
     all_ux, all_uy, all_uz, all_p = [], [], [], []
+    all_k, all_omega = [], []
     cont_local = []
     # Track timestep boundaries (cumulative iter index where each timestep starts)
     ts_boundaries = []
@@ -1730,6 +2198,7 @@ def parse_log():
     ts_max_pimple = 0
     # Buffer for current PIMPLE iteration within a timestep
     iter_ux, iter_uy, iter_uz, iter_p = None, None, None, None
+    iter_k, iter_omega = None, None
 
     with open(LOG) as f:
         for line in f:
@@ -1751,6 +2220,7 @@ def parse_log():
                 # Each PIMPLE iteration = one cumulative iteration
                 # Reset per-iter buffers
                 iter_ux, iter_uy, iter_uz, iter_p = None, None, None, None
+                iter_k, iter_omega = None, None
                 continue
 
             m = re_courant.search(line)
@@ -1793,6 +2263,20 @@ def parse_log():
                     iter_p = val
                     all_p.append(val)
                 continue
+            m = re_k.search(line)
+            if m:
+                val = float(m.group(1))
+                if iter_k is None:
+                    iter_k = val
+                    all_k.append(val)
+                continue
+            m = re_omega.search(line)
+            if m:
+                val = float(m.group(1))
+                if iter_omega is None:
+                    iter_omega = val
+                    all_omega.append(val)
+                continue
 
     # Flush last timestep
     if current_time is not None:
@@ -1802,6 +2286,7 @@ def parse_log():
     return dict(
         # Per cumulative PIMPLE iteration
         all_ux=all_ux, all_uy=all_uy, all_uz=all_uz, all_p=all_p,
+        all_k=all_k, all_omega=all_omega,
         cont_local=cont_local,
         ts_boundaries=ts_boundaries,
         # Per timestep
@@ -1927,8 +2412,37 @@ def update_plot(fig, axes, d, settings):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Row 2 right: PIMPLE outer iterations per timestep
-    ax = axes[6]
+    # k/omega residuals (RANS only — panels exist only when data is present)
+    has_k_omega = len(d.get("all_k", [])) > 0
+    if has_k_omega and len(axes) > 8:
+        # k residual
+        ax = axes[6]
+        nk = min(len(d["all_k"]), n_iter)
+        ax.semilogy(iters[:nk], d["all_k"][:nk], lw=0.8, alpha=0.9, color="C5")
+        _add_ts_lines(ax, bounds)
+        ax.set_ylabel("Residual")
+        ax.set_title("k Residual")
+        ax.set_xlabel("Cumulative PIMPLE iteration")
+        ax.grid(True, alpha=0.3)
+        _add_time_twin_axis(ax, bounds, d["times"], n_iter)
+
+        # omega residual
+        ax = axes[7]
+        nom = min(len(d["all_omega"]), n_iter)
+        ax.semilogy(iters[:nom], d["all_omega"][:nom], lw=0.8, alpha=0.9, color="C6")
+        _add_ts_lines(ax, bounds)
+        ax.set_ylabel("Residual")
+        ax.set_title("omega Residual")
+        ax.set_xlabel("Cumulative PIMPLE iteration")
+        ax.grid(True, alpha=0.3)
+        _add_time_twin_axis(ax, bounds, d["times"], n_iter)
+
+        # Hide spare axes[8]
+        axes[8].set_visible(False)
+
+    # PIMPLE outer iterations per timestep (last axes element)
+    pimple_ax_idx = -1  # always last element
+    ax = axes[pimple_ax_idx]
     pi = d["pimple_iters"]
     np_t = min(n_ts, len(pi))
     if np_t > 1:
@@ -1956,18 +2470,25 @@ def update_plot(fig, axes, d, settings):
     return True
 
 
-def _create_figure():
-    fig = plt.figure(figsize=(16, 14))
-    gs = fig.add_gridspec(3, 3, hspace=0.38, wspace=0.3)
+def _create_figure(has_k_omega=False):
+    n_rows = 4 if has_k_omega else 3
+    fig = plt.figure(figsize=(16, 4.5 * n_rows))
+    gs = fig.add_gridspec(n_rows, 3, hspace=0.38, wspace=0.3)
     axes = [
-        fig.add_subplot(gs[0, 0]),  # Ux
-        fig.add_subplot(gs[0, 1]),  # Uy
-        fig.add_subplot(gs[0, 2]),  # Uz
-        fig.add_subplot(gs[1, 0]),  # p
-        fig.add_subplot(gs[1, 1]),  # continuity
-        fig.add_subplot(gs[1, 2]),  # courant
-        fig.add_subplot(gs[2, :]),  # PIMPLE iters (full width)
+        fig.add_subplot(gs[0, 0]),  # 0: Ux
+        fig.add_subplot(gs[0, 1]),  # 1: Uy
+        fig.add_subplot(gs[0, 2]),  # 2: Uz
+        fig.add_subplot(gs[1, 0]),  # 3: p
+        fig.add_subplot(gs[1, 1]),  # 4: continuity
+        fig.add_subplot(gs[1, 2]),  # 5: courant
     ]
+    if has_k_omega:
+        axes.append(fig.add_subplot(gs[2, 0]))  # 6: k
+        axes.append(fig.add_subplot(gs[2, 1]))  # 7: omega
+        axes.append(fig.add_subplot(gs[2, 2]))  # 8: (empty/spare)
+        axes.append(fig.add_subplot(gs[3, :]))  # 9: PIMPLE iters
+    else:
+        axes.append(fig.add_subplot(gs[2, :]))  # 6: PIMPLE iters
     return fig, axes
 
 
@@ -1981,9 +2502,10 @@ def _sleep(seconds):
 def main():
     settings = read_case_settings()
 
+    has_k_omega = False  # detected from log data
     if not HEADLESS:
         plt.ion()
-        fig, axes = _create_figure()
+        fig, axes = _create_figure(has_k_omega)
         plt.show(block=False)
 
     prev_size = 0
@@ -2003,8 +2525,14 @@ def main():
             print(f"[{pytime.strftime('%H:%M:%S')}] No new data (log size {cur_size}). Solver done?")
             d = parse_log()
             if d["all_ux"]:
+                new_k_omega = len(d.get("all_k", [])) > 0
                 if HEADLESS:
-                    fig, axes = _create_figure()
+                    fig, axes = _create_figure(new_k_omega)
+                elif new_k_omega != has_k_omega:
+                    plt.close(fig)
+                    has_k_omega = new_k_omega
+                    fig, axes = _create_figure(has_k_omega)
+                    plt.show(block=False)
                 update_plot(fig, axes, d, settings)
                 print(f"Final plot saved: t={d['times'][-1]:.4f}s, "
                       f"{len(d['times'])} steps, {len(d['all_ux'])} iters")
@@ -2017,8 +2545,14 @@ def main():
             n_it = len(d["all_ux"])
             co_str = f"Co max={max(d['co_max']):.1f}" if d["co_max"] else ""
             cont_str = f"cont={max(d['cont_local']):.1e}" if d["cont_local"] else ""
+            new_k_omega = len(d.get("all_k", [])) > 0
             if HEADLESS:
-                fig, axes = _create_figure()
+                fig, axes = _create_figure(new_k_omega)
+            elif new_k_omega != has_k_omega:
+                plt.close(fig)
+                has_k_omega = new_k_omega
+                fig, axes = _create_figure(has_k_omega)
+                plt.show(block=False)
             update_plot(fig, axes, d, settings)
             print(f"[{pytime.strftime('%H:%M:%S')}] t={d['times'][-1]:.4f}s  "
                   f"steps={n_ts}  iters={n_it}  {co_str}  {cont_str}  -> {OUT}")

@@ -6,3 +6,5 @@ build/
 .eggs/
 *.stl
 *.json
+# Template config.json is required runtime data (load_template), not an exported artifact
+!mesh_prep/templates/*/config.json
