@@ -485,6 +485,15 @@ class STLClipperEngine:
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
         return self.recompute_all()
 
+    def undo_trim(self) -> bool:
+        """Restore the mesh from before the most recent trim and re-apply clips.
+        Returns True if a state was restored, False if there is no trim history."""
+        if not self._trim_history:
+            return False
+        self.original_mesh = self._trim_history.pop()
+        self.recompute_all()
+        return True
+
     def get_wall_mesh(self) -> Optional[pv.PolyData]:
         return self._wall_mesh
 

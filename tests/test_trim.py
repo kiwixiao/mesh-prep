@@ -69,3 +69,26 @@ def test_trim_selecting_everything_refuses():
         eng.trim_by_screen_polygon(allp, VIEW, VIEWPORT)
     assert eng.original_mesh.n_cells == 4
     assert len(eng._trim_history) == 0
+
+
+def test_undo_restores_previous_mesh():
+    eng = _engine_with_quad()
+    eng.trim_by_screen_polygon([(0, 0), (50, 0), (50, 50), (0, 50)], VIEW, VIEWPORT)
+    assert eng.original_mesh.n_cells == 3
+    assert eng.undo_trim() is True
+    assert eng.original_mesh.n_cells == 4
+    assert eng._wall_mesh.n_cells == 4
+
+
+def test_undo_multi_level():
+    eng = _engine_with_quad()
+    # trim 1: removes display (25,25) -> 4 -> 3
+    eng.trim_by_screen_polygon([(0, 0), (50, 0), (50, 50), (0, 50)], VIEW, VIEWPORT)
+    # trim 2: removes display (75,25) -> 3 -> 2
+    eng.trim_by_screen_polygon([(50, 0), (100, 0), (100, 50), (50, 50)], VIEW, VIEWPORT)
+    assert eng.original_mesh.n_cells == 2
+    assert eng.undo_trim() is True
+    assert eng.original_mesh.n_cells == 3
+    assert eng.undo_trim() is True
+    assert eng.original_mesh.n_cells == 4
+    assert eng.undo_trim() is False
