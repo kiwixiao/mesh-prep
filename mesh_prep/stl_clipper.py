@@ -3097,20 +3097,25 @@ class STLClipperApp(QMainWindow):
             self._trim_obs = []
             if getattr(self, "_trim_saved_style", None) is not None:
                 vtk_iren.SetInteractorStyle(self._trim_saved_style)
+            self._end_lasso_overlay()
             logger.info("trim mode OFF")
             self.status.showMessage("Trim mode off.")
 
     def _on_trim_press(self):
         self._trim_drawing = True
         self._trim_points = [self.plotter.iren.get_event_position()]
+        self._start_lasso_overlay()
+        self._update_lasso_overlay()
         logger.info("trim press at %s", self._trim_points[0])
 
     def _on_trim_move(self):
         if getattr(self, "_trim_drawing", False):
             self._trim_points.append(self.plotter.iren.get_event_position())
+            self._update_lasso_overlay()
 
     def _on_trim_release(self):
         self._trim_drawing = False
+        self._end_lasso_overlay()
         points = list(self._trim_points)
         self._trim_points = []
         logger.info("trim release: %d points", len(points))
@@ -3118,6 +3123,56 @@ class STLClipperApp(QMainWindow):
             self.status.showMessage("Trim: stroke too short — draw a closed shape.")
             return
         self._apply_trim(points)
+
+    # --- Lasso outline overlay (2D screen-space polyline while drawing) -------
+
+    def _start_lasso_overlay(self):
+        """Create a fresh yellow 2D polyline actor for the in-progress lasso."""
+        self._end_lasso_overlay()
+        self._lasso_pts = vtk.vtkPoints()
+        self._lasso_cells = vtk.vtkCellArray()
+        self._lasso_poly = vtk.vtkPolyData()
+        self._lasso_poly.SetPoints(self._lasso_pts)
+        self._lasso_poly.SetLines(self._lasso_cells)
+        coord = vtk.vtkCoordinate()
+        coord.SetCoordinateSystemToDisplay()
+        mapper = vtk.vtkPolyDataMapper2D()
+        mapper.SetInputData(self._lasso_poly)
+        mapper.SetTransformCoordinate(coord)
+        self._lasso_actor = vtk.vtkActor2D()
+        self._lasso_actor.SetMapper(mapper)
+        self._lasso_actor.GetProperty().SetColor(1.0, 1.0, 0.0)
+        self._lasso_actor.GetProperty().SetLineWidth(2.0)
+        self.plotter.renderer.AddActor2D(self._lasso_actor)
+
+    def _update_lasso_overlay(self):
+        """Rebuild the polyline from the captured display points and redraw."""
+        if getattr(self, "_lasso_actor", None) is None:
+            return
+        pts = self._trim_points
+        self._lasso_pts.Reset()
+        self._lasso_cells.Reset()
+        for x, y in pts:
+            self._lasso_pts.InsertNextPoint(float(x), float(y), 0.0)
+        n = len(pts)
+        if n >= 2:
+            self._lasso_cells.InsertNextCell(n + 1)
+            for i in range(n):
+                self._lasso_cells.InsertCellPoint(i)
+            self._lasso_cells.InsertCellPoint(0)  # close the loop
+        self._lasso_poly.Modified()
+        self.plotter.render()
+
+    def _end_lasso_overlay(self):
+        """Remove the lasso overlay actor if present."""
+        actor = getattr(self, "_lasso_actor", None)
+        if actor is not None:
+            try:
+                self.plotter.renderer.RemoveActor2D(actor)
+            except Exception:
+                pass
+            self._lasso_actor = None
+            self.plotter.render()
 
     def _apply_trim(self, display_points):
         cam = self.plotter.camera
@@ -3274,6 +3329,7 @@ class STLClipperApp(QMainWindow):
         self.plotter.add_mesh(
             wall, color=WALL_COLOR, opacity=wall_opacity,
             show_edges=show_mesh, edge_color="black", line_width=0.5,
+            smooth_shading=True,
             name="wall",
         )
 
