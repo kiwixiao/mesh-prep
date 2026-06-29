@@ -498,6 +498,26 @@ class STLClipperEngine:
     def get_wall_mesh(self) -> Optional[pv.PolyData]:
         return self._wall_mesh
 
+    def bounds_info(self) -> Optional[dict]:
+        """Axis-aligned bounding box + per-axis dimensions of the loaded STL,
+        in its raw (unitless) coordinates. Returns None if no mesh is loaded.
+
+        An STL carries no units, so its bounding box is the only clue to scale:
+        a max dimension of ~200 suggests millimetres, ~0.2 suggests metres.
+        This drives the GUI bounds readout.
+        """
+        if self.original_mesh is None:
+            return None
+        b = self.original_mesh.bounds  # (xmin, xmax, ymin, ymax, zmin, zmax)
+        dx, dy, dz = b[1] - b[0], b[3] - b[2], b[5] - b[4]
+        return {
+            "xmin": b[0], "xmax": b[1],
+            "ymin": b[2], "ymax": b[3],
+            "zmin": b[4], "zmax": b[5],
+            "dx": dx, "dy": dy, "dz": dz,
+            "max_dim": max(dx, dy, dz),
+        }
+
     def geometry_quality(self) -> dict:
         """Return geometry quality metrics for the current wall mesh."""
         wall = self._wall_mesh
@@ -1331,17 +1351,28 @@ class STLClipperApp(QMainWindow):
         geo_box.setLayout(geo_lay)
         panel.addWidget(geo_box)
 
+        # Loaded-STL bounding box — the only clue to the file's units.
+        bounds_box = QGroupBox("STL Bounds (raw units)")
+        bounds_lay = QVBoxLayout()
+        self._lbl_bounds = QLabel("—")
+        self._lbl_bounds.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bounds_lay.addWidget(self._lbl_bounds)
+        bounds_box.setLayout(bounds_lay)
+        panel.addWidget(bounds_box)
+
         panel.addWidget(self._separator("STL Export"))
 
         # Scale factor input (for STL-only exports on this tab).
         # Applied uniformly to all vertex coordinates on export.
+        # Default 1.0 = save raw STL coordinates unchanged; set this yourself
+        # (e.g. 0.001 for a mm STL -> metres) when the target needs scaling.
         scale_row = QHBoxLayout()
         scale_row.addWidget(QLabel("Scale factor ×"))
         self._spin_scale = QDoubleSpinBox()
         self._spin_scale.setRange(1e-6, 1e6)
         self._spin_scale.setDecimals(6)
         self._spin_scale.setSingleStep(0.1)
-        self._spin_scale.setValue(0.001)
+        self._spin_scale.setValue(1.0)
         scale_row.addWidget(self._spin_scale)
         panel.addLayout(scale_row)
 
@@ -1458,7 +1489,7 @@ class STLClipperApp(QMainWindow):
         self._spin_scale_of.setRange(1e-6, 1e6)
         self._spin_scale_of.setDecimals(6)
         self._spin_scale_of.setSingleStep(0.1)
-        self._spin_scale_of.setValue(0.001)
+        self._spin_scale_of.setValue(1.0)
         scale_lay.addWidget(self._spin_scale_of)
         scale_box.setLayout(scale_lay)
         tab2.addWidget(scale_box)
@@ -1707,9 +1738,9 @@ class STLClipperApp(QMainWindow):
         self._clip_save_combos: list = []
 
         # Independent scale factor for this tab — default 1.0 preserves the
-        # original STL units (e.g. keeps mm input as mm on output).  The
-        # Clipping tab's separate scale (default 0.001 for CFD mm→m) is
-        # unaffected.
+        # original STL units (e.g. keeps mm input as mm on output). All scale
+        # spinboxes now default to 1.0 (raw); set a factor explicitly to convert
+        # (e.g. 0.001 for a mm STL -> metres for CFD).
         scale_row = QHBoxLayout()
         scale_row.addWidget(QLabel("Scale factor ×"))
         self._spin_scale_save = QDoubleSpinBox()
@@ -3231,7 +3262,23 @@ class STLClipperApp(QMainWindow):
     # Display
     # ------------------------------------------------------------------
 
+    def _refresh_bounds_panel(self):
+        """Show the loaded STL's raw-unit bounding box so units can be inferred."""
+        if not hasattr(self, "_lbl_bounds"):
+            return
+        info = self.engine.bounds_info()
+        if info is None:
+            self._lbl_bounds.setText("—")
+            return
+        self._lbl_bounds.setText(
+            f"X: {info['xmin']:.3f} … {info['xmax']:.3f}  (Δ {info['dx']:.3f})\n"
+            f"Y: {info['ymin']:.3f} … {info['ymax']:.3f}  (Δ {info['dy']:.3f})\n"
+            f"Z: {info['zmin']:.3f} … {info['zmax']:.3f}  (Δ {info['dz']:.3f})\n"
+            f"Max dim: {info['max_dim']:.3f}"
+        )
+
     def _refresh_display(self):
+        self._refresh_bounds_panel()
         self.plotter.clear()
 
         wall = self.engine.get_wall_mesh()
