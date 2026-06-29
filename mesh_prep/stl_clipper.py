@@ -62,7 +62,7 @@ INLET_COLOR = (0.9, 0.2, 0.2)       # red
 OUTLET_COLOR = (0.2, 0.4, 0.9)      # blue
 DEFAULT_CAP_COLOR = (0.2, 0.8, 0.3) # green (fallback)
 
-WALL_COLOR = (0.7, 0.7, 0.7)
+WALL_COLOR = (0.82, 0.82, 0.82)
 PREVIEW_COLOR = (0.0, 1.0, 1.0)  # cyan for slice preview
 
 
@@ -3329,7 +3329,7 @@ class STLClipperApp(QMainWindow):
         self.plotter.add_mesh(
             wall, color=WALL_COLOR, opacity=wall_opacity,
             show_edges=show_mesh, edge_color="black", line_width=0.5,
-            smooth_shading=True,
+            specular=0.15, specular_power=20.0, ambient=0.15, diffuse=0.9,
             name="wall",
         )
 
