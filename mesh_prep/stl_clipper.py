@@ -62,7 +62,7 @@ INLET_COLOR = (0.9, 0.2, 0.2)       # red
 OUTLET_COLOR = (0.2, 0.4, 0.9)      # blue
 DEFAULT_CAP_COLOR = (0.2, 0.8, 0.3) # green (fallback)
 
-WALL_COLOR = (0.7, 0.7, 0.75)
+WALL_COLOR = (0.7, 0.7, 0.7)
 PREVIEW_COLOR = (0.0, 1.0, 1.0)  # cyan for slice preview
 
 
@@ -497,26 +497,6 @@ class STLClipperEngine:
 
     def get_wall_mesh(self) -> Optional[pv.PolyData]:
         return self._wall_mesh
-
-    def bounds_info(self) -> Optional[dict]:
-        """Axis-aligned bounding box + per-axis dimensions of the loaded STL,
-        in its raw (unitless) coordinates. Returns None if no mesh is loaded.
-
-        An STL carries no units, so its bounding box is the only clue to scale:
-        a max dimension of ~200 suggests millimetres, ~0.2 suggests metres.
-        This drives the GUI bounds readout.
-        """
-        if self.original_mesh is None:
-            return None
-        b = self.original_mesh.bounds  # (xmin, xmax, ymin, ymax, zmin, zmax)
-        dx, dy, dz = b[1] - b[0], b[3] - b[2], b[5] - b[4]
-        return {
-            "xmin": b[0], "xmax": b[1],
-            "ymin": b[2], "ymax": b[3],
-            "zmin": b[4], "zmax": b[5],
-            "dx": dx, "dy": dy, "dz": dz,
-            "max_dim": max(dx, dy, dz),
-        }
 
     def geometry_quality(self) -> dict:
         """Return geometry quality metrics for the current wall mesh."""
@@ -1331,7 +1311,7 @@ class STLClipperApp(QMainWindow):
         geo_lay.addWidget(self._btn_show_mesh_edges)
         self._btn_opaque_wall = QPushButton("Opaque Wall")
         self._btn_opaque_wall.setCheckable(True)
-        self._btn_opaque_wall.setChecked(False)
+        self._btn_opaque_wall.setChecked(True)
         self._btn_opaque_wall.clicked.connect(self._on_toggle_opaque_wall)
         geo_lay.addWidget(self._btn_opaque_wall)
         self._btn_show_boundary = QPushButton("Show Boundary Edges")
@@ -1350,15 +1330,6 @@ class STLClipperApp(QMainWindow):
         geo_lay.addWidget(self._btn_show_non_manifold)
         geo_box.setLayout(geo_lay)
         panel.addWidget(geo_box)
-
-        # Loaded-STL bounding box — the only clue to the file's units.
-        bounds_box = QGroupBox("STL Bounds (raw units)")
-        bounds_lay = QVBoxLayout()
-        self._lbl_bounds = QLabel("—")
-        self._lbl_bounds.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        bounds_lay.addWidget(self._lbl_bounds)
-        bounds_box.setLayout(bounds_lay)
-        panel.addWidget(bounds_box)
 
         panel.addWidget(self._separator("STL Export"))
 
@@ -3262,23 +3233,7 @@ class STLClipperApp(QMainWindow):
     # Display
     # ------------------------------------------------------------------
 
-    def _refresh_bounds_panel(self):
-        """Show the loaded STL's raw-unit bounding box so units can be inferred."""
-        if not hasattr(self, "_lbl_bounds"):
-            return
-        info = self.engine.bounds_info()
-        if info is None:
-            self._lbl_bounds.setText("—")
-            return
-        self._lbl_bounds.setText(
-            f"X: {info['xmin']:.3f} … {info['xmax']:.3f}  (Δ {info['dx']:.3f})\n"
-            f"Y: {info['ymin']:.3f} … {info['ymax']:.3f}  (Δ {info['dy']:.3f})\n"
-            f"Z: {info['zmin']:.3f} … {info['zmax']:.3f}  (Δ {info['dz']:.3f})\n"
-            f"Max dim: {info['max_dim']:.3f}"
-        )
-
     def _refresh_display(self):
-        self._refresh_bounds_panel()
         self.plotter.clear()
 
         wall = self.engine.get_wall_mesh()
