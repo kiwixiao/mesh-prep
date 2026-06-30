@@ -1065,8 +1065,8 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
             picker = vtk.vtkPropPicker()
             picker.Pick(x, y, 0, app.plotter.renderer)
             if picker.GetActor() is not None:        # cursor over geometry -> lasso
-                self._lasso_active = True
                 app._select_lasso_press()
+                self._lasso_active = True
                 return                                # suppress rotate (don't forward)
             self._lasso_active = False
             self.OnLeftButtonDown()                   # empty space -> default rotate
