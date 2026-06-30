@@ -2527,7 +2527,7 @@ class STLClipperApp(QMainWindow):
         self._centerline_worker = None
         self._lbl_repair_status.setText("Status: \u2014")
         self._clear_selection()
-        self._refresh_display()
+        self._refresh_display(fit_camera=True)
 
         fname = os.path.basename(filepath)
         n = mesh.n_cells
@@ -2966,7 +2966,7 @@ class STLClipperApp(QMainWindow):
         radius = np.min(self._box_half_extents) * 0.1
         self.plotter.add_mesh(
             pv.Sphere(center=center, radius=radius),
-            color="green", name="box_center_marker",
+            color="green", name="box_center_marker", reset_camera=False,
         )
 
         self._update_preview()
@@ -3554,7 +3554,8 @@ class STLClipperApp(QMainWindow):
             ids = sorted(i for i in self._selection if 0 <= i < mesh.n_cells)
             if ids:
                 self.plotter.add_mesh(mesh.extract_cells(ids), color=(1.0, 0.55, 0.0),
-                                      name="selection", lighting=True, pickable=False)
+                                      name="selection", lighting=True, pickable=False,
+                                      reset_camera=False)
         self.plotter.render()
 
     def _clear_selection(self):
@@ -3699,7 +3700,7 @@ class STLClipperApp(QMainWindow):
     # Display
     # ------------------------------------------------------------------
 
-    def _refresh_display(self):
+    def _refresh_display(self, fit_camera=False):
         self.plotter.clear()
         # pyvista's clear() also removes all lights (Renderer.clear ->
         # remove_all_lights), leaving only VTK's fallback headlight, which lights
@@ -3720,7 +3721,7 @@ class STLClipperApp(QMainWindow):
             wall, color=WALL_COLOR, opacity=wall_opacity,
             show_edges=show_mesh, edge_color="black", line_width=0.5,
             specular=0.15, specular_power=20.0, ambient=0.15, diffuse=0.9,
-            name="wall",
+            name="wall", reset_camera=False,
         )
 
         # Cap patches — name-based colors with white edges for visibility
@@ -3729,7 +3730,7 @@ class STLClipperApp(QMainWindow):
                 self.plotter.add_mesh(
                     clip_def.cap_mesh, color=clip_def.color, opacity=1.0,
                     show_edges=True, edge_color="white", line_width=2,
-                    name=f"cap_{clip_def.name}",
+                    name=f"cap_{clip_def.name}", reset_camera=False,
                 )
 
         # Centerline — yellow tube
@@ -3746,13 +3747,14 @@ class STLClipperApp(QMainWindow):
             if tube is not None and tube.n_points > 0:
                 self.plotter.add_mesh(
                     tube, color="yellow", opacity=1.0,
-                    name="centerline",
+                    name="centerline", reset_camera=False,
                 )
                 logger.info("Centerline tube added to plotter")
             else:
                 logger.warning("Tube generation produced empty mesh — centerline not rendered")
 
-        self.plotter.reset_camera()
+        if fit_camera:
+            self.plotter.reset_camera()
         self.plotter.render()
 
         # Update wall face count label
@@ -3820,7 +3822,7 @@ class STLClipperApp(QMainWindow):
         if self._btn_show_boundary.isChecked() and self._boundary_mesh is not None and self._boundary_mesh.n_cells > 0:
             self.plotter.add_mesh(
                 self._boundary_mesh, color="red", line_width=4,
-                name="boundary_edges",
+                name="boundary_edges", reset_camera=False,
             )
 
         # Re-render non-manifold edges if toggle is on
@@ -3828,7 +3830,7 @@ class STLClipperApp(QMainWindow):
             if self._non_manifold_mesh.n_cells > 0:
                 self.plotter.add_mesh(
                     self._non_manifold_mesh, color="magenta", line_width=4,
-                    name="non_manifold_edges",
+                    name="non_manifold_edges", reset_camera=False,
                 )
 
         self.plotter.render()
@@ -3847,7 +3849,7 @@ class STLClipperApp(QMainWindow):
             if self._boundary_mesh is not None and self._boundary_mesh.n_cells > 0:
                 self.plotter.add_mesh(
                     self._boundary_mesh, color="red", line_width=4,
-                    name="boundary_edges",
+                    name="boundary_edges", reset_camera=False,
                 )
                 self.plotter.render()
         else:
@@ -3860,7 +3862,7 @@ class STLClipperApp(QMainWindow):
             if self._non_manifold_mesh is not None and self._non_manifold_mesh.n_cells > 0:
                 self.plotter.add_mesh(
                     self._non_manifold_mesh, color="magenta", line_width=4,
-                    name="non_manifold_edges",
+                    name="non_manifold_edges", reset_camera=False,
                 )
                 self.plotter.render()
         else:
