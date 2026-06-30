@@ -231,6 +231,23 @@ def _points_in_polygon(xs, ys, polygon):
     return inside
 
 
+def _project_to_display(points, view_matrix, viewport):
+    """Project world points (N,3) through a 4x4 world->clip matrix to display
+    (x, y) in logical pixels (VTK bottom-left origin)."""
+    pts = np.asarray(points, dtype=float)
+    matrix = np.asarray(view_matrix, dtype=float).reshape(4, 4)
+    width, height = viewport
+    n = pts.shape[0]
+    homog = np.hstack([pts, np.ones((n, 1))])
+    clip = homog @ matrix.T
+    w = clip[:, 3].copy()
+    w[w == 0] = 1e-12
+    ndc = clip[:, :3] / w[:, None]
+    disp_x = (ndc[:, 0] * 0.5 + 0.5) * width
+    disp_y = (ndc[:, 1] * 0.5 + 0.5) * height
+    return disp_x, disp_y
+
+
 class STLClipperEngine:
     """
     Core mesh clipping logic — no Qt dependency.
@@ -464,22 +481,13 @@ class STLClipperEngine:
         poly = np.asarray(polygon_xy, dtype=float)
         if poly.shape[0] < 3:
             return None
-        matrix = np.asarray(view_matrix, dtype=float).reshape(4, 4)
-        width, height = viewport
         centers = self.original_mesh.cell_centers().points          # (N, 3)
-        n = centers.shape[0]
-        homog = np.hstack([centers, np.ones((n, 1))])               # (N, 4)
-        clip = homog @ matrix.T                                     # (N, 4)
-        w = clip[:, 3].copy()
-        w[w == 0] = 1e-12
-        ndc = clip[:, :3] / w[:, None]
-        disp_x = (ndc[:, 0] * 0.5 + 0.5) * width
-        disp_y = (ndc[:, 1] * 0.5 + 0.5) * height                  # bottom-left origin
+        disp_x, disp_y = _project_to_display(centers, view_matrix, viewport)
         inside = _points_in_polygon(disp_x, disp_y, poly)
         n_inside = int(inside.sum())
         if n_inside == 0:
             return None
-        if n_inside == n:
+        if n_inside == centers.shape[0]:
             raise ValueError("Trim would delete the entire mesh")
         self._trim_history.append(self.original_mesh.copy())
         keep_ids = np.where(~inside)[0]
