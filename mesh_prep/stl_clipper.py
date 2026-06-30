@@ -657,6 +657,21 @@ class STLClipperEngine:
         self.original_mesh = smoothed
         return self.recompute_all()
 
+    def delete_cells(self, cell_ids):
+        """Permanently delete the given cells from original_mesh (shared undo).
+        Returns the new _wall_mesh, or None on a no-op (no mesh, empty/stale
+        selection, or a selection covering the whole mesh)."""
+        if self.original_mesh is None:
+            return None
+        n = self.original_mesh.n_cells
+        ids = {int(c) for c in cell_ids if 0 <= int(c) < n}
+        if not ids or len(ids) >= n:
+            return None
+        self._trim_history.append(self.original_mesh.copy())
+        keep_ids = np.array([i for i in range(n) if i not in ids], dtype=np.int64)
+        self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
+        return self.recompute_all()
+
     def undo_trim(self) -> bool:
         """Restore the mesh from before the most recent trim and re-apply clips.
         Returns True if a state was restored, False if there is no trim history."""

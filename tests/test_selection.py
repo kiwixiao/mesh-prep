@@ -174,3 +174,36 @@ def test_adjacency_cache_rebuilds_after_topology_change():
     assert eng._adj_for_mesh is eng.original_mesh
     assert eng._adj_for_mesh is not first
     assert eng._adj_tri.shape[0] == eng.original_mesh.n_cells
+
+
+def test_delete_cells_removes_and_undo_restores():
+    eng = STLClipperEngine()
+    grid = pv.Plane(i_resolution=6, j_resolution=6).triangulate()
+    eng.original_mesh = grid
+    eng._wall_mesh = grid.copy()
+    n0 = grid.n_cells
+    sel = [0, 1, 2, 5, 9]
+    out = eng.delete_cells(sel)
+    assert out is not None
+    assert eng.original_mesh.n_cells == n0 - len(sel)
+    assert len(eng._trim_history) == 1
+    assert eng.undo_trim() is True
+    assert eng.original_mesh.n_cells == n0
+
+
+def test_delete_cells_empty_is_noop():
+    eng = STLClipperEngine()
+    eng.original_mesh = pv.Plane(i_resolution=3, j_resolution=3).triangulate()
+    eng._wall_mesh = eng.original_mesh.copy()
+    assert eng.delete_cells([]) is None
+    assert len(eng._trim_history) == 0
+
+
+def test_delete_cells_whole_mesh_is_noop():
+    eng = STLClipperEngine()
+    grid = pv.Plane(i_resolution=3, j_resolution=3).triangulate()
+    eng.original_mesh = grid
+    eng._wall_mesh = grid.copy()
+    assert eng.delete_cells(list(range(grid.n_cells))) is None
+    assert len(eng._trim_history) == 0
+    assert eng.original_mesh.n_cells == grid.n_cells
