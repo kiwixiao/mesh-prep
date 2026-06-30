@@ -1045,6 +1045,54 @@ class STLClipperEngine:
             f.write(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall", scale_factor))
 
 
+class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
+    """Trackball camera style for Select mode. A left-drag that STARTS ON
+    geometry becomes a lasso (camera rotation suppressed for that drag); a
+    left-drag that starts on empty background rotates normally. Follows pyvista's
+    subclass + AddObserver + conditional-forward pattern."""
+
+    def __init__(self, app):
+        self._app = app
+        self._lasso_active = False
+        self.AddObserver("LeftButtonPressEvent", self._on_press)
+        self.AddObserver("MouseMoveEvent", self._on_move)
+        self.AddObserver("LeftButtonReleaseEvent", self._on_release)
+
+    def _on_press(self, _obj=None, _evt=None):
+        try:
+            app = self._app
+            x, y = app.plotter.iren.get_event_position()
+            picker = vtk.vtkPropPicker()
+            picker.Pick(x, y, 0, app.plotter.renderer)
+            if picker.GetActor() is not None:        # cursor over geometry -> lasso
+                self._lasso_active = True
+                app._select_lasso_press()
+                return                                # suppress rotate (don't forward)
+            self._lasso_active = False
+            self.OnLeftButtonDown()                   # empty space -> default rotate
+        except Exception:
+            logger.exception("select press handler failed")
+
+    def _on_move(self, _obj=None, _evt=None):
+        try:
+            if self._lasso_active:
+                self._app._select_lasso_move()
+            else:
+                self.OnMouseMove()
+        except Exception:
+            logger.exception("select move handler failed")
+
+    def _on_release(self, _obj=None, _evt=None):
+        try:
+            if self._lasso_active:
+                self._lasso_active = False
+                self._app._select_lasso_release()
+            else:
+                self.OnLeftButtonUp()
+        except Exception:
+            logger.exception("select release handler failed")
+
+
 class STLClipperApp(QMainWindow):
     """Qt GUI with embedded PyVista viewport and control panel."""
 
@@ -3196,6 +3244,35 @@ class STLClipperApp(QMainWindow):
             vtk_iren.SetInteractorStyle(self._lasso_saved_style)
         self._end_lasso_overlay()
 
+    def _begin_select_lasso(self):
+        vtk_iren = self.plotter.iren.interactor
+        self._lasso_points = []
+        self._select_saved_style = vtk_iren.GetInteractorStyle()
+        self._select_style = _SelectLassoStyle(self)
+        vtk_iren.SetInteractorStyle(self._select_style)
+
+    def _end_select_lasso(self):
+        vtk_iren = self.plotter.iren.interactor
+        if getattr(self, "_select_saved_style", None) is not None:
+            vtk_iren.SetInteractorStyle(self._select_saved_style)
+        self._end_lasso_overlay()
+
+    def _select_lasso_press(self):
+        self._lasso_points = [self.plotter.iren.get_event_position()]
+        self._start_lasso_overlay()
+        self._update_lasso_overlay()
+
+    def _select_lasso_move(self):
+        self._lasso_points.append(self.plotter.iren.get_event_position())
+        self._update_lasso_overlay()
+
+    def _select_lasso_release(self):
+        self._end_lasso_overlay()
+        points = list(self._lasso_points)
+        self._lasso_points = []
+        if len(points) >= 3:
+            self._apply_select(points)
+
     def _on_lasso_press(self):
         self._lasso_drawing = True
         self._lasso_points = [self.plotter.iren.get_event_position()]
@@ -3321,10 +3398,13 @@ class STLClipperApp(QMainWindow):
                 return
             if getattr(self, "_btn_trim", None) is not None and self._btn_trim.isChecked():
                 self._btn_trim.setChecked(False)
-            self._begin_lasso(self._apply_select)
-            self.status.showMessage("Select mode: drag to lasso faces. Toggle off to keep the selection.")
+            self._begin_select_lasso()
+            self.status.showMessage(
+                "Select mode: drag on the model to lasso faces (adds to selection); "
+                "drag empty space to rotate. Esc clears."
+            )
         else:
-            self._end_lasso()
+            self._end_select_lasso()
             self.status.showMessage("Select mode off.")
 
     def _apply_select(self, display_points):
