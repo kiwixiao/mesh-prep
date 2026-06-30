@@ -3085,7 +3085,6 @@ class STLClipperApp(QMainWindow):
                 s.AddObserver("MouseMoveEvent", self._trim_safe(self._on_trim_move)),
                 s.AddObserver("LeftButtonReleaseEvent", self._trim_safe(self._on_trim_release)),
             ]
-            logger.info("trim mode ON: %d observers on active style", len(self._trim_obs))
             self.status.showMessage(
                 "Trim mode: drag to lasso a region to delete. Toggle off to exit."
             )
@@ -3098,7 +3097,6 @@ class STLClipperApp(QMainWindow):
             if getattr(self, "_trim_saved_style", None) is not None:
                 vtk_iren.SetInteractorStyle(self._trim_saved_style)
             self._end_lasso_overlay()
-            logger.info("trim mode OFF")
             self.status.showMessage("Trim mode off.")
 
     def _on_trim_press(self):
@@ -3106,7 +3104,6 @@ class STLClipperApp(QMainWindow):
         self._trim_points = [self.plotter.iren.get_event_position()]
         self._start_lasso_overlay()
         self._update_lasso_overlay()
-        logger.info("trim press at %s", self._trim_points[0])
 
     def _on_trim_move(self):
         if getattr(self, "_trim_drawing", False):
@@ -3118,7 +3115,6 @@ class STLClipperApp(QMainWindow):
         self._end_lasso_overlay()
         points = list(self._trim_points)
         self._trim_points = []
-        logger.info("trim release: %d points", len(points))
         if len(points) < 3:
             self.status.showMessage("Trim: stroke too short — draw a closed shape.")
             return
@@ -3181,20 +3177,16 @@ class STLClipperApp(QMainWindow):
         aspect = width / height if height else 1.0
         vtk_m = cam.GetCompositeProjectionTransformMatrix(aspect, -1, 1)
         matrix = np.array([[vtk_m.GetElement(i, j) for j in range(4)] for i in range(4)])
-        logger.info("trim apply: %d pts, viewport=%s", len(display_points), (width, height))
         try:
             result = self.engine.trim_by_screen_polygon(display_points, matrix, (width, height))
         except ValueError as exc:
             self.status.showMessage(str(exc))
-            logger.info("trim refused: %s", exc)
             return
         if result is None:
             self.status.showMessage("Trim: nothing selected.")
-            logger.info("trim: nothing selected (0 cells inside polygon)")
             return
         self._refresh_display()
         self.status.showMessage(f"Trimmed region. Mesh now {result.n_cells} cells. Ctrl+Z to undo.")
-        logger.info("trim done: mesh now %d cells", result.n_cells)
 
     def _undo_trim(self):
         if self.engine.undo_trim():
