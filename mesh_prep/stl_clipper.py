@@ -498,18 +498,27 @@ class STLClipperEngine:
 
     def select_cells_in_polygon(self, polygon_xy, view_matrix, viewport,
                                 view_direction, front_only=True):
-        """Cell ids of original_mesh whose centroid projects inside polygon_xy
-        (and, if front_only, whose normal faces the camera). view_direction is the
-        world vector the camera looks along (into the screen)."""
+        """Cell ids the screen polygon covers — a cell is selected if ANY of its
+        vertices projects inside polygon_xy, so triangles partially under the lasso
+        are captured (not just those whose centroid is inside). If front_only, also
+        require the cell normal to face the camera. view_direction is the world
+        vector the camera looks along (into the screen)."""
         if self.original_mesh is None:
             return []
         poly = np.asarray(polygon_xy, dtype=float)
         if poly.shape[0] < 3:
             return []
         mesh = self.original_mesh
-        centers = mesh.cell_centers().points
-        disp_x, disp_y = _project_to_display(centers, view_matrix, viewport)
-        inside = _points_in_polygon(disp_x, disp_y, poly)
+        faces = mesh.faces
+        if faces.size == 4 * mesh.n_cells:                 # all-triangle fast path
+            tri = faces.reshape(-1, 4)[:, 1:]
+            disp_x, disp_y = _project_to_display(mesh.points, view_matrix, viewport)
+            pt_inside = _points_in_polygon(disp_x, disp_y, poly)
+            inside = pt_inside[tri].any(axis=1)
+        else:                                              # non-triangle: centroid test
+            centers = mesh.cell_centers().points
+            disp_x, disp_y = _project_to_display(centers, view_matrix, viewport)
+            inside = _points_in_polygon(disp_x, disp_y, poly)
         if front_only:
             vd = np.asarray(view_direction, dtype=float)
             facing = (np.asarray(mesh.cell_normals) @ vd) < 0.0
@@ -1178,17 +1187,12 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
             # GetShiftKey(), which can drop/lag the modifier on macOS and made
             # Shift+drag intermittently rotate instead of lasso.
             shift = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
-            cam = self._app.plotter.camera
-            logger.debug("DIAG press shift=%s path=%s pos=%s focal=%s scale=%.2f",
-                        shift, "lasso" if shift else "rotate",
-                        tuple(round(float(v), 1) for v in cam.position),
-                        tuple(round(float(v), 1) for v in cam.focal_point),
-                        float(cam.parallel_scale))
             if shift:                                      # Shift+drag -> lasso
                 self._app._select_lasso_press()
                 self._lasso_active = True
                 return                                     # suppress camera (don't forward)
             self._lasso_active = False
+            self._press_pos = self._app.plotter.iren.get_event_position()
             self.OnLeftButtonDown()                        # plain drag -> rotate
         except Exception:
             logger.exception("select press handler failed")
@@ -1204,17 +1208,17 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
 
     def _on_release(self, _obj=None, _evt=None):
         try:
-            cam = self._app.plotter.camera
-            logger.debug("DIAG release lasso=%s pos=%s focal=%s scale=%.2f",
-                        self._lasso_active,
-                        tuple(round(float(v), 1) for v in cam.position),
-                        tuple(round(float(v), 1) for v in cam.focal_point),
-                        float(cam.parallel_scale))
             if self._lasso_active:
                 self._lasso_active = False
                 self._app._select_lasso_release()
-            else:
-                self.OnLeftButtonUp()
+                return
+            self.OnLeftButtonUp()
+            # A plain press+release that did not move is a click, not a rotate ->
+            # pick the single face under the cursor (Select mode only).
+            pp = getattr(self, "_press_pos", None)
+            rp = self._app.plotter.iren.get_event_position()
+            if pp is not None and abs(rp[0] - pp[0]) <= 3 and abs(rp[1] - pp[1]) <= 3:
+                self._app._select_click_pick(rp)
         except Exception:
             logger.exception("select release handler failed")
 
@@ -3337,55 +3341,27 @@ class STLClipperApp(QMainWindow):
     # Trim region (freehand lasso)
     # ------------------------------------------------------------------
 
-    def _trim_safe(self, fn):
-        """Wrap a VTK observer callback so exceptions are logged, not thrown
-        back into VTK (which can crash the app)."""
-        def _cb(_obj=None, _evt=None):
-            try:
-                fn()
-            except Exception:
-                logger.exception("trim callback failed")
-        return _cb
-
-    def _begin_lasso(self, on_release):
-        if getattr(self, "_lasso_obs", None):
-            self._end_lasso()
-        vtk_iren = self.plotter.iren.interactor
+    def _begin_select_lasso(self, on_release):
+        """Install the shared Shift+drag lasso style. on_release(display_points)
+        is invoked when a lasso stroke completes — Select passes _apply_select,
+        Trim passes _apply_trim. Plain drag rotates the camera (trackball)."""
+        iren = self.plotter.iren
+        if isinstance(iren.style, _SelectLassoStyle):
+            self._end_select_lasso()            # never stack two lasso styles
         self._lasso_points = []
-        self._lasso_drawing = False
         self._lasso_on_release = on_release
-        self._lasso_saved_style = vtk_iren.GetInteractorStyle()
-        self._lasso_style = vtk.vtkInteractorStyleUser()
-        vtk_iren.SetInteractorStyle(self._lasso_style)
-        s = self._lasso_style
-        self._lasso_obs = [
-            s.AddObserver("LeftButtonPressEvent", self._trim_safe(self._on_lasso_press)),
-            s.AddObserver("MouseMoveEvent", self._trim_safe(self._on_lasso_move)),
-            s.AddObserver("LeftButtonReleaseEvent", self._trim_safe(self._on_lasso_release)),
-        ]
-
-    def _end_lasso(self):
-        vtk_iren = self.plotter.iren.interactor
-        style = getattr(self, "_lasso_style", None)
-        if style is not None:
-            for obs in getattr(self, "_lasso_obs", []):
-                style.RemoveObserver(obs)
-        self._lasso_obs = []
-        if getattr(self, "_lasso_saved_style", None) is not None:
-            vtk_iren.SetInteractorStyle(self._lasso_saved_style)
-        self._end_lasso_overlay()
-
-    def _begin_select_lasso(self):
-        vtk_iren = self.plotter.iren.interactor
-        self._lasso_points = []
-        self._select_saved_style = vtk_iren.GetInteractorStyle()
+        # Install via pyvista's style setter (which updates iren._style_class) so
+        # the style survives pyvista's update_style() re-assertion on the next
+        # render. Installing with the raw vtk SetInteractorStyle left _style_class
+        # pointing at the trackball, which got re-asserted and made the FIRST drag
+        # rotate instead of lasso.
+        self._select_saved_style = iren.style or iren.interactor.GetInteractorStyle()
         self._select_style = _SelectLassoStyle(self)
-        vtk_iren.SetInteractorStyle(self._select_style)
+        iren.style = self._select_style
 
     def _end_select_lasso(self):
-        vtk_iren = self.plotter.iren.interactor
         if getattr(self, "_select_saved_style", None) is not None:
-            vtk_iren.SetInteractorStyle(self._select_saved_style)
+            self.plotter.iren.style = self._select_saved_style
         self._end_lasso_overlay()
 
     def _select_lasso_press(self):
@@ -3402,34 +3378,19 @@ class STLClipperApp(QMainWindow):
         points = list(self._lasso_points)
         self._lasso_points = []
         if len(points) >= 3:
-            self._apply_select(points)
-
-    def _on_lasso_press(self):
-        self._lasso_drawing = True
-        self._lasso_points = [self.plotter.iren.get_event_position()]
-        self._start_lasso_overlay()
-        self._update_lasso_overlay()
-
-    def _on_lasso_move(self):
-        if getattr(self, "_lasso_drawing", False):
-            self._lasso_points.append(self.plotter.iren.get_event_position())
-            self._update_lasso_overlay()
-
-    def _on_lasso_release(self):
-        self._lasso_drawing = False
-        self._end_lasso_overlay()
-        points = list(self._lasso_points)
-        self._lasso_points = []
-        self._lasso_on_release(points)
+            self._lasso_on_release(points)
 
     def _toggle_trim_mode(self, checked):
         if checked:
             if getattr(self, "_btn_select", None) is not None and self._btn_select.isChecked():
                 self._btn_select.setChecked(False)
-            self._begin_lasso(self._apply_trim)
-            self.status.showMessage("Trim mode: drag to lasso a region to delete. Toggle off to exit.")
+            self._begin_select_lasso(self._apply_trim)
+            self.status.showMessage(
+                "Trim mode: Shift+drag to lasso a region to delete (through-model); "
+                "drag to rotate. Toggle off to exit."
+            )
         else:
-            self._end_lasso()
+            self._end_select_lasso()
             self.status.showMessage("Trim mode off.")
 
     # --- Lasso outline overlay (2D screen-space polyline while drawing) -------
@@ -3529,7 +3490,7 @@ class STLClipperApp(QMainWindow):
                 return
             if getattr(self, "_btn_trim", None) is not None and self._btn_trim.isChecked():
                 self._btn_trim.setChecked(False)
-            self._begin_select_lasso()
+            self._begin_select_lasso(self._apply_select)
             self.status.showMessage(
                 "Select mode: Shift+drag to lasso faces (adds to selection); "
                 "drag to rotate. Esc clears."
@@ -3548,33 +3509,37 @@ class STLClipperApp(QMainWindow):
         vtk_m = cam.GetCompositeProjectionTransformMatrix(aspect, -1, 1)
         matrix = np.array([[vtk_m.GetElement(i, j) for j in range(4)] for i in range(4)])
         view_dir = np.asarray(self.plotter.camera.direction, dtype=float)
+        # Through-model, like Trim: select every face under the lasso polygon —
+        # front-facing AND the ones behind / hidden from this view.
         ids = self.engine.select_cells_in_polygon(
-            display_points, matrix, (width, height), view_dir, front_only=True)
-        self._selection |= self._visible_cells(ids)
+            display_points, matrix, (width, height), view_dir, front_only=False)
+        self._selection |= set(int(i) for i in ids)
         self._refresh_selection_highlight()
         self.status.showMessage(f"Selected {len(self._selection)} faces.")
         self._update_button_states()
 
-    def _visible_cells(self, cell_ids):
-        """Return the subset of cell_ids whose cell centroid is actually visible
-        from the current camera (not occluded by nearer geometry), using the live
-        depth buffer via vtkSelectVisiblePoints."""
-        ids = [int(c) for c in cell_ids]
+    def _select_click_pick(self, pos):
+        """A single click in Select mode adds the one face under the cursor to the
+        active selection. The picker is restricted to the wall actor so it cannot
+        catch the centerline or other props."""
+        if not self._btn_select.isChecked() or not self._edit_enabled():
+            return
+        wall_actor = getattr(self, "_wall_actor", None)
         mesh = self.engine.original_mesh
-        if not ids or mesh is None:
-            return set()
-        centers = mesh.cell_centers().points[ids]
-        pts = pv.PolyData(centers)
-        pts["cid"] = np.asarray(ids, dtype=np.int64)
-        sel = vtk.vtkSelectVisiblePoints()
-        sel.SetInputData(pts)
-        sel.SetRenderer(self.plotter.renderer)
-        sel.SetTolerance(1e-3)
-        sel.Update()
-        out = pv.wrap(sel.GetOutput())
-        if out.n_points == 0 or "cid" not in out.point_data:
-            return set()
-        return set(int(c) for c in out["cid"])
+        if wall_actor is None or mesh is None:
+            return
+        picker = vtk.vtkCellPicker()
+        picker.InitializePickList()
+        picker.AddPickList(wall_actor)
+        picker.PickFromListOn()
+        picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
+        cid = picker.GetCellId()
+        if cid is None or cid < 0 or cid >= mesh.n_cells:   # missed the wall
+            return
+        self._selection.add(int(cid))
+        self._refresh_selection_highlight()
+        self.status.showMessage(f"Selected {len(self._selection)} faces.")
+        self._update_button_states()
 
     def _refresh_selection_highlight(self):
         try:
@@ -3761,7 +3726,7 @@ class STLClipperApp(QMainWindow):
         # Wall mesh — optionally opaque, optionally with surface mesh edges
         show_mesh = self._btn_show_mesh_edges.isChecked()
         wall_opacity = 1.0 if self._btn_opaque_wall.isChecked() else 0.4
-        self.plotter.add_mesh(
+        self._wall_actor = self.plotter.add_mesh(
             wall, color=WALL_COLOR, opacity=wall_opacity,
             show_edges=show_mesh, edge_color="black", line_width=0.5,
             specular=0.15, specular_power=20.0, ambient=0.15, diffuse=0.9,
@@ -3799,6 +3764,12 @@ class STLClipperApp(QMainWindow):
 
         if fit_camera:
             self.plotter.reset_camera()
+        # pyvista auto-resets the camera to the data bounds the next time an actor
+        # is added whenever renderer.camera_set is False (reset_camera() does NOT
+        # set that flag). Without this, the FIRST lasso actor-add snapped the view
+        # back to the initial load fit. Mark the camera as user-set so that
+        # one-time auto-reset never fires.
+        self.plotter.renderer.camera_set = True
         self.plotter.render()
 
         # Update wall face count label

@@ -42,6 +42,20 @@ def test_select_empty_polygon_returns_empty():
     assert eng.select_cells_in_polygon([(0, 0), (1, 1)], VIEW, VIEWPORT, (0, 0, 1)) == []
 
 
+def test_select_any_vertex_inside_catches_boundary_cell():
+    # Triangle with ONE vertex inside the polygon but its centroid OUTSIDE.
+    # VIEW maps world (x, y) -> display (25x, 25y); poly covers display [0,30]^2.
+    # vertex (0,0) -> (0,0) inside; centroid (1.33,0.67) -> (33.3,16.7) outside.
+    pts = np.array([(0, 0, 0), (2, 0, 0), (2, 2, 0)], dtype=float)
+    faces = np.array([3, 0, 1, 2])
+    eng = STLClipperEngine()
+    eng.original_mesh = pv.PolyData(pts, faces)
+    eng._wall_mesh = eng.original_mesh.copy()
+    poly = [(0, 0), (30, 0), (30, 30), (0, 30)]
+    ids = eng.select_cells_in_polygon(poly, VIEW, VIEWPORT, (0, 0, 1), front_only=False)
+    assert ids == [0]   # selected: a vertex is inside even though the centroid is not
+
+
 def _grid():
     eng = STLClipperEngine()
     eng.original_mesh = pv.Plane(i_resolution=5, j_resolution=5).triangulate()
