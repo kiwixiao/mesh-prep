@@ -1540,6 +1540,10 @@ class STLClipperApp(QMainWindow):
         self._btn_smooth.clicked.connect(self._on_smooth_selection)
         panel.addWidget(self._btn_smooth)
 
+        self._btn_delete = QPushButton("🗑 Delete faces")
+        self._btn_delete.clicked.connect(self._on_delete_selection)
+        panel.addWidget(self._btn_delete)
+
         panel.addWidget(self._separator("Patches"))
 
         self.patch_list = QListWidget()
@@ -2529,6 +2533,7 @@ class STLClipperApp(QMainWindow):
             self._btn_select.setEnabled(can_edit)
             self._btn_grow.setEnabled(can_edit and has_sel)
             self._btn_smooth.setEnabled(can_edit and has_sel)
+            self._btn_delete.setEnabled(can_edit and has_sel)
 
     # ------------------------------------------------------------------
     # Load
@@ -3607,6 +3612,18 @@ class STLClipperApp(QMainWindow):
         self._refresh_display()                 # rebuilds the wall (and clears the highlight actor)
         self._refresh_selection_highlight()     # ids still valid (topology unchanged)
         self.status.showMessage(f"Smoothed {len(self._selection)} faces (\xd75). Ctrl+Z to undo.")
+
+    def _on_delete_selection(self):
+        if not self._selection or not self._edit_enabled():
+            return
+        result = self.engine.delete_cells(self._selection)
+        if result is None:
+            self.status.showMessage("Nothing deleted.")
+            return
+        self._clear_selection()              # deleted ids no longer exist
+        self._refresh_display()
+        n = result.n_cells if result is not None else 0
+        self.status.showMessage(f"Deleted faces — wall now {n:,} faces.")
 
     def _on_escape_selection(self):
         if getattr(self, "_select_mode", False):
