@@ -3169,6 +3169,8 @@ class STLClipperApp(QMainWindow):
         return _cb
 
     def _begin_lasso(self, on_release):
+        if getattr(self, "_lasso_obs", None):
+            self._end_lasso()
         vtk_iren = self.plotter.iren.interactor
         self._lasso_points = []
         self._lasso_drawing = False
@@ -3214,6 +3216,8 @@ class STLClipperApp(QMainWindow):
 
     def _toggle_trim_mode(self, checked):
         if checked:
+            if getattr(self, "_btn_select", None) is not None and self._btn_select.isChecked():
+                self._btn_select.setChecked(False)
             self._begin_lasso(self._apply_trim)
             self.status.showMessage("Trim mode: drag to lasso a region to delete. Toggle off to exit.")
         else:
@@ -3315,6 +3319,8 @@ class STLClipperApp(QMainWindow):
                 self._btn_select.setChecked(False)
                 self.status.showMessage("Clear clips to select/edit the base mesh.")
                 return
+            if getattr(self, "_btn_trim", None) is not None and self._btn_trim.isChecked():
+                self._btn_trim.setChecked(False)
             self._begin_lasso(self._apply_select)
             self.status.showMessage("Select mode: drag to lasso faces. Toggle off to keep the selection.")
         else:
