@@ -264,6 +264,8 @@ class STLClipperEngine:
         self.clips: list[ClipDefinition] = []
         self._wall_mesh: Optional[pv.PolyData] = None
         self._trim_history: deque = deque(maxlen=10)
+        self._adj_for_mesh = None
+        self._adj_ok = False
 
     def load_stl(self, filepath: str) -> pv.PolyData:
         mesh = pv.read(filepath)
@@ -514,17 +516,82 @@ class STLClipperEngine:
             inside = inside & facing
         return np.where(inside)[0].tolist()
 
+    def _ensure_adjacency(self):
+        """Build (once per mesh) CSR adjacency for fast neighbor lookups so grow and
+        smooth avoid per-element pyvista queries (~1 ms each). Rebuilt automatically
+        whenever original_mesh is replaced (identity check). Falls back to no fast
+        path (`_adj_ok = False`) on non-triangle meshes."""
+        mesh = self.original_mesh
+        if mesh is None:
+            self._adj_for_mesh = None
+            self._adj_ok = False
+            return
+        if self._adj_for_mesh is mesh:
+            return
+        faces = mesh.faces
+        if faces.size != 4 * mesh.n_cells:
+            self._adj_for_mesh = mesh
+            self._adj_ok = False
+            return
+        faces = faces.reshape(-1, 4)
+        if not bool((faces[:, 0] == 3).all()):
+            self._adj_for_mesh = mesh
+            self._adj_ok = False
+            return
+        tri = faces[:, 1:].astype(np.int64)
+        n_cells, n_points = mesh.n_cells, mesh.n_points
+        # point -> incident cells (CSR)
+        cell_rep = np.repeat(np.arange(n_cells, dtype=np.int64), 3)
+        pt_flat = tri.ravel()
+        order = np.argsort(pt_flat, kind="stable")
+        cells_by_point = cell_rep[order]
+        counts = np.bincount(pt_flat, minlength=n_points)
+        cell_starts = np.zeros(n_points + 1, dtype=np.int64)
+        np.cumsum(counts, out=cell_starts[1:])
+        # point -> edge-neighbor points (CSR; unique both-direction edges so a point
+        # shared by two triangles is not listed twice — keeps the Laplacian mean
+        # identical to pyvista's point_neighbors)
+        edges = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+        edges = np.vstack([edges, edges[:, ::-1]])
+        edges = np.unique(edges, axis=0)
+        nbr_by_point = edges[:, 1].copy()
+        ecounts = np.bincount(edges[:, 0], minlength=n_points)
+        nbr_starts = np.zeros(n_points + 1, dtype=np.int64)
+        np.cumsum(ecounts, out=nbr_starts[1:])
+        self._adj_tri = tri
+        self._adj_cells_by_point = cells_by_point
+        self._adj_cell_starts = cell_starts
+        self._adj_nbr_by_point = nbr_by_point
+        self._adj_nbr_starts = nbr_starts
+        self._adj_for_mesh = mesh
+        self._adj_ok = True
+
     def grow_cells(self, cell_ids, rings=1):
         """Dilate a cell selection by `rings` point-connected face neighbors."""
         if self.original_mesh is None:
             return sorted({int(c) for c in cell_ids})
-        mesh = self.original_mesh
-        current = {int(c) for c in cell_ids}
+        self._ensure_adjacency()
+        n_cells = self.original_mesh.n_cells
+        current = {int(c) for c in cell_ids if 0 <= int(c) < n_cells}
+        if not self._adj_ok:
+            mesh = self.original_mesh
+            for _ in range(int(rings)):
+                nxt = set(current)
+                for cid in current:
+                    nxt.update(int(c) for c in mesh.cell_neighbors(cid, connections="points"))
+                current = nxt
+            return sorted(current)
+        tri = self._adj_tri
+        cells_by_point = self._adj_cells_by_point
+        cell_starts = self._adj_cell_starts
         for _ in range(int(rings)):
-            nxt = set(current)
-            for cid in current:
-                nxt.update(int(c) for c in mesh.cell_neighbors(cid, connections="points"))
-            current = nxt
+            if not current:
+                break
+            cur = np.fromiter(current, dtype=np.int64, count=len(current))
+            pts = np.unique(tri[cur])
+            chunks = [cells_by_point[cell_starts[p]:cell_starts[p + 1]] for p in pts]
+            if chunks:
+                current.update(int(c) for c in np.unique(np.concatenate(chunks)))
         return sorted(current)
 
     def smooth_cells(self, cell_ids, iterations=5, relaxation=0.5):
@@ -537,20 +604,27 @@ class STLClipperEngine:
         ids = [int(c) for c in cell_ids if 0 <= int(c) < mesh.n_cells]
         if not ids:
             return None
-        movable = set()
-        for cid in ids:
-            movable.update(int(p) for p in mesh.get_cell(cid).point_ids)
-        movable = sorted(movable)
+        self._ensure_adjacency()
+        if self._adj_ok:
+            movable = [int(p) for p in np.unique(self._adj_tri[np.asarray(ids, dtype=np.int64)])]
+            nbr = self._adj_nbr_by_point
+            starts = self._adj_nbr_starts
+            neighbors = {p: nbr[starts[p]:starts[p + 1]] for p in movable}
+        else:
+            movable = set()
+            for cid in ids:
+                movable.update(int(p) for p in mesh.get_cell(cid).point_ids)
+            movable = sorted(movable)
+            neighbors = {p: np.asarray(list(mesh.point_neighbors(p)), dtype=np.int64) for p in movable}
         if not movable:
             return None
-        neighbors = {p: list(mesh.point_neighbors(p)) for p in movable}
         pts = mesh.points.copy()
         self._trim_history.append(self.original_mesh.copy())
         for _ in range(int(iterations)):
             new_pts = pts.copy()
             for p in movable:
                 nb = neighbors[p]
-                if nb:
+                if len(nb):
                     new_pts[p] = (1.0 - relaxation) * pts[p] + relaxation * pts[nb].mean(axis=0)
             pts = new_pts
         smoothed = mesh.copy()

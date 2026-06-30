@@ -98,3 +98,45 @@ def test_smooth_cells_empty_is_noop():
     eng._wall_mesh = eng.original_mesh.copy()
     assert eng.smooth_cells([], iterations=5) is None
     assert len(eng._trim_history) == 0
+
+
+def test_fast_adjacency_point_neighbors_match_pyvista():
+    # The cached CSR point-neighbor lists must equal pyvista's point_neighbors
+    # (unique), since smooth's Laplacian mean depends on the exact neighbor set.
+    eng = STLClipperEngine()
+    grid = pv.Plane(i_resolution=8, j_resolution=8).triangulate()
+    eng.original_mesh = grid
+    eng._ensure_adjacency()
+    assert eng._adj_ok
+    for p in (0, grid.n_points // 2, grid.n_points - 1):
+        s = eng._adj_nbr_starts
+        got = set(int(x) for x in eng._adj_nbr_by_point[s[p]:s[p + 1]])
+        assert got == set(int(x) for x in grid.point_neighbors(p))
+
+
+def test_fast_grow_matches_pyvista_two_rings():
+    # Two-ring grow via the cached fast path must equal a pyvista reference.
+    eng = STLClipperEngine()
+    grid = pv.Plane(i_resolution=10, j_resolution=10).triangulate()
+    eng.original_mesh = grid
+    seed = [grid.n_cells // 2]
+    ref = set(seed)
+    for _ in range(2):
+        nxt = set(ref)
+        for c in ref:
+            nxt.update(int(x) for x in grid.cell_neighbors(c, connections="points"))
+        ref = nxt
+    assert set(eng.grow_cells(seed, rings=2)) == ref
+
+
+def test_adjacency_cache_rebuilds_after_topology_change():
+    # Identity-keyed cache must rebuild when original_mesh is replaced.
+    eng = STLClipperEngine()
+    eng.original_mesh = pv.Plane(i_resolution=4, j_resolution=4).triangulate()
+    eng._ensure_adjacency()
+    first = eng._adj_for_mesh
+    eng.original_mesh = pv.Plane(i_resolution=6, j_resolution=6).triangulate()
+    eng._ensure_adjacency()
+    assert eng._adj_for_mesh is eng.original_mesh
+    assert eng._adj_for_mesh is not first
+    assert eng._adj_tri.shape[0] == eng.original_mesh.n_cells
