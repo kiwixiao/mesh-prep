@@ -1035,6 +1035,10 @@ class STLClipperApp(QMainWindow):
         self.plotter = QtInteractor(central)
         self.plotter.set_background("black")
         self.plotter.enable_parallel_projection()
+        # QtInteractor starts with no lights, so surfaces render as a flat,
+        # unshaded silhouette. Add a ParaView-style 3-light kit so geometry is
+        # properly shaded.
+        self.plotter.enable_lightkit()
 
         # Tabbed control panel
         self._tab_widget = QTabWidget()
