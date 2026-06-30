@@ -1035,10 +1035,6 @@ class STLClipperApp(QMainWindow):
         self.plotter = QtInteractor(central)
         self.plotter.set_background("black")
         self.plotter.enable_parallel_projection()
-        # QtInteractor starts with no lights, so surfaces render as a flat,
-        # unshaded silhouette. Add a ParaView-style 3-light kit so geometry is
-        # properly shaded.
-        self.plotter.enable_lightkit()
 
         # Tabbed control panel
         self._tab_widget = QTabWidget()
@@ -3321,6 +3317,12 @@ class STLClipperApp(QMainWindow):
 
     def _refresh_display(self):
         self.plotter.clear()
+        # pyvista's clear() also removes all lights (Renderer.clear ->
+        # remove_all_lights), leaving only VTK's fallback headlight, which lights
+        # every camera-facing face equally -> a flat, unshaded silhouette.
+        # Re-establish a ParaView-style light kit on each redraw so the surface
+        # renders with proper shading.
+        self.plotter.enable_lightkit()
 
         wall = self.engine.get_wall_mesh()
         if wall is None or wall.n_cells == 0:
