@@ -129,6 +129,40 @@ def test_fast_grow_matches_pyvista_two_rings():
     assert set(eng.grow_cells(seed, rings=2)) == ref
 
 
+def test_smooth_fast_matches_reference_loop():
+    # The vectorized Laplacian must match an explicit per-point loop to float
+    # precision (same math, different summation order).
+    eng = STLClipperEngine()
+    grid = pv.Plane(i_resolution=8, j_resolution=8).triangulate()
+    deg = [len(grid.point_neighbors(i)) for i in range(grid.n_points)]
+    spike = int(np.argmax(deg))
+    p0 = grid.points.copy()
+    p0[spike, 2] = 1.0
+    grid.points = p0
+    eng.original_mesh = grid.copy()
+    eng._wall_mesh = eng.original_mesh.copy()
+    sel = list(grid.point_cell_ids(spike))
+
+    rel, iters = 0.5, 5
+    ref = grid.points.copy()
+    movable = set()
+    for c in sel:
+        movable.update(int(p) for p in grid.get_cell(c).point_ids)
+    movable = sorted(movable)
+    neigh = {p: np.asarray([int(x) for x in grid.point_neighbors(p)]) for p in movable}
+    for _ in range(iters):
+        nw = ref.copy()
+        for p in movable:
+            nb = neigh[p]
+            if len(nb):
+                nw[p] = (1 - rel) * ref[p] + rel * ref[nb].mean(axis=0)
+        ref = nw
+
+    out = eng.smooth_cells(sel, iterations=iters, relaxation=rel)
+    assert out is not None
+    assert np.allclose(eng.original_mesh.points, ref, atol=1e-5)
+
+
 def test_adjacency_cache_rebuilds_after_topology_change():
     # Identity-keyed cache must rebuild when original_mesh is replaced.
     eng = STLClipperEngine()

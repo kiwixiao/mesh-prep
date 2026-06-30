@@ -606,27 +606,52 @@ class STLClipperEngine:
             return None
         self._ensure_adjacency()
         if self._adj_ok:
-            movable = [int(p) for p in np.unique(self._adj_tri[np.asarray(ids, dtype=np.int64)])]
+            movable = np.unique(self._adj_tri[np.asarray(ids, dtype=np.int64)])
             nbr = self._adj_nbr_by_point
             starts = self._adj_nbr_starts
-            neighbors = {p: nbr[starts[p]:starts[p + 1]] for p in movable}
+            deg = (starts[movable + 1] - starts[movable]).astype(np.int64)
+            keep = deg > 0
+            mov = movable[keep]
+            dg = deg[keep]
+            if mov.size == 0:
+                return None
+            # reshape the ragged neighbor lists into a fixed (M, max_deg) index
+            # matrix + validity mask, vectorized via the cumsum "ranges" trick,
+            # so every smoothing iteration is a single array op.
+            total = int(dg.sum())
+            n_movable, max_deg = mov.size, int(dg.max())
+            row = np.repeat(np.arange(n_movable), dg)
+            off = np.arange(total) - np.repeat(np.cumsum(dg) - dg, dg)
+            pos = np.repeat(starts[mov], dg) + off
+            idx = np.zeros((n_movable, max_deg), dtype=np.int64)
+            idx[row, off] = nbr[pos]
+            valid = np.zeros((n_movable, max_deg), dtype=bool)
+            valid[row, off] = True
+            inv_deg = (1.0 / dg)[:, None]
+            pts = mesh.points.copy()
+            self._trim_history.append(self.original_mesh.copy())
+            for _ in range(int(iterations)):
+                gathered = pts[idx]
+                gathered[~valid] = 0.0
+                mean_nb = gathered.sum(axis=1) * inv_deg
+                pts[mov] = (1.0 - relaxation) * pts[mov] + relaxation * mean_nb
         else:
             movable = set()
             for cid in ids:
                 movable.update(int(p) for p in mesh.get_cell(cid).point_ids)
             movable = sorted(movable)
+            if not movable:
+                return None
             neighbors = {p: np.asarray(list(mesh.point_neighbors(p)), dtype=np.int64) for p in movable}
-        if not movable:
-            return None
-        pts = mesh.points.copy()
-        self._trim_history.append(self.original_mesh.copy())
-        for _ in range(int(iterations)):
-            new_pts = pts.copy()
-            for p in movable:
-                nb = neighbors[p]
-                if len(nb):
-                    new_pts[p] = (1.0 - relaxation) * pts[p] + relaxation * pts[nb].mean(axis=0)
-            pts = new_pts
+            pts = mesh.points.copy()
+            self._trim_history.append(self.original_mesh.copy())
+            for _ in range(int(iterations)):
+                new_pts = pts.copy()
+                for p in movable:
+                    nb = neighbors[p]
+                    if len(nb):
+                        new_pts[p] = (1.0 - relaxation) * pts[p] + relaxation * pts[nb].mean(axis=0)
+                pts = new_pts
         smoothed = mesh.copy()
         smoothed.points = pts
         self.original_mesh = smoothed
