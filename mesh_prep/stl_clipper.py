@@ -514,6 +514,19 @@ class STLClipperEngine:
             inside = inside & facing
         return np.where(inside)[0].tolist()
 
+    def grow_cells(self, cell_ids, rings=1):
+        """Dilate a cell selection by `rings` point-connected face neighbors."""
+        if self.original_mesh is None:
+            return sorted({int(c) for c in cell_ids})
+        mesh = self.original_mesh
+        current = {int(c) for c in cell_ids}
+        for _ in range(int(rings)):
+            nxt = set(current)
+            for cid in current:
+                nxt.update(int(c) for c in mesh.cell_neighbors(cid, connections="points"))
+            current = nxt
+        return sorted(current)
+
     def undo_trim(self) -> bool:
         """Restore the mesh from before the most recent trim and re-apply clips.
         Returns True if a state was restored, False if there is no trim history."""

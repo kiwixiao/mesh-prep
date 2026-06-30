@@ -40,3 +40,25 @@ def test_select_front_only_excludes_back_facing():
 def test_select_empty_polygon_returns_empty():
     eng = _two_triangles()
     assert eng.select_cells_in_polygon([(0, 0), (1, 1)], VIEW, VIEWPORT, (0, 0, 1)) == []
+
+
+def _grid():
+    eng = STLClipperEngine()
+    eng.original_mesh = pv.Plane(i_resolution=5, j_resolution=5).triangulate()
+    eng._wall_mesh = eng.original_mesh.copy()
+    return eng
+
+
+def test_grow_one_ring_adds_point_neighbors():
+    eng = _grid()
+    seed = [0]
+    expected = sorted(set(seed) | set(eng.original_mesh.cell_neighbors(0, connections="points")))
+    assert eng.grow_cells(seed, rings=1) == expected
+
+
+def test_grow_two_rings_superset_of_one():
+    eng = _grid()
+    one = set(eng.grow_cells([0], rings=1))
+    two = set(eng.grow_cells([0], rings=2))
+    assert one.issubset(two)
+    assert len(two) > len(one)
