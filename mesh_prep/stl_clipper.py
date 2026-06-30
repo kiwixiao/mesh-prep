@@ -3139,58 +3139,57 @@ class STLClipperApp(QMainWindow):
                 logger.exception("trim callback failed")
         return _cb
 
-    def _toggle_trim_mode(self, checked):
+    def _begin_lasso(self, on_release):
         vtk_iren = self.plotter.iren.interactor
-        if checked:
-            self._trim_points = []
-            self._trim_drawing = False
-            # Capture the lasso with a do-nothing style and observe the mouse
-            # events ON that active style. Going through pyvista's add_observer
-            # misroutes LeftButtonReleaseEvent to the previous (now-inactive)
-            # style (pyvista #4976), so the stroke never completes.
-            self._trim_saved_style = vtk_iren.GetInteractorStyle()
-            self._trim_style = vtk.vtkInteractorStyleUser()
-            vtk_iren.SetInteractorStyle(self._trim_style)
-            s = self._trim_style
-            self._trim_obs = [
-                s.AddObserver("LeftButtonPressEvent", self._trim_safe(self._on_trim_press)),
-                s.AddObserver("MouseMoveEvent", self._trim_safe(self._on_trim_move)),
-                s.AddObserver("LeftButtonReleaseEvent", self._trim_safe(self._on_trim_release)),
-            ]
-            self.status.showMessage(
-                "Trim mode: drag to lasso a region to delete. Toggle off to exit."
-            )
-        else:
-            style = getattr(self, "_trim_style", None)
-            if style is not None:
-                for obs in getattr(self, "_trim_obs", []):
-                    style.RemoveObserver(obs)
-            self._trim_obs = []
-            if getattr(self, "_trim_saved_style", None) is not None:
-                vtk_iren.SetInteractorStyle(self._trim_saved_style)
-            self._end_lasso_overlay()
-            self.status.showMessage("Trim mode off.")
+        self._lasso_points = []
+        self._lasso_drawing = False
+        self._lasso_on_release = on_release
+        self._lasso_saved_style = vtk_iren.GetInteractorStyle()
+        self._lasso_style = vtk.vtkInteractorStyleUser()
+        vtk_iren.SetInteractorStyle(self._lasso_style)
+        s = self._lasso_style
+        self._lasso_obs = [
+            s.AddObserver("LeftButtonPressEvent", self._trim_safe(self._on_lasso_press)),
+            s.AddObserver("MouseMoveEvent", self._trim_safe(self._on_lasso_move)),
+            s.AddObserver("LeftButtonReleaseEvent", self._trim_safe(self._on_lasso_release)),
+        ]
 
-    def _on_trim_press(self):
-        self._trim_drawing = True
-        self._trim_points = [self.plotter.iren.get_event_position()]
+    def _end_lasso(self):
+        vtk_iren = self.plotter.iren.interactor
+        style = getattr(self, "_lasso_style", None)
+        if style is not None:
+            for obs in getattr(self, "_lasso_obs", []):
+                style.RemoveObserver(obs)
+        self._lasso_obs = []
+        if getattr(self, "_lasso_saved_style", None) is not None:
+            vtk_iren.SetInteractorStyle(self._lasso_saved_style)
+        self._end_lasso_overlay()
+
+    def _on_lasso_press(self):
+        self._lasso_drawing = True
+        self._lasso_points = [self.plotter.iren.get_event_position()]
         self._start_lasso_overlay()
         self._update_lasso_overlay()
 
-    def _on_trim_move(self):
-        if getattr(self, "_trim_drawing", False):
-            self._trim_points.append(self.plotter.iren.get_event_position())
+    def _on_lasso_move(self):
+        if getattr(self, "_lasso_drawing", False):
+            self._lasso_points.append(self.plotter.iren.get_event_position())
             self._update_lasso_overlay()
 
-    def _on_trim_release(self):
-        self._trim_drawing = False
+    def _on_lasso_release(self):
+        self._lasso_drawing = False
         self._end_lasso_overlay()
-        points = list(self._trim_points)
-        self._trim_points = []
-        if len(points) < 3:
-            self.status.showMessage("Trim: stroke too short — draw a closed shape.")
-            return
-        self._apply_trim(points)
+        points = list(self._lasso_points)
+        self._lasso_points = []
+        self._lasso_on_release(points)
+
+    def _toggle_trim_mode(self, checked):
+        if checked:
+            self._begin_lasso(self._apply_trim)
+            self.status.showMessage("Trim mode: drag to lasso a region to delete. Toggle off to exit.")
+        else:
+            self._end_lasso()
+            self.status.showMessage("Trim mode off.")
 
     # --- Lasso outline overlay (2D screen-space polyline while drawing) -------
 
@@ -3217,7 +3216,7 @@ class STLClipperApp(QMainWindow):
         """Rebuild the polyline from the captured display points and redraw."""
         if getattr(self, "_lasso_actor", None) is None:
             return
-        pts = self._trim_points
+        pts = self._lasso_points
         self._lasso_pts.Reset()
         self._lasso_cells.Reset()
         for x, y in pts:
@@ -3243,6 +3242,9 @@ class STLClipperApp(QMainWindow):
             self.plotter.render()
 
     def _apply_trim(self, display_points):
+        if len(display_points) < 3:
+            self.status.showMessage("Trim: stroke too short — draw a closed shape.")
+            return
         cam = self.plotter.camera
         size = self.plotter.render_window.GetSize()
         width, height = int(size[0]), int(size[1])
