@@ -3339,10 +3339,31 @@ class STLClipperApp(QMainWindow):
         view_dir = np.asarray(self.plotter.camera.direction, dtype=float)
         ids = self.engine.select_cells_in_polygon(
             display_points, matrix, (width, height), view_dir, front_only=True)
-        self._selection = set(ids)
+        self._selection |= self._visible_cells(ids)
         self._refresh_selection_highlight()
         self.status.showMessage(f"Selected {len(self._selection)} faces.")
         self._update_button_states()
+
+    def _visible_cells(self, cell_ids):
+        """Return the subset of cell_ids whose cell centroid is actually visible
+        from the current camera (not occluded by nearer geometry), using the live
+        depth buffer via vtkSelectVisiblePoints."""
+        ids = [int(c) for c in cell_ids]
+        mesh = self.engine.original_mesh
+        if not ids or mesh is None:
+            return set()
+        centers = mesh.cell_centers().points[ids]
+        pts = pv.PolyData(centers)
+        pts["cid"] = np.asarray(ids, dtype=np.int64)
+        sel = vtk.vtkSelectVisiblePoints()
+        sel.SetInputData(pts)
+        sel.SetRenderer(self.plotter.renderer)
+        sel.SetTolerance(1e-3)
+        sel.Update()
+        out = pv.wrap(sel.GetOutput())
+        if out.n_points == 0 or "cid" not in out.point_data:
+            return set()
+        return set(int(c) for c in out["cid"])
 
     def _refresh_selection_highlight(self):
         try:
