@@ -494,6 +494,26 @@ class STLClipperEngine:
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
         return self.recompute_all()
 
+    def select_cells_in_polygon(self, polygon_xy, view_matrix, viewport,
+                                view_direction, front_only=True):
+        """Cell ids of original_mesh whose centroid projects inside polygon_xy
+        (and, if front_only, whose normal faces the camera). view_direction is the
+        world vector the camera looks along (into the screen)."""
+        if self.original_mesh is None:
+            return []
+        poly = np.asarray(polygon_xy, dtype=float)
+        if poly.shape[0] < 3:
+            return []
+        mesh = self.original_mesh
+        centers = mesh.cell_centers().points
+        disp_x, disp_y = _project_to_display(centers, view_matrix, viewport)
+        inside = _points_in_polygon(disp_x, disp_y, poly)
+        if front_only:
+            vd = np.asarray(view_direction, dtype=float)
+            facing = (np.asarray(mesh.cell_normals) @ vd) < 0.0
+            inside = inside & facing
+        return np.where(inside)[0].tolist()
+
     def undo_trim(self) -> bool:
         """Restore the mesh from before the most recent trim and re-apply clips.
         Returns True if a state was restored, False if there is no trim history."""
