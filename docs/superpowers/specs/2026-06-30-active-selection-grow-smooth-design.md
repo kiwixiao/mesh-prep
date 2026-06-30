@@ -15,6 +15,23 @@ a lasso **Select** mode, a **Grow** button that dilates the selection by face
 rings, and a **Smooth** button that Laplacian-smooths the selected patch
 ("moving average"). The selection is a shared concept future tools can also use.
 
+## 1.5 Workflow & data model
+
+There is one evolving **active base mesh** (`STLClipperEngine.original_mesh`).
+Cleanup operations — **trim** and **smooth** — mutate it in place and **stack** on
+each other; each acts on the result of the previous, and `Ctrl+Z` walks back through
+them via one shared history. **Clips are a separate parametric layer**, not baked into
+the base: `recompute_all()` re-applies the clip list on top of the *current* base to
+produce the export geometry (`_wall_mesh`). Intended flow:
+
+```
+load STL → trim / smooth / grow-select (repeat to tidy the raw geometry)
+        → clip (define inlet/outlet patches) → export for CFD
+```
+
+This is why v1 edits target the unclipped base and the edit buttons are disabled once
+clips exist: **cleanup happens first; clipping is the final, parametric step.**
+
 ## 2. Requirements (decided in brainstorming)
 
 | # | Decision |
