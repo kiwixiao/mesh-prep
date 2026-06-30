@@ -527,6 +527,37 @@ class STLClipperEngine:
             current = nxt
         return sorted(current)
 
+    def smooth_cells(self, cell_ids, iterations=5, relaxation=0.5):
+        """Constrained Laplacian smoothing of the points of the selected cells.
+        Points not in any selected cell stay fixed (the patch blends into the rest).
+        Mutates original_mesh, pushes undo history, returns the new _wall_mesh."""
+        if self.original_mesh is None:
+            return None
+        mesh = self.original_mesh
+        ids = [int(c) for c in cell_ids if 0 <= int(c) < mesh.n_cells]
+        if not ids:
+            return None
+        movable = set()
+        for cid in ids:
+            movable.update(int(p) for p in mesh.get_cell(cid).point_ids)
+        movable = sorted(movable)
+        if not movable:
+            return None
+        neighbors = {p: list(mesh.point_neighbors(p)) for p in movable}
+        pts = mesh.points.copy()
+        self._trim_history.append(self.original_mesh.copy())
+        for _ in range(int(iterations)):
+            new_pts = pts.copy()
+            for p in movable:
+                nb = neighbors[p]
+                if nb:
+                    new_pts[p] = (1.0 - relaxation) * pts[p] + relaxation * pts[nb].mean(axis=0)
+            pts = new_pts
+        smoothed = mesh.copy()
+        smoothed.points = pts
+        self.original_mesh = smoothed
+        return self.recompute_all()
+
     def undo_trim(self) -> bool:
         """Restore the mesh from before the most recent trim and re-apply clips.
         Returns True if a state was restored, False if there is no trim history."""

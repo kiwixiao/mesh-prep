@@ -62,3 +62,39 @@ def test_grow_two_rings_superset_of_one():
     two = set(eng.grow_cells([0], rings=2))
     assert one.issubset(two)
     assert len(two) > len(one)
+
+
+def test_smooth_cells_relaxes_spike_and_leaves_rest_fixed():
+    eng = STLClipperEngine()
+    grid = pv.Plane(i_resolution=5, j_resolution=5).triangulate()
+    # raise the most-connected interior point into a spike
+    deg = [len(grid.point_neighbors(i)) for i in range(grid.n_points)]
+    spike = int(np.argmax(deg))
+    pts = grid.points.copy()
+    pts[spike, 2] = 1.0
+    grid.points = pts
+    eng.original_mesh = grid
+    eng._wall_mesh = grid.copy()
+
+    sel = list(grid.point_cell_ids(spike))      # cells touching the spike
+    movable = set()
+    for cid in sel:
+        movable.update(int(p) for p in grid.get_cell(cid).point_ids)
+    unsel_pts = [i for i in range(grid.n_points) if i not in movable]
+    before_unsel = grid.points[unsel_pts].copy()
+
+    out = eng.smooth_cells(sel, iterations=5, relaxation=0.5)
+    assert out is not None
+    assert eng.original_mesh.points[spike, 2] < 0.5            # spike relaxed toward neighbors
+    assert np.allclose(eng.original_mesh.points[unsel_pts], before_unsel)  # others fixed
+    assert len(eng._trim_history) == 1
+    assert eng.undo_trim() is True
+    assert eng.original_mesh.points[spike, 2] == 1.0          # restored
+
+
+def test_smooth_cells_empty_is_noop():
+    eng = STLClipperEngine()
+    eng.original_mesh = pv.Plane(i_resolution=3, j_resolution=3).triangulate()
+    eng._wall_mesh = eng.original_mesh.copy()
+    assert eng.smooth_cells([], iterations=5) is None
+    assert len(eng._trim_history) == 0
