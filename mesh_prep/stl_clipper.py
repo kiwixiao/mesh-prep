@@ -1145,10 +1145,10 @@ class STLClipperEngine:
 
 
 class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
-    """Trackball camera style for Select mode. A left-drag that STARTS ON
-    geometry becomes a lasso (camera rotation suppressed for that drag); a
-    left-drag that starts on empty background rotates normally. Follows pyvista's
-    subclass + AddObserver + conditional-forward pattern."""
+    """Trackball camera style for Select mode. Shift+left-drag draws a lasso
+    (camera movement suppressed for that drag, so a patch can be encircled from
+    anywhere, including empty space); a plain left-drag rotates the view normally.
+    Follows pyvista's subclass + AddObserver + conditional-forward pattern."""
 
     def __init__(self, app):
         self._app = app
@@ -1159,16 +1159,22 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
 
     def _on_press(self, _obj=None, _evt=None):
         try:
-            app = self._app
-            x, y = app.plotter.iren.get_event_position()
-            picker = vtk.vtkPropPicker()
-            picker.Pick(x, y, 0, app.plotter.renderer)
-            if picker.GetActor() is not None:        # cursor over geometry -> lasso
-                app._select_lasso_press()
+            # Read the live OS modifier state via Qt rather than VTK's
+            # GetShiftKey(), which can drop/lag the modifier on macOS and made
+            # Shift+drag intermittently rotate instead of lasso.
+            shift = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
+            cam = self._app.plotter.camera
+            logger.debug("DIAG press shift=%s path=%s pos=%s focal=%s scale=%.2f",
+                        shift, "lasso" if shift else "rotate",
+                        tuple(round(float(v), 1) for v in cam.position),
+                        tuple(round(float(v), 1) for v in cam.focal_point),
+                        float(cam.parallel_scale))
+            if shift:                                      # Shift+drag -> lasso
+                self._app._select_lasso_press()
                 self._lasso_active = True
-                return                                # suppress rotate (don't forward)
+                return                                     # suppress camera (don't forward)
             self._lasso_active = False
-            self.OnLeftButtonDown()                   # empty space -> default rotate
+            self.OnLeftButtonDown()                        # plain drag -> rotate
         except Exception:
             logger.exception("select press handler failed")
 
@@ -1183,6 +1189,12 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
 
     def _on_release(self, _obj=None, _evt=None):
         try:
+            cam = self._app.plotter.camera
+            logger.debug("DIAG release lasso=%s pos=%s focal=%s scale=%.2f",
+                        self._lasso_active,
+                        tuple(round(float(v), 1) for v in cam.position),
+                        tuple(round(float(v), 1) for v in cam.focal_point),
+                        float(cam.parallel_scale))
             if self._lasso_active:
                 self._lasso_active = False
                 self._app._select_lasso_release()
@@ -3499,8 +3511,8 @@ class STLClipperApp(QMainWindow):
                 self._btn_trim.setChecked(False)
             self._begin_select_lasso()
             self.status.showMessage(
-                "Select mode: drag on the model to lasso faces (adds to selection); "
-                "drag empty space to rotate. Esc clears."
+                "Select mode: Shift+drag to lasso faces (adds to selection); "
+                "drag to rotate. Esc clears."
             )
         else:
             self._end_select_lasso()
