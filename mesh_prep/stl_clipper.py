@@ -1084,12 +1084,19 @@ class STLClipperApp(QMainWindow):
         self._last_case_dir = None            # set after successful export
         self._openfoam_worker = None          # OpenFOAMWorker QThread
 
+        # Selection state
+        self._selection: set = set()          # active selected cell ids (original_mesh)
+        self._select_mode = False
+
         self._build_ui()
         self._build_menu()
         self._update_button_states()
 
         self._trim_undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
         self._trim_undo_shortcut.activated.connect(self._undo_trim)
+
+        self._select_esc_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self._select_esc_shortcut.activated.connect(self._on_escape_selection)
 
         if initial_file and os.path.isfile(initial_file):
             self._load_file(initial_file)
@@ -1345,6 +1352,19 @@ class STLClipperApp(QMainWindow):
         self._btn_trim.setCheckable(True)
         self._btn_trim.toggled.connect(self._toggle_trim_mode)
         panel.addWidget(self._btn_trim)
+
+        self._btn_select = QPushButton("🖈 Select faces")
+        self._btn_select.setCheckable(True)
+        self._btn_select.toggled.connect(self._toggle_select_mode)
+        panel.addWidget(self._btn_select)
+
+        self._btn_grow = QPushButton("➕ Grow")
+        self._btn_grow.clicked.connect(self._on_grow_selection)
+        panel.addWidget(self._btn_grow)
+
+        self._btn_smooth = QPushButton("✨ Smooth (×5)")
+        self._btn_smooth.clicked.connect(self._on_smooth_selection)
+        panel.addWidget(self._btn_smooth)
 
         panel.addWidget(self._separator("Patches"))
 
@@ -2328,6 +2348,14 @@ class STLClipperApp(QMainWindow):
         self._btn_repair_clean.setEnabled(has_mesh)
         self._btn_repair_normals.setEnabled(has_mesh)
 
+        # Selection buttons
+        has_sel = bool(getattr(self, "_selection", set()))
+        can_edit = self._edit_enabled()
+        if hasattr(self, "_btn_select"):
+            self._btn_select.setEnabled(can_edit)
+            self._btn_grow.setEnabled(can_edit and has_sel)
+            self._btn_smooth.setEnabled(can_edit and has_sel)
+
     # ------------------------------------------------------------------
     # Load
     # ------------------------------------------------------------------
@@ -2351,6 +2379,7 @@ class STLClipperApp(QMainWindow):
         self._centerline_mesh = None
         self._centerline_worker = None
         self._lbl_repair_status.setText("Status: \u2014")
+        self._clear_selection()
         self._refresh_display()
 
         fname = os.path.basename(filepath)
@@ -3259,15 +3288,98 @@ class STLClipperApp(QMainWindow):
         if result is None:
             self.status.showMessage("Trim: nothing selected.")
             return
+        self._clear_selection()
         self._refresh_display()
         self.status.showMessage(f"Trimmed region. Mesh now {result.n_cells} cells. Ctrl+Z to undo.")
 
     def _undo_trim(self):
         if self.engine.undo_trim():
+            self._clear_selection()
             self._refresh_display()
             self.status.showMessage("Undid last trim.")
         else:
             self.status.showMessage("Nothing to undo.")
+
+    # ------------------------------------------------------------------
+    # Selection (Select faces / Grow / Smooth)
+    # ------------------------------------------------------------------
+
+    def _edit_enabled(self):
+        """Editing targets the unclipped base mesh (v1)."""
+        return (self.engine.original_mesh is not None) and (not self.engine.clips)
+
+    def _toggle_select_mode(self, checked):
+        self._select_mode = checked
+        if checked:
+            if not self._edit_enabled():
+                self._btn_select.setChecked(False)
+                self.status.showMessage("Clear clips to select/edit the base mesh.")
+                return
+            self._begin_lasso(self._apply_select)
+            self.status.showMessage("Select mode: drag to lasso faces. Toggle off to keep the selection.")
+        else:
+            self._end_lasso()
+            self.status.showMessage("Select mode off.")
+
+    def _apply_select(self, display_points):
+        if len(display_points) < 3:
+            return
+        cam = self.plotter.camera
+        size = self.plotter.render_window.GetSize()
+        width, height = int(size[0]), int(size[1])
+        aspect = width / height if height else 1.0
+        vtk_m = cam.GetCompositeProjectionTransformMatrix(aspect, -1, 1)
+        matrix = np.array([[vtk_m.GetElement(i, j) for j in range(4)] for i in range(4)])
+        view_dir = np.asarray(self.plotter.camera.direction, dtype=float)
+        ids = self.engine.select_cells_in_polygon(
+            display_points, matrix, (width, height), view_dir, front_only=True)
+        self._selection = set(ids)
+        self._refresh_selection_highlight()
+        self.status.showMessage(f"Selected {len(self._selection)} faces.")
+        self._update_button_states()
+
+    def _refresh_selection_highlight(self):
+        try:
+            self.plotter.remove_actor("selection", render=False)
+        except Exception:
+            pass
+        mesh = self.engine.original_mesh
+        if self._selection and mesh is not None:
+            ids = sorted(i for i in self._selection if 0 <= i < mesh.n_cells)
+            if ids:
+                self.plotter.add_mesh(mesh.extract_cells(ids), color=(1.0, 0.55, 0.0),
+                                      name="selection", lighting=True, pickable=False)
+        self.plotter.render()
+
+    def _clear_selection(self):
+        self._selection = set()
+        self._refresh_selection_highlight()
+        self._update_button_states()
+
+    def _on_grow_selection(self):
+        if not self._selection or not self._edit_enabled():
+            return
+        self._selection = set(self.engine.grow_cells(self._selection, rings=1))
+        self._refresh_selection_highlight()
+        self.status.showMessage(f"Grown to {len(self._selection)} faces.")
+
+    def _on_smooth_selection(self):
+        if not self._selection or not self._edit_enabled():
+            return
+        result = self.engine.smooth_cells(self._selection, iterations=5, relaxation=0.5)
+        if result is None:
+            self.status.showMessage("Smooth: nothing selected.")
+            return
+        self._refresh_display()                 # rebuilds the wall (and clears the highlight actor)
+        self._refresh_selection_highlight()     # ids still valid (topology unchanged)
+        self.status.showMessage(f"Smoothed {len(self._selection)} faces (\xd75). Ctrl+Z to undo.")
+
+    def _on_escape_selection(self):
+        if getattr(self, "_select_mode", False):
+            self._btn_select.setChecked(False)   # exits select mode via _toggle_select_mode
+        self._clear_selection()
+
+    # ------------------------------------------------------------------
 
     def _refresh_patch_list(self):
         self.patch_list.clear()
