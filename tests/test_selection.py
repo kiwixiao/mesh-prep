@@ -541,3 +541,22 @@ def test_health_stats_keys():
     assert set(stats.keys()) == {"cells", "nm", "open", "pieces"}
     assert stats["pieces"] == 1
     assert stats["cells"] == eng.original_mesh.n_cells
+
+
+def test_drawable_feature_curves_excludes_deleted_side():
+    eng = _sphere_engine()
+    assert eng.drawable_feature_curves() == []          # no curves yet
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    assert len(eng.drawable_feature_curves()) == 1      # interior on the closed surface
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))             # delete one side -> open profile
+    assert eng.drawable_feature_curves() == []          # no longer interior -> not drawn
+
+
+def test_drawable_feature_curves_excludes_floating():
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    z = eng.original_mesh.cell_centers().points[:, 2]
+    band = [int(i) for i in np.where(np.abs(z) < 0.25)[0]]
+    eng.delete_cells(band)                              # removes the seam -> curve floats
+    assert eng.drawable_feature_curves() == []          # floating -> not drawn

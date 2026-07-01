@@ -881,6 +881,52 @@ class STLClipperEngine:
         return [p for p in self.detect_open_profiles()
                 if self._profile_signature(p) not in filled]
 
+    def drawable_feature_curves(self):
+        """Feature curves that still lie on the CLOSED interior of the surface, i.e.
+        whose edges are still shared by two faces. Once a cut's region is deleted its
+        edges become open-boundary (it is now an open profile) or vanish entirely, so
+        it is excluded here — no stale/floating cyan feature curve is drawn."""
+        m = self.original_mesh
+        if m is None or not self._feature_curves:
+            return []
+        faces = m.faces
+        if faces.size != 4 * m.n_cells or not bool((faces.reshape(-1, 4)[:, 0] == 3).all()):
+            return list(self._feature_curves)          # non-triangle: can't check, draw as-is
+        n_points = m.n_points
+        tri = faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+        e = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+        e.sort(axis=1)
+        keys = e[:, 0] * n_points + e[:, 1]
+        uk, cnt = np.unique(keys, return_counts=True)
+        share = dict(zip(uk.tolist(), cnt.tolist()))
+        b = np.asarray(m.bounds, dtype=float)
+        diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+        tol = 1e-6 * diag if diag > 0 else 1e-6
+        out = []
+        for cur in self._feature_curves:
+            if cur is None or cur.n_cells == 0:
+                continue
+            pts = np.asarray(cur.points)
+            pid = np.empty(cur.n_points, dtype=np.int64)
+            ok = np.zeros(cur.n_points, dtype=bool)
+            for i in range(cur.n_points):
+                j = int(m.find_closest_point(pts[i]))
+                pid[i] = j
+                ok[i] = float(np.linalg.norm(pts[i] - m.points[j])) <= tol
+            interior = total = 0
+            for seg in cur.lines.reshape(-1, 3):
+                i0, i1 = int(seg[1]), int(seg[2])
+                total += 1
+                if ok[i0] and ok[i1]:
+                    u, v = int(pid[i0]), int(pid[i1])
+                    if u != v:
+                        a, bb = (u, v) if u < v else (v, u)
+                        if share.get(a * n_points + bb, 0) == 2:
+                            interior += 1
+            if total > 0 and interior / total >= 0.5:      # still mostly an interior feature
+                out.append(cur)
+        return out
+
     def delete_cells(self, cell_ids):
         """Permanently delete the given cells from original_mesh (shared undo).
         Returns the new _wall_mesh, or None on a no-op (no mesh, empty/stale
@@ -4413,7 +4459,7 @@ class STLClipperApp(QMainWindow):
         wall_bounds = self.engine.original_mesh.bounds if self.engine.original_mesh is not None else None
         tube_r = 0.003 * float(np.linalg.norm(
             np.array(wall_bounds[1::2]) - np.array(wall_bounds[0::2]))) if wall_bounds else 0.3
-        for i, curve in enumerate(self.engine._feature_curves):
+        for i, curve in enumerate(self.engine.drawable_feature_curves()):
             if curve is None or curve.n_cells == 0:
                 continue
             try:
