@@ -3841,9 +3841,24 @@ class STLClipperApp(QMainWindow):
             else:
                 logger.warning("Tube generation produced empty mesh — centerline not rendered")
 
+        # Feature curves from cuts. Render as a thin tube (like the centerline) so
+        # the curve pokes out from the surface — coincident thin lines z-fight with
+        # the opaque wall and are invisible.
+        wall_bounds = self.engine.original_mesh.bounds if self.engine.original_mesh is not None else None
+        tube_r = 0.003 * float(np.linalg.norm(
+            np.array(wall_bounds[1::2]) - np.array(wall_bounds[0::2]))) if wall_bounds else 0.3
         for i, curve in enumerate(self.engine._feature_curves):
-            if curve is not None and curve.n_cells > 0:
-                self.plotter.add_mesh(curve, color="cyan", line_width=4,
+            if curve is None or curve.n_cells == 0:
+                continue
+            try:
+                tube = curve.tube(radius=tube_r)
+            except Exception:
+                tube = None
+            if tube is not None and tube.n_points > 0:
+                self.plotter.add_mesh(tube, color="cyan", name=f"feature_curve_{i}",
+                                      reset_camera=False)
+            else:
+                self.plotter.add_mesh(curve, color="cyan", line_width=6,
                                       name=f"feature_curve_{i}", reset_camera=False)
 
         if fit_camera:
