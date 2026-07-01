@@ -2047,25 +2047,33 @@ class STLClipperApp(QMainWindow):
         self._object_tree.setHeaderLabel("Objects")
         self._object_tree.itemClicked.connect(self._on_tree_item_clicked)
 
-        # Persistent geometry status strip under the viewport (X/Y/Z range + Fit).
+        # Geometry status (X/Y/Z range + Fit) — pinned to the bottom of the left
+        # (Objects) panel. Wrapping the TREE widget is safe; the interactor stays a
+        # direct splitter child so the orientation gizmo is untouched.
         self._lbl_bounds_x = QLabel("X: -")
         self._lbl_bounds_y = QLabel("Y: -")
         self._lbl_bounds_z = QLabel("Z: -")
         self.btn_zoom_fit = QPushButton("⤡ Fit to view")
         self.btn_zoom_fit.clicked.connect(self._on_zoom_to_fit)
-        _geom_strip = QWidget()
-        _strip_lay = QHBoxLayout(_geom_strip)
-        _strip_lay.setContentsMargins(6, 2, 6, 2)
-        _strip_lay.addWidget(self._lbl_bounds_x)
-        _strip_lay.addWidget(self._lbl_bounds_y)
-        _strip_lay.addWidget(self._lbl_bounds_z)
-        _strip_lay.addStretch()
-        _strip_lay.addWidget(self.btn_zoom_fit)
-        # Draggable splitter: object tree | viewport | tab panel. The interactor
-        # stays a DIRECT splitter child — wrapping it in another layout re-parents the
-        # VTK render window and resets the orientation gizmo, so we don't.
+        _geom_box = QGroupBox("Geometry")
+        _geom_lay = QVBoxLayout(_geom_box)
+        _geom_lay.setContentsMargins(6, 4, 6, 4)
+        _geom_lay.addWidget(self._lbl_bounds_x)
+        _geom_lay.addWidget(self._lbl_bounds_y)
+        _geom_lay.addWidget(self._lbl_bounds_z)
+        _geom_lay.addWidget(self.btn_zoom_fit)
+
+        _left_pane = QWidget()
+        _left_lay = QVBoxLayout(_left_pane)
+        _left_lay.setContentsMargins(0, 0, 0, 0)
+        _left_lay.addWidget(self._object_tree, 1)   # tree fills the column
+        _left_lay.addWidget(_geom_box)              # geometry status pinned at the bottom
+
+        # Draggable splitter: (objects tree + geometry) | viewport | tab panel. The
+        # interactor stays a DIRECT splitter child — wrapping it re-parents the VTK
+        # render window and resets the orientation gizmo, so we don't.
         splitter = QSplitter(Qt.Horizontal, central)
-        splitter.addWidget(self._object_tree)
+        splitter.addWidget(_left_pane)
         splitter.addWidget(self.plotter.interactor)
         splitter.addWidget(self._tab_widget)
         splitter.setStretchFactor(0, 1)
@@ -2075,7 +2083,6 @@ class STLClipperApp(QMainWindow):
         splitter.setCollapsible(1, False)
         splitter.setCollapsible(2, False)
         layout.addWidget(splitter)
-        layout.addWidget(_geom_strip)   # geometry status bar below the view (above status bar)
 
         # Status bar
         self.status = QStatusBar()
