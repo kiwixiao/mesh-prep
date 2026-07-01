@@ -274,6 +274,8 @@ class STLClipperEngine:
             raise ValueError(f"Expected PolyData, got {type(mesh).__name__}")
         self.original_mesh = mesh
         self.clips.clear()
+        self._trim_history.clear()
+        self._feature_curves.clear()
         self._wall_mesh = mesh.copy()
         return mesh
 
@@ -3368,6 +3370,8 @@ class STLClipperApp(QMainWindow):
             return
         self._cancel_clip_widgets()
         self._refresh_display()
+        self._update_status()
+        self._update_button_states()
         self.status.showMessage(f"Cut applied — {len(self.engine._feature_curves)} feature curve(s).")
 
     # ------------------------------------------------------------------

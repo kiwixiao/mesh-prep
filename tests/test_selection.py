@@ -283,3 +283,18 @@ def test_cut_by_box_keeps_surface_closed_and_records_curve():
     assert eng.original_mesh.n_cells > n0
     assert len(eng._feature_curves) == 1
     assert len(eng._trim_history) == 1
+
+
+def test_load_stl_resets_cut_state(tmp_path):
+    eng = STLClipperEngine()
+    p1 = tmp_path / "s1.stl"
+    pv.Sphere(theta_resolution=16, phi_resolution=16).save(str(p1))
+    eng.load_stl(str(p1))
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    assert len(eng._feature_curves) == 1
+    assert len(eng._trim_history) == 1
+    p2 = tmp_path / "s2.stl"
+    pv.Sphere(theta_resolution=12, phi_resolution=12).save(str(p2))
+    eng.load_stl(str(p2))
+    assert len(eng._feature_curves) == 0
+    assert len(eng._trim_history) == 0
