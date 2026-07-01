@@ -778,6 +778,46 @@ class STLClipperEngine:
                     stack.append(nb)
         return sorted(seen)
 
+    def _split_edge_groups(self, edges):
+        """Split an edge PolyData into connected groups; one geometry per group
+        (line cells preserved) for highlighting. [] if empty/None."""
+        if edges is None or edges.n_cells == 0:
+            return []
+        conn = edges.connectivity('all')
+        rid = np.asarray(conn['RegionId'])
+        return [conn.extract_cells(np.nonzero(rid == r)[0]).extract_surface()
+                for r in np.unique(rid)]
+
+    def detect_open_profiles(self):
+        """List of boundary-edge loops (open profiles / holes), one pv.PolyData per
+        connected loop. [] if watertight or no mesh."""
+        m = self.original_mesh
+        if m is None:
+            return []
+        edges = m.extract_feature_edges(boundary_edges=True, feature_edges=False,
+                                        manifold_edges=False, non_manifold_edges=False)
+        return self._split_edge_groups(edges)
+
+    def detect_nonmanifold_edges(self):
+        """List of non-manifold edge groups (edges shared by >2 faces), one
+        pv.PolyData per connected group. [] if none or no mesh."""
+        m = self.original_mesh
+        if m is None:
+            return []
+        edges = m.extract_feature_edges(boundary_edges=False, feature_edges=False,
+                                        manifold_edges=False, non_manifold_edges=True)
+        return self._split_edge_groups(edges)
+
+    def detect_pieces(self):
+        """List of connected components; each entry is a sorted list of cell ids into
+        original_mesh. [] if no mesh. Single watertight body -> one entry."""
+        m = self.original_mesh
+        if m is None:
+            return []
+        conn = m.connectivity('all')
+        rid = np.asarray(conn['RegionId'])
+        return [sorted(int(c) for c in np.nonzero(rid == r)[0]) for r in np.unique(rid)]
+
     def delete_cells(self, cell_ids):
         """Permanently delete the given cells from original_mesh (shared undo).
         Returns the new _wall_mesh, or None on a no-op (no mesh, empty/stale

@@ -361,3 +361,64 @@ def test_flood_select_out_of_range_returns_empty():
 
 def test_flood_select_no_mesh_returns_empty():
     assert STLClipperEngine().flood_select(0) == []
+
+
+def test_detect_open_profiles_counts_loops():
+    eng = _sphere_engine()
+    assert eng.detect_open_profiles() == []                # watertight sphere
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    assert len(eng.detect_open_profiles()) == 1            # one hole after delete
+
+
+def test_detect_open_profiles_two_loops():
+    eng = STLClipperEngine()
+    cyl = pv.Cylinder(radius=1, height=4, resolution=40, capping=True).triangulate()
+    eng.original_mesh = cyl
+    eng._wall_mesh = cyl.copy()
+    eng.cut_by_plane((0, 0, 1.0), (0, 0, 1))
+    eng.cut_by_plane((0, 0, -1.0), (0, 0, 1))
+    mid = int(np.where(np.abs(eng.original_mesh.cell_centers().points[:, 2]) < 0.5)[0][0])
+    eng.delete_cells(eng.flood_select(mid))
+    assert len(eng.detect_open_profiles()) == 2
+
+
+def test_detect_open_profiles_no_mesh():
+    assert STLClipperEngine().detect_open_profiles() == []
+
+
+def test_detect_pieces_body_and_stray():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=20, phi_resolution=20).triangulate()
+    stray = pv.PolyData(np.array([(10, 10, 10), (10.1, 10, 10), (10, 10.1, 10)], float),
+                        np.array([3, 0, 1, 2]))
+    combined = sph.merge(stray, merge_points=False)
+    eng.original_mesh = combined
+    eng._wall_mesh = combined.copy()
+    pieces = eng.detect_pieces()
+    assert len(pieces) == 2
+    assert sorted(len(p) for p in pieces) == [1, 720]
+    allids = sorted(i for p in pieces for i in p)
+    assert allids == list(range(combined.n_cells))         # valid ids, full partition
+
+
+def test_detect_pieces_single_body():
+    eng = _sphere_engine()
+    pieces = eng.detect_pieces()
+    assert len(pieces) == 1
+    assert len(pieces[0]) == eng.original_mesh.n_cells
+
+
+def test_detect_pieces_no_mesh():
+    assert STLClipperEngine().detect_pieces() == []
+
+
+def test_detect_nonmanifold_edges():
+    eng = STLClipperEngine()
+    pts = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1)], float)
+    faces = np.hstack([[3, 0, 1, 2], [3, 0, 1, 3], [3, 0, 1, 4]])   # 3 tris share edge (0,1)
+    eng.original_mesh = pv.PolyData(pts, faces)
+    eng._wall_mesh = eng.original_mesh.copy()
+    assert len(eng.detect_nonmanifold_edges()) == 1
+    assert _sphere_engine().detect_nonmanifold_edges() == []        # clean sphere
