@@ -1396,6 +1396,10 @@ class STLClipperApp(QMainWindow):
         self.btn_confirm.clicked.connect(self._on_confirm_clip)
         btn_row.addWidget(self.btn_confirm)
 
+        self.btn_cut = QPushButton("✂ Cut")
+        self.btn_cut.clicked.connect(self._on_cut)
+        btn_row.addWidget(self.btn_cut)
+
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.clicked.connect(self._on_cancel)
         btn_row.addWidget(self.btn_cancel)
@@ -3348,6 +3352,24 @@ class STLClipperApp(QMainWindow):
         self._update_status()
         self._update_button_states()
 
+    def _on_cut(self):
+        if self.engine.original_mesh is None:
+            return
+        box = self._current_box_planes_data
+        if box:
+            result = self.engine.cut_by_box(box)
+        elif self._current_plane_origin is not None and self._current_plane_normal is not None:
+            result = self.engine.cut_by_plane(self._current_plane_origin, self._current_plane_normal)
+        else:
+            self.status.showMessage("Position a cut plane/box first.")
+            return
+        if result is None:
+            self.status.showMessage("Cut did not intersect the surface.")
+            return
+        self._cancel_clip_widgets()
+        self._refresh_display()
+        self.status.showMessage(f"Cut applied — {len(self.engine._feature_curves)} feature curve(s).")
+
     # ------------------------------------------------------------------
     # Patch management
     # ------------------------------------------------------------------
@@ -3814,6 +3836,11 @@ class STLClipperApp(QMainWindow):
                 logger.info("Centerline tube added to plotter")
             else:
                 logger.warning("Tube generation produced empty mesh — centerline not rendered")
+
+        for i, curve in enumerate(self.engine._feature_curves):
+            if curve is not None and curve.n_cells > 0:
+                self.plotter.add_mesh(curve, color="cyan", line_width=4,
+                                      name=f"feature_curve_{i}", reset_camera=False)
 
         if fit_camera:
             self.plotter.reset_camera()
