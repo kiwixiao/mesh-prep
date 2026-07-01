@@ -2061,17 +2061,12 @@ class STLClipperApp(QMainWindow):
         _strip_lay.addWidget(self._lbl_bounds_z)
         _strip_lay.addStretch()
         _strip_lay.addWidget(self.btn_zoom_fit)
-        _center_pane = QWidget()
-        _center_lay = QVBoxLayout(_center_pane)
-        _center_lay.setContentsMargins(0, 0, 0, 0)
-        _center_lay.setSpacing(0)
-        _center_lay.addWidget(self.plotter.interactor, 1)
-        _center_lay.addWidget(_geom_strip)
-
-        # Draggable splitter: object tree | viewport(+geometry strip) | tab panel
+        # Draggable splitter: object tree | viewport | tab panel. The interactor
+        # stays a DIRECT splitter child — wrapping it in another layout re-parents the
+        # VTK render window and resets the orientation gizmo, so we don't.
         splitter = QSplitter(Qt.Horizontal, central)
         splitter.addWidget(self._object_tree)
-        splitter.addWidget(_center_pane)
+        splitter.addWidget(self.plotter.interactor)
         splitter.addWidget(self._tab_widget)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 4)
@@ -2080,6 +2075,7 @@ class STLClipperApp(QMainWindow):
         splitter.setCollapsible(1, False)
         splitter.setCollapsible(2, False)
         layout.addWidget(splitter)
+        layout.addWidget(_geom_strip)   # geometry status bar below the view (above status bar)
 
         # Status bar
         self.status = QStatusBar()
