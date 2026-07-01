@@ -3346,6 +3346,8 @@ class STLClipperApp(QMainWindow):
     def _on_two_point_plane(self):
         """Enter two-point plane capture mode: orbit freely, then Shift+click two
         points to define a cut plane parallel to the view direction."""
+        if self._twopt_active:
+            self._end_two_point()      # re-entry: restore the real style before re-arming
         if self.engine.original_mesh is None:
             self.status.showMessage("Load an STL first.")
             return
