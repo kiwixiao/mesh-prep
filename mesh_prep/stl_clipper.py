@@ -267,6 +267,11 @@ class STLClipperEngine:
         self._adj_for_mesh = None
         self._adj_ok = False
         self._feature_curves: list = []   # polylines from cuts (sub-feature A)
+        # Flood-select (sub-feature B) cached barrier edge-adjacency
+        self._flood_adj_for_mesh = None
+        self._flood_adj_n_curves = -1
+        self._flood_adj = None
+        self._flood_ok = False
 
     def load_stl(self, filepath: str) -> pv.PolyData:
         mesh = pv.read(filepath)
@@ -668,6 +673,110 @@ class STLClipperEngine:
         smoothed.points = pts
         self.original_mesh = smoothed
         return self.recompute_all()
+
+    def _barrier_edge_keys(self, mesh):
+        """Edge keys (min*n_points + max) for every feature-curve segment, mapped to
+        current mesh vertices. A segment contributes a wall only if BOTH endpoints
+        map to a vertex within 1e-6 * bbox-diagonal, so feature-curve points whose
+        region was deleted drop out instead of snapping to a wrong vertex."""
+        n_points = mesh.n_points
+        b = np.asarray(mesh.bounds, dtype=float)
+        diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+        tol = 1e-6 * diag if diag > 0 else 1e-6
+        barrier = set()
+        for curve in self._feature_curves:
+            if curve is None or curve.n_cells == 0:
+                continue
+            pts = np.asarray(curve.points)
+            pid = np.empty(curve.n_points, dtype=np.int64)
+            ok = np.zeros(curve.n_points, dtype=bool)
+            for i in range(curve.n_points):
+                j = int(mesh.find_closest_point(pts[i]))
+                pid[i] = j
+                ok[i] = float(np.linalg.norm(pts[i] - mesh.points[j])) <= tol
+            for seg in curve.lines.reshape(-1, 3):
+                i0, i1 = int(seg[1]), int(seg[2])
+                if ok[i0] and ok[i1]:
+                    u, v = int(pid[i0]), int(pid[i1])
+                    if u != v:
+                        if u > v:
+                            u, v = v, u
+                        barrier.add(u * n_points + v)
+        return barrier
+
+    def _ensure_flood_adjacency(self):
+        """Build (once per mesh identity + feature-curve count) cell edge-adjacency
+        that excludes feature-curve edges, so a flood never crosses a cut. Sets
+        _flood_ok = False on a non-triangle mesh (no fast path). Mirrors the
+        _ensure_adjacency cache pattern."""
+        mesh = self.original_mesh
+        if mesh is None:
+            self._flood_adj_for_mesh = None
+            self._flood_adj_n_curves = -1
+            self._flood_adj = None
+            self._flood_ok = False
+            return
+        if (self._flood_adj_for_mesh is mesh
+                and self._flood_adj_n_curves == len(self._feature_curves)):
+            return
+        self._flood_adj_for_mesh = mesh
+        self._flood_adj_n_curves = len(self._feature_curves)
+        faces = mesh.faces
+        if faces.size != 4 * mesh.n_cells or not bool(
+                (faces.reshape(-1, 4)[:, 0] == 3).all()):
+            self._flood_adj = None
+            self._flood_ok = False
+            return
+        n_cells, n_points = mesh.n_cells, mesh.n_points
+        tri = faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+        barrier = self._barrier_edge_keys(mesh)
+        e = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+        e.sort(axis=1)
+        keys = e[:, 0] * n_points + e[:, 1]
+        cell_of = np.tile(np.arange(n_cells, dtype=np.int64), 3)   # tile, NOT repeat
+        order = np.argsort(keys, kind="stable")
+        keys_s = keys[order]
+        cells_s = cell_of[order]
+        adj = [[] for _ in range(n_cells)]
+        n = len(keys_s)
+        i = 0
+        while i < n:
+            j = i
+            while j < n and keys_s[j] == keys_s[i]:
+                j += 1
+            if (j - i) == 2 and int(keys_s[i]) not in barrier:
+                c0 = int(cells_s[i])
+                c1 = int(cells_s[i + 1])
+                adj[c0].append(c1)
+                adj[c1].append(c0)
+            i = j
+        self._flood_adj = adj
+        self._flood_ok = True
+
+    def flood_select(self, seed_cell):
+        """Connected surface region containing seed_cell, with feature-curve edges as
+        walls (the flood never crosses a cut). Returns a sorted list of cell ids; []
+        if the seed is out of range or there is no mesh; [seed_cell] on a non-triangle
+        mesh."""
+        mesh = self.original_mesh
+        if mesh is None:
+            return []
+        seed = int(seed_cell)
+        if seed < 0 or seed >= mesh.n_cells:
+            return []
+        self._ensure_flood_adjacency()
+        if not self._flood_ok:
+            return [seed]
+        adj = self._flood_adj
+        seen = {seed}
+        stack = [seed]
+        while stack:
+            c = stack.pop()
+            for nb in adj[c]:
+                if nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        return sorted(seen)
 
     def delete_cells(self, cell_ids):
         """Permanently delete the given cells from original_mesh (shared undo).

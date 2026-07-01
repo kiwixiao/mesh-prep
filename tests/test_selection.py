@@ -298,3 +298,66 @@ def test_load_stl_resets_cut_state(tmp_path):
     eng.load_stl(str(p2))
     assert len(eng._feature_curves) == 0
     assert len(eng._trim_history) == 0
+
+
+def _sphere_engine(theta=24, phi=24):
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=theta, phi_resolution=phi)
+    eng.original_mesh = sph
+    eng._wall_mesh = sph.copy()
+    return eng
+
+
+def _cell_on_side(mesh, axis_idx, positive):
+    col = mesh.cell_centers().points[:, axis_idx]
+    idx = np.where(col > 0.3)[0] if positive else np.where(col < -0.3)[0]
+    return int(idx[0])
+
+
+def test_flood_select_no_cut_returns_whole_component():
+    eng = _sphere_engine()
+    n = eng.original_mesh.n_cells
+    assert len(eng.flood_select(0)) == n          # closed sphere is one component
+
+
+def test_flood_select_after_cut_separates_two_sides():
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    mesh = eng.original_mesh
+    top = _cell_on_side(mesh, 2, True)
+    bot = _cell_on_side(mesh, 2, False)
+    rt = set(eng.flood_select(top))
+    rb = set(eng.flood_select(bot))
+    assert rt and rb
+    assert rt.isdisjoint(rb)                        # the cut is a wall
+    assert len(rt) + len(rb) == mesh.n_cells        # partition the whole surface
+    assert top in rt and bot in rb
+
+
+def test_flood_select_two_cuts_bounded_region():
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    eng.cut_by_plane((0, 0, 0), (1, 0, 0))
+    mesh = eng.original_mesh
+    region = eng.flood_select(0)
+    assert 0 < len(region) < mesh.n_cells           # a quadrant, strictly smaller
+
+
+def test_flood_select_survives_delete():
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))         # remove one side
+    m2 = eng.original_mesh
+    r2 = eng.flood_select(0)                         # no crash, no leak beyond mesh
+    assert 0 < len(r2) <= m2.n_cells
+
+
+def test_flood_select_out_of_range_returns_empty():
+    eng = _sphere_engine()
+    assert eng.flood_select(-1) == []
+    assert eng.flood_select(10 ** 9) == []
+
+
+def test_flood_select_no_mesh_returns_empty():
+    assert STLClipperEngine().flood_select(0) == []
