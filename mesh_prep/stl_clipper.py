@@ -4022,6 +4022,7 @@ class STLClipperApp(QMainWindow):
             return
         self._tree_mesh = mesh
         self._tree_n_patches = npatch
+        self._active_profile_index = None       # stale once the profile list is rebuilt
         self._tree_profiles = self.engine.unfilled_open_profiles()
         self._tree_nonmanifold = self.engine.detect_nonmanifold_edges()
         self._tree_pieces = self.engine.detect_pieces()
