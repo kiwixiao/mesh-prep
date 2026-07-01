@@ -1886,6 +1886,11 @@ class STLClipperApp(QMainWindow):
         self._btn_delete.clicked.connect(self._on_delete_selection)
         panel.addWidget(self._btn_delete)
 
+        self._btn_fill = QPushButton("🩹 Fill profile → patch")
+        self._btn_fill.setToolTip("Fill the open profile selected in the Objects tree into a named patch")
+        self._btn_fill.clicked.connect(self._on_fill_profile)
+        panel.addWidget(self._btn_fill)
+
         panel.addWidget(self._separator("Patches"))
 
         self.patch_list = QListWidget()
@@ -2015,6 +2020,9 @@ class STLClipperApp(QMainWindow):
         self._tree_profiles = []
         self._tree_nonmanifold = []
         self._tree_pieces = []
+        self._tree_patches = []
+        self._tree_n_patches = -1
+        self._active_profile_index = None
         self._object_tree = QTreeWidget()
         self._object_tree.setHeaderLabel("Objects")
         self._object_tree.itemClicked.connect(self._on_tree_item_clicked)
@@ -4009,12 +4017,15 @@ class STLClipperApp(QMainWindow):
         skips recompute when the mesh is unchanged since the last build, so view-only
         refreshes stay free."""
         mesh = self.engine.original_mesh
-        if mesh is self._tree_mesh:
+        npatch = len(self.engine.filled_patches)
+        if mesh is self._tree_mesh and npatch == self._tree_n_patches:
             return
         self._tree_mesh = mesh
-        self._tree_profiles = self.engine.detect_open_profiles()
+        self._tree_n_patches = npatch
+        self._tree_profiles = self.engine.unfilled_open_profiles()
         self._tree_nonmanifold = self.engine.detect_nonmanifold_edges()
         self._tree_pieces = self.engine.detect_pieces()
+        self._tree_patches = self.engine.filled_patches
         tree = self._object_tree
         tree.clear()
 
@@ -4045,6 +4056,15 @@ class STLClipperApp(QMainWindow):
         else:
             QTreeWidgetItem(pc, ["(none)"]).setDisabled(True)
 
+        pt = QTreeWidgetItem(tree, ["Named patches"])
+        pt.setExpanded(True)
+        if self._tree_patches:
+            for i, p in enumerate(self._tree_patches):
+                it = QTreeWidgetItem(pt, [f"{p.name} ({p.cap_mesh.n_cells} faces)"])
+                it.setData(0, Qt.UserRole, ("patch", i))
+        else:
+            QTreeWidgetItem(pt, ["(none)"]).setDisabled(True)
+
     def _on_tree_item_clicked(self, item, column):
         """Highlight the clicked entity (no camera move). Pieces also load into the
         face selection so Delete faces removes them."""
@@ -4059,6 +4079,7 @@ class STLClipperApp(QMainWindow):
             self.plotter.add_mesh(geom, color="orange", line_width=6,
                                   name="tree_highlight", reset_camera=False)
             self.status.showMessage(f"Open Profile {index + 1} — {geom.n_cells} edges.")
+            self._active_profile_index = index
         elif kind == "nonmanifold":
             geom = self._tree_nonmanifold[index]
             self.plotter.add_mesh(geom, color="red", line_width=6,
@@ -4071,6 +4092,11 @@ class STLClipperApp(QMainWindow):
             self.status.showMessage(
                 f"Piece {index + 1} — {len(cells)} faces selected. Delete faces to remove.")
             self._update_button_states()
+        elif kind == "patch":
+            patch = self._tree_patches[index]
+            self.plotter.add_mesh(patch.cap_mesh, color="green", opacity=0.8,
+                                  name="tree_highlight", reset_camera=False)
+            self.status.showMessage(f"Patch '{patch.name}' — {patch.cap_mesh.n_cells} faces.")
         self.plotter.render()
 
     def _clear_selection(self):
@@ -4107,6 +4133,41 @@ class STLClipperApp(QMainWindow):
         self._refresh_display()
         n = result.n_cells if result is not None else 0
         self.status.showMessage(f"Deleted faces — wall now {n:,} faces.")
+
+    def _on_fill_profile(self):
+        """Fill the open profile selected in the Objects tree into a named patch."""
+        if self.engine.original_mesh is None:
+            self.status.showMessage("Load an STL first.")
+            return
+        idx = self._active_profile_index
+        profiles = self._tree_profiles
+        if idx is None or not (0 <= idx < len(profiles)):
+            self.status.showMessage("Select an open profile in the Objects tree first.")
+            return
+        used = ({c.name for c in self.engine.clips}
+                | {p.name for p in self.engine.filled_patches} | {"wall"})
+        if "inlet" not in used:
+            default = "inlet"
+        else:
+            n = 1
+            while f"outlet_{n}" in used:
+                n += 1
+            default = f"outlet_{n}"
+        name, ok = QInputDialog.getText(self, "Patch Name", "Name for this patch:", text=default)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in used:
+            QMessageBox.warning(self, "Duplicate Name", f"'{name}' is already used. Choose another.")
+            return
+        patch = self.engine.fill_profile(profiles[idx], name)
+        if patch is None:
+            self.status.showMessage("Could not fill this profile.")
+            return
+        self._active_profile_index = None
+        self._refresh_display()
+        self._refresh_object_tree()
+        self.status.showMessage(f"Filled patch '{name}' ({patch.cap_mesh.n_cells} faces).")
 
     def _on_escape_selection(self):
         if getattr(self, "_twopt_active", False):
@@ -4303,6 +4364,11 @@ class STLClipperApp(QMainWindow):
             else:
                 self.plotter.add_mesh(curve, color="cyan", line_width=6,
                                       name=f"feature_curve_{i}", reset_camera=False)
+
+        for i, patch in enumerate(self.engine.filled_patches):
+            if patch.cap_mesh is not None and patch.cap_mesh.n_cells > 0:
+                self.plotter.add_mesh(patch.cap_mesh, color=patch.color,
+                                      name=f"patch_{i}", reset_camera=False)
 
         if fit_camera:
             self.plotter.reset_camera()
