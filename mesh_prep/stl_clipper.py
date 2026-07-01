@@ -786,7 +786,7 @@ class STLClipperEngine:
         if edges is None or edges.n_cells == 0:
             return []
         conn = edges.connectivity('all')
-        rid = np.asarray(conn['RegionId'])
+        rid = np.asarray(conn.cell_data['RegionId'])
         return [conn.extract_cells(np.nonzero(rid == r)[0]).extract_surface()
                 for r in np.unique(rid)]
 
@@ -817,7 +817,7 @@ class STLClipperEngine:
         if m is None:
             return []
         conn = m.connectivity('all')
-        rid = np.asarray(conn['RegionId'])
+        rid = np.asarray(conn.cell_data['RegionId'])
         return [sorted(int(c) for c in np.nonzero(rid == r)[0]) for r in np.unique(rid)]
 
     def delete_cells(self, cell_ids):
