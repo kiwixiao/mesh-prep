@@ -1107,6 +1107,8 @@ class STLClipperEngine:
             if clip_def.cap_kind != "closed":
                 continue
             blocks.append(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name, scale_factor))
+        for patch in self.filled_patches:
+            blocks.append(self._polydata_to_ascii_stl_block(patch.cap_mesh, patch.name, scale_factor))
         blocks.append(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall", scale_factor))
         with open(filepath, "w") as f:
             f.write("".join(blocks))

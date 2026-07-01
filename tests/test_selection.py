@@ -493,3 +493,16 @@ def test_load_stl_resets_filled_patches(tmp_path):
     assert len(eng.filled_patches) == 1
     eng.load_stl(str(p1))
     assert eng.filled_patches == []
+
+
+def test_export_combined_stl_includes_filled_patch(tmp_path):
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    eng.fill_profile(eng.detect_open_profiles()[0], "inlet")
+    out = tmp_path / "multi.stl"
+    eng.export_combined_stl(str(out))
+    text = out.read_text()
+    assert "solid inlet" in text
+    assert "solid wall" in text
