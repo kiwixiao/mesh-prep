@@ -210,6 +210,15 @@ class ClipDefinition:
     cap_kind: str = "closed"    # "closed": cap the cut (CFD); "open": leave a hole
 
 
+@dataclass
+class FilledPatch:
+    """A named cap patch triangulated from an open profile's boundary loop."""
+    name: str
+    cap_mesh: pv.PolyData
+    signature: tuple                       # (n_points, rounded centroid) of the filled loop
+    color: tuple = (0.2, 0.6, 0.9)
+
+
 def _points_in_polygon(xs, ys, polygon):
     """Vectorized even-odd (ray-casting) point-in-polygon test.
 
@@ -284,6 +293,7 @@ class STLClipperEngine:
         self._adj_for_mesh = None
         self._adj_ok = False
         self._feature_curves: list = []   # polylines from cuts (sub-feature A)
+        self.filled_patches: list = []     # named caps from fill_profile (sub-feature D)
         # Flood-select (sub-feature B) cached barrier edge-adjacency
         self._flood_adj_for_mesh = None
         self._flood_adj_n_curves = -1
@@ -298,6 +308,7 @@ class STLClipperEngine:
         self.clips.clear()
         self._trim_history.clear()
         self._feature_curves.clear()
+        self.filled_patches.clear()
         self._wall_mesh = mesh.copy()
         return mesh
 
@@ -834,6 +845,41 @@ class STLClipperEngine:
         conn = m.connectivity('all')
         rid = np.asarray(conn.cell_data['RegionId'])
         return [sorted(int(c) for c in np.nonzero(rid == r)[0]) for r in np.unique(rid)]
+
+    @staticmethod
+    def _profile_signature(edges):
+        """Stable key for a boundary loop: (point count, rounded centroid)."""
+        c = np.asarray(edges.points).mean(axis=0)
+        return (int(edges.n_points), tuple(np.round(c, 6)))
+
+    def fill_profile(self, profile_edges, name):
+        """Triangulate an open profile's boundary loop into a named cap patch and
+        append it to filled_patches. Returns the FilledPatch, or None if the edges
+        are empty or cannot be triangulated. Does not modify original_mesh."""
+        if profile_edges is None or profile_edges.n_cells == 0:
+            return None
+        strip = vtk.vtkStripper()
+        strip.SetInputData(profile_edges)
+        strip.Update()
+        tri = vtk.vtkContourTriangulator()
+        tri.SetInputData(strip.GetOutput())
+        tri.Update()
+        cap = pv.wrap(tri.GetOutput())
+        if cap is None or cap.n_cells == 0:
+            cap = pv.PolyData(profile_edges.points).delaunay_2d()     # fallback
+        if cap is None or cap.n_cells == 0:
+            return None
+        patch = FilledPatch(name=name, cap_mesh=cap,
+                            signature=self._profile_signature(profile_edges),
+                            color=_color_for_name(name))
+        self.filled_patches.append(patch)
+        return patch
+
+    def unfilled_open_profiles(self):
+        """Open profiles that have not been filled (matched by signature)."""
+        filled = {fp.signature for fp in self.filled_patches}
+        return [p for p in self.detect_open_profiles()
+                if self._profile_signature(p) not in filled]
 
     def delete_cells(self, cell_ids):
         """Permanently delete the given cells from original_mesh (shared undo).

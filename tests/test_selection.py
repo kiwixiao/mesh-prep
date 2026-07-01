@@ -447,3 +447,49 @@ def test_plane_from_two_points_identical_points_none():
 
 def test_plane_from_two_points_colinear_with_view_none():
     assert plane_from_two_points((0, 0, 0), (0, 0, 2), (0, 0, 1)) is None
+
+
+def test_fill_profile_caps_the_hole():
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    prof = eng.detect_open_profiles()[0]
+    patch = eng.fill_profile(prof, "inlet")
+    assert patch is not None
+    assert patch.name == "inlet"
+    assert patch.cap_mesh.n_cells > 0
+    assert len(eng.filled_patches) == 1
+    merged = eng.original_mesh.merge(patch.cap_mesh, merge_points=True)
+    assert _n_open(merged) == 0                       # cap closes the hole
+
+
+def test_unfilled_open_profiles_excludes_filled():
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    assert len(eng.unfilled_open_profiles()) == 1
+    eng.fill_profile(eng.detect_open_profiles()[0], "inlet")
+    assert len(eng.unfilled_open_profiles()) == 0
+
+
+def test_fill_profile_none_on_empty():
+    eng = _sphere_engine()
+    assert eng.fill_profile(None, "x") is None
+    assert eng.fill_profile(pv.PolyData(), "x") is None
+    assert eng.filled_patches == []
+
+
+def test_load_stl_resets_filled_patches(tmp_path):
+    eng = STLClipperEngine()
+    p1 = tmp_path / "s1.stl"
+    pv.Sphere(theta_resolution=16, phi_resolution=16).save(str(p1))
+    eng.load_stl(str(p1))
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    eng.fill_profile(eng.detect_open_profiles()[0], "inlet")
+    assert len(eng.filled_patches) == 1
+    eng.load_stl(str(p1))
+    assert eng.filled_patches == []
