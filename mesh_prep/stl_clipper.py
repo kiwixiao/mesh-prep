@@ -2529,6 +2529,11 @@ class STLClipperApp(QMainWindow):
         self._btn_repair_normals.clicked.connect(self._on_repair_normals)
         tab3.addWidget(self._btn_repair_normals)
 
+        self._btn_auto_repair = QPushButton("\ud83d\udd27 Auto-repair")
+        self._btn_auto_repair.setToolTip("Clean + fix normals in one pass, with a before/after summary")
+        self._btn_auto_repair.clicked.connect(self._on_auto_repair)
+        tab3.addWidget(self._btn_auto_repair)
+
         self._lbl_repair_status = QLabel("Status: \u2014")
         tab3.addWidget(self._lbl_repair_status)
 
@@ -2747,6 +2752,11 @@ class STLClipperApp(QMainWindow):
         self._refresh_patch_list()
         self._refresh_display()
         self._update_button_states()
+
+    def _on_auto_repair(self):
+        msg = self.engine.auto_repair()
+        self._lbl_repair_status.setText(msg)
+        self._refresh_display()
 
     def _on_sim_type_changed(self, index: int):
         """Switch UI between LES and RANS turbulence parameters."""
