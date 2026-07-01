@@ -1942,12 +1942,6 @@ class STLClipperApp(QMainWindow):
         # ── Geometry Info panel ──
         geo_box = QGroupBox("Geometry Info")
         geo_lay = QVBoxLayout()
-        self._lbl_bounds_x = QLabel("X: —")
-        self._lbl_bounds_y = QLabel("Y: —")
-        self._lbl_bounds_z = QLabel("Z: —")
-        geo_lay.addWidget(self._lbl_bounds_x)
-        geo_lay.addWidget(self._lbl_bounds_y)
-        geo_lay.addWidget(self._lbl_bounds_z)
         self._lbl_wall_faces = QLabel("Wall: — faces")
         geo_lay.addWidget(self._lbl_wall_faces)
         self._lbl_open_profiles = QLabel("Open profiles: —")
@@ -2026,13 +2020,6 @@ class STLClipperApp(QMainWindow):
         self.btn_save_cl.clicked.connect(self._on_save_centerline)
         panel.addWidget(self.btn_save_cl)
 
-        panel.addWidget(self._separator("View"))
-
-        # Orthographic views come from the interactive axes gizmo in the viewport
-        # corner (add_camera_orientation_widget) — click a face/arrow to snap.
-        self.btn_zoom_fit = QPushButton("Zoom to Fit")
-        self.btn_zoom_fit.clicked.connect(self._on_zoom_to_fit)
-        panel.addWidget(self.btn_zoom_fit)
 
         panel.addStretch()
 
@@ -2060,10 +2047,31 @@ class STLClipperApp(QMainWindow):
         self._object_tree.setHeaderLabel("Objects")
         self._object_tree.itemClicked.connect(self._on_tree_item_clicked)
 
-        # Draggable splitter: object tree | viewport | tab panel
+        # Persistent geometry status strip under the viewport (X/Y/Z range + Fit).
+        self._lbl_bounds_x = QLabel("X: -")
+        self._lbl_bounds_y = QLabel("Y: -")
+        self._lbl_bounds_z = QLabel("Z: -")
+        self.btn_zoom_fit = QPushButton("⤡ Fit to view")
+        self.btn_zoom_fit.clicked.connect(self._on_zoom_to_fit)
+        _geom_strip = QWidget()
+        _strip_lay = QHBoxLayout(_geom_strip)
+        _strip_lay.setContentsMargins(6, 2, 6, 2)
+        _strip_lay.addWidget(self._lbl_bounds_x)
+        _strip_lay.addWidget(self._lbl_bounds_y)
+        _strip_lay.addWidget(self._lbl_bounds_z)
+        _strip_lay.addStretch()
+        _strip_lay.addWidget(self.btn_zoom_fit)
+        _center_pane = QWidget()
+        _center_lay = QVBoxLayout(_center_pane)
+        _center_lay.setContentsMargins(0, 0, 0, 0)
+        _center_lay.setSpacing(0)
+        _center_lay.addWidget(self.plotter.interactor, 1)
+        _center_lay.addWidget(_geom_strip)
+
+        # Draggable splitter: object tree | viewport(+geometry strip) | tab panel
         splitter = QSplitter(Qt.Horizontal, central)
         splitter.addWidget(self._object_tree)
-        splitter.addWidget(self.plotter.interactor)
+        splitter.addWidget(_center_pane)
         splitter.addWidget(self._tab_widget)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 4)
@@ -4450,25 +4458,10 @@ class STLClipperApp(QMainWindow):
         # Update geometry quality indicators
         quality = self.engine.geometry_quality()
         self._boundary_mesh = quality["boundary_mesh"]
-        n_profiles = quality["open_profiles"]
-        n_edges = quality["open_edges"]
-        n_clips = len(self.engine.clips)
-
-        if n_profiles == 0 and n_clips == 0:
-            self._lbl_open_profiles.setText("Open profiles: —")
-            self._lbl_open_profiles.setStyleSheet("")
-        elif n_profiles == n_clips:
-            self._lbl_open_profiles.setText(
-                f"Open profiles: {n_profiles} (expected: {n_clips}) \u2713"
-            )
-            self._lbl_open_profiles.setStyleSheet("color: green;")
-        else:
-            self._lbl_open_profiles.setText(
-                f"Open profiles: {n_profiles} (expected: {n_clips}) \u2717"
-            )
-            self._lbl_open_profiles.setStyleSheet("color: red;")
-
-        self._lbl_open_edges.setText(f"Open edges: {n_edges}")
+        n_profiles = len(self.engine.unfilled_open_profiles())
+        self._lbl_open_profiles.setText(f"Open profiles: {n_profiles}")
+        self._lbl_open_profiles.setStyleSheet("")
+        self._lbl_open_edges.setText(f"Open edges: {quality['open_edges']}")
 
         # Update non-manifold indicators
         self._non_manifold_mesh = quality["non_manifold_mesh"]
