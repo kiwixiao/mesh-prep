@@ -506,3 +506,17 @@ def test_export_combined_stl_includes_filled_patch(tmp_path):
     text = out.read_text()
     assert "solid inlet" in text
     assert "solid wall" in text
+
+
+def test_export_separate_stl_includes_filled_patch(tmp_path):
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    eng.fill_profile(eng.detect_open_profiles()[0], "inlet")
+    sep_dir = tmp_path / "sep"
+    eng.export_separate_stl(str(sep_dir))
+    inlet_file = sep_dir / "inlet.stl"
+    assert inlet_file.exists(), "inlet.stl not written by export_separate_stl"
+    assert "solid inlet" in inlet_file.read_text()
+    assert (sep_dir / "wall.stl").exists()

@@ -1433,7 +1433,8 @@ class STLClipperEngine:
     def export_separate_stl(self, output_dir: str, scale_factor: float = 1.0):
         """Write one STL file per patch into output_dir.
 
-        Open-profile clips contribute no cap file.
+        Open-profile clips contribute no cap file.  Filled patches (from
+        fill_profile) each produce their own file, mirroring export_combined_stl.
         """
         os.makedirs(output_dir, exist_ok=True)
         for clip_def in self.clips:
@@ -1442,6 +1443,10 @@ class STLClipperEngine:
             path = os.path.join(output_dir, f"{clip_def.name}.stl")
             with open(path, "w") as f:
                 f.write(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name, scale_factor))
+        for patch in self.filled_patches:
+            path = os.path.join(output_dir, f"{patch.name}.stl")
+            with open(path, "w") as f:
+                f.write(self._polydata_to_ascii_stl_block(patch.cap_mesh, patch.name, scale_factor))
         wall_path = os.path.join(output_dir, "wall.stl")
         with open(wall_path, "w") as f:
             f.write(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall", scale_factor))
@@ -2858,10 +2863,11 @@ class STLClipperApp(QMainWindow):
         self.btn_flip.setEnabled(plane_active and not self._plane_confirmed)
         self.btn_rename.setEnabled(has_clips)
         self.btn_delete.setEnabled(has_clips)
-        self.btn_export_foam.setEnabled(has_clips)
-        self.btn_export_sep.setEnabled(has_clips)
-        self.btn_export_comb.setEnabled(has_clips)
-        self.btn_save_of_stl.setEnabled(has_clips)
+        has_export = bool(self.engine.clips or self.engine.filled_patches)
+        self.btn_export_foam.setEnabled(has_export)
+        self.btn_export_sep.setEnabled(has_export)
+        self.btn_export_comb.setEnabled(has_export)
+        self.btn_save_of_stl.setEnabled(has_export)
 
         # Centerline buttons
         has_inlet = any("inlet" in c.name.lower() for c in self.engine.clips)
@@ -3668,7 +3674,7 @@ class STLClipperApp(QMainWindow):
             return
 
         # Suggest a default name
-        existing_names = {c.name for c in self.engine.clips}
+        existing_names = {c.name for c in self.engine.clips} | {p.name for p in self.engine.filled_patches}
         if "inlet" not in existing_names:
             default = "inlet"
         else:
@@ -4544,7 +4550,7 @@ class STLClipperApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_export_separate(self):
-        if not self.engine.clips:
+        if not (self.engine.clips or self.engine.filled_patches):
             return
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
@@ -4555,7 +4561,8 @@ class STLClipperApp(QMainWindow):
             self.engine.export_separate_stl(sep_dir, scale_factor=sf)
             planes_path = os.path.join(case_dir, "clip_planes.json")
             self.engine.export_clip_planes(planes_path)
-            files = [f"{c.name}.stl" for c in self.engine.clips] + ["wall.stl"]
+            patch_names = [c.name for c in self.engine.clips] + [p.name for p in self.engine.filled_patches]
+            files = [f"{n}.stl" for n in patch_names] + ["wall.stl"]
             QMessageBox.information(
                 self, "Export Complete",
                 f"Exported {len(files)} files to:\n{sep_dir}\n"
@@ -4567,7 +4574,7 @@ class STLClipperApp(QMainWindow):
             QMessageBox.critical(self, "Export Error", str(e))
 
     def _on_export_combined(self):
-        if not self.engine.clips:
+        if not (self.engine.clips or self.engine.filled_patches):
             return
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
@@ -4578,18 +4585,19 @@ class STLClipperApp(QMainWindow):
             self.engine.export_combined_stl(filepath, scale_factor=sf)
             planes_path = os.path.join(case_dir, "clip_planes.json")
             self.engine.export_clip_planes(planes_path)
+            patch_names = [c.name for c in self.engine.clips] + [p.name for p in self.engine.filled_patches]
             QMessageBox.information(
                 self, "Export Complete",
                 f"Combined STL saved to:\n{filepath}\n"
                 f"Scale factor: ×{sf}\n\n"
                 f"Clip planes JSON:\n{planes_path}\n\n"
-                f"Patches: {', '.join(c.name for c in self.engine.clips)}, wall",
+                f"Patches: {', '.join(patch_names)}, wall",
             )
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
 
     def _on_save_openfoam_stl(self):
-        if not self.engine.clips:
+        if not (self.engine.clips or self.engine.filled_patches):
             return
         default_name = "boundary.stl"
         if self._loaded_filepath:
@@ -4605,7 +4613,8 @@ class STLClipperApp(QMainWindow):
         sf = self._spin_scale.value()
         try:
             self.engine.export_combined_stl(filepath, scale_factor=sf)
-            patches = ", ".join(c.name for c in self.engine.clips) + ", wall"
+            patch_names = [c.name for c in self.engine.clips] + [p.name for p in self.engine.filled_patches]
+            patches = ", ".join(patch_names) + ", wall"
             QMessageBox.information(
                 self, "Saved",
                 f"Multi-solid STL saved to:\n{filepath}\n"
@@ -4616,7 +4625,7 @@ class STLClipperApp(QMainWindow):
             QMessageBox.critical(self, "Save Error", str(e))
 
     def _on_export_openfoam(self):
-        if not self.engine.clips or self._loaded_filepath is None:
+        if not (self.engine.clips or self.engine.filled_patches) or self._loaded_filepath is None:
             return
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
@@ -4668,7 +4677,8 @@ class STLClipperApp(QMainWindow):
             )
             self._last_case_dir = case_dir
             self._run_case_label.setText(f"Case: {case_dir}")
-            patches = ", ".join(c.name for c in self.engine.clips) + ", wall"
+            patch_names = [c.name for c in self.engine.clips] + [p.name for p in self.engine.filled_patches]
+            patches = ", ".join(patch_names) + ", wall"
             # Summarise generated files by category
             bc_files = [k for k in ("p", "U", "nut", "k", "omega") if k in result]
             system_files = [
