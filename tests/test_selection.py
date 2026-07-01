@@ -221,3 +221,47 @@ def test_delete_cells_whole_mesh_is_noop():
     assert eng.delete_cells(list(range(grid.n_cells))) is None
     assert len(eng._trim_history) == 0
     assert eng.original_mesh.n_cells == grid.n_cells
+
+
+def _n_open(m):
+    return m.extract_feature_edges(boundary_edges=True, feature_edges=False,
+                                   manifold_edges=False, non_manifold_edges=False).n_cells
+
+
+def test_cut_by_plane_keeps_surface_closed_and_records_curve():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=24, phi_resolution=24)
+    eng.original_mesh = sph
+    eng._wall_mesh = sph.copy()
+    n0 = sph.n_cells
+    assert _n_open(eng.original_mesh) == 0
+    out = eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    assert out is not None
+    assert _n_open(eng.original_mesh) == 0          # still closed: feature curve, not open profile
+    assert eng.original_mesh.n_cells > n0           # split added triangles
+    assert len(eng._feature_curves) == 1
+    assert eng._feature_curves[0].n_cells > 0
+    assert len(eng._trim_history) == 1
+
+
+def test_cut_undo_restores_mesh_and_removes_curve():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=20, phi_resolution=20)
+    eng.original_mesh = sph
+    eng._wall_mesh = sph.copy()
+    n0 = sph.n_cells
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    assert eng.undo_trim() is True
+    assert eng.original_mesh.n_cells == n0
+    assert len(eng._feature_curves) == 0
+
+
+def test_cut_plane_miss_is_noop():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(radius=1.0)
+    eng.original_mesh = sph
+    eng._wall_mesh = sph.copy()
+    out = eng.cut_by_plane((0, 0, 100), (0, 0, 1))  # plane outside the sphere -> one side empty
+    assert out is None
+    assert len(eng._trim_history) == 0
+    assert len(eng._feature_curves) == 0

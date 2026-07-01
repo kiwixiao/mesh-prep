@@ -266,6 +266,7 @@ class STLClipperEngine:
         self._trim_history: deque = deque(maxlen=10)
         self._adj_for_mesh = None
         self._adj_ok = False
+        self._feature_curves: list = []   # polylines from cuts (sub-feature A)
 
     def load_stl(self, filepath: str) -> pv.PolyData:
         mesh = pv.read(filepath)
@@ -491,7 +492,7 @@ class STLClipperEngine:
             return None
         if n_inside == centers.shape[0]:
             raise ValueError("Trim would delete the entire mesh")
-        self._trim_history.append(self.original_mesh.copy())
+        self._push_history()
         keep_ids = np.where(~inside)[0]
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
         return self.recompute_all()
@@ -638,7 +639,7 @@ class STLClipperEngine:
             valid[row, off] = True
             inv_deg = (1.0 / dg)[:, None]
             pts = mesh.points.copy()
-            self._trim_history.append(self.original_mesh.copy())
+            self._push_history()
             for _ in range(int(iterations)):
                 gathered = pts[idx]
                 gathered[~valid] = 0.0
@@ -653,7 +654,7 @@ class STLClipperEngine:
                 return None
             neighbors = {p: np.asarray(list(mesh.point_neighbors(p)), dtype=np.int64) for p in movable}
             pts = mesh.points.copy()
-            self._trim_history.append(self.original_mesh.copy())
+            self._push_history()
             for _ in range(int(iterations)):
                 new_pts = pts.copy()
                 for p in movable:
@@ -676,17 +677,41 @@ class STLClipperEngine:
         ids = {int(c) for c in cell_ids if 0 <= int(c) < n}
         if not ids or len(ids) >= n:
             return None
-        self._trim_history.append(self.original_mesh.copy())
+        self._push_history()
         keep_ids = np.array([i for i in range(n) if i not in ids], dtype=np.int64)
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
         return self.recompute_all()
+
+    def cut_by_plane(self, origin, normal):
+        """Split the surface along the plane but keep it one connected, still-closed
+        surface (the cut becomes an internal feature curve, not an open boundary).
+        Records the cut curve; mutates original_mesh; pushes shared undo. Returns the
+        new _wall_mesh, or None if the plane misses the surface (a no-op)."""
+        if self.original_mesh is None:
+            return None
+        a, b = self.original_mesh.clip(normal, origin=origin, return_clipped=True)
+        if a.n_cells == 0 or b.n_cells == 0:      # plane missed -> nothing to cut
+            return None
+        cut_curve = a.extract_feature_edges(
+            boundary_edges=True, feature_edges=False,
+            manifold_edges=False, non_manifold_edges=False)
+        self._push_history()
+        self.original_mesh = a.merge(b, merge_points=True)
+        self._feature_curves.append(cut_curve)
+        return self.recompute_all()
+
+    def _push_history(self):
+        """Snapshot the base mesh + feature curves for shared Ctrl+Z undo."""
+        self._trim_history.append((self.original_mesh.copy(), list(self._feature_curves)))
 
     def undo_trim(self) -> bool:
         """Restore the mesh from before the most recent trim and re-apply clips.
         Returns True if a state was restored, False if there is no trim history."""
         if not self._trim_history:
             return False
-        self.original_mesh = self._trim_history.pop()
+        mesh, curves = self._trim_history.pop()
+        self.original_mesh = mesh
+        self._feature_curves = curves
         self.recompute_all()
         return True
 
@@ -1292,6 +1317,9 @@ class STLClipperApp(QMainWindow):
         self.plotter = QtInteractor(central)
         self.plotter.set_background("black")
         self.plotter.enable_parallel_projection()
+        # Interactive axes gizmo in the corner: click a face/arrow to snap to that
+        # orthographic view (replaces the old +X/-X..+Z/-Z panel buttons).
+        self.plotter.add_camera_orientation_widget()
 
         # Tabbed control panel
         self._tab_widget = QTabWidget()
@@ -1652,21 +1680,8 @@ class STLClipperApp(QMainWindow):
 
         panel.addWidget(self._separator("View"))
 
-        # Orthogonal view buttons — 3 rows of axis pairs
-        for axis, pos_cb, neg_cb in [
-            ("X", self._on_view_pos_x, self._on_view_neg_x),
-            ("Y", self._on_view_pos_y, self._on_view_neg_y),
-            ("Z", self._on_view_pos_z, self._on_view_neg_z),
-        ]:
-            row = QHBoxLayout()
-            bp = QPushButton(f"+{axis}")
-            bp.clicked.connect(pos_cb)
-            row.addWidget(bp)
-            bn = QPushButton(f"-{axis}")
-            bn.clicked.connect(neg_cb)
-            row.addWidget(bn)
-            panel.addLayout(row)
-
+        # Orthographic views come from the interactive axes gizmo in the viewport
+        # corner (add_camera_orientation_widget) — click a face/arrow to snap.
         self.btn_zoom_fit = QPushButton("Zoom to Fit")
         self.btn_zoom_fit.clicked.connect(self._on_zoom_to_fit)
         panel.addWidget(self.btn_zoom_fit)
@@ -3887,30 +3902,6 @@ class STLClipperApp(QMainWindow):
     # ------------------------------------------------------------------
     # View controls
     # ------------------------------------------------------------------
-
-    def _on_view_pos_x(self):
-        """Camera looks from +X toward origin (right side view)."""
-        self.plotter.view_yz(negative=True)
-
-    def _on_view_neg_x(self):
-        """Camera looks from -X toward origin (left side view)."""
-        self.plotter.view_yz(negative=False)
-
-    def _on_view_pos_y(self):
-        """Camera looks from +Y toward origin (back view)."""
-        self.plotter.view_xz(negative=True)
-
-    def _on_view_neg_y(self):
-        """Camera looks from -Y toward origin (front view)."""
-        self.plotter.view_xz(negative=False)
-
-    def _on_view_pos_z(self):
-        """Camera looks from +Z toward origin (top view)."""
-        self.plotter.view_xy(negative=False)
-
-    def _on_view_neg_z(self):
-        """Camera looks from -Z toward origin (bottom view)."""
-        self.plotter.view_xy(negative=True)
 
     def _on_zoom_to_fit(self):
         """Reset camera to fit all visible actors."""
