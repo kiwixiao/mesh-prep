@@ -1055,6 +1055,34 @@ class STLClipperEngine:
         self._apply_repair(repaired)
         return "Normals fixed (consistent winding)"
 
+    def _health_stats(self):
+        """Mesh health snapshot for the auto-repair summary."""
+        m = self.original_mesh
+        nm = m.extract_feature_edges(boundary_edges=False, feature_edges=False,
+                                     manifold_edges=False, non_manifold_edges=True).n_cells
+        op = m.extract_feature_edges(boundary_edges=True, feature_edges=False,
+                                     manifold_edges=False, non_manifold_edges=False).n_cells
+        return {"cells": m.n_cells, "nm": nm, "open": op, "pieces": len(self.detect_pieces())}
+
+    def auto_repair(self):
+        """Clean + fix-normals in one pass; return a before->after health summary.
+        Best-effort (pyvista has no true non-manifold repair). Replaces original_mesh
+        and clears clips via _apply_repair, like the existing repair buttons."""
+        if self.original_mesh is None:
+            return "No mesh loaded."
+        before = self._health_stats()
+        m = self.original_mesh.clean()
+        m = m.compute_normals(cell_normals=False, point_normals=True,
+                              split_vertices=False, consistent_normals=True,
+                              auto_orient_normals=False)
+        self._apply_repair(m)
+        after = self._health_stats()
+        return ("Auto-repair — "
+                f"faces {before['cells']}->{after['cells']}, "
+                f"non-manifold {before['nm']}->{after['nm']}, "
+                f"open edges {before['open']}->{after['open']}, "
+                f"pieces {before['pieces']}->{after['pieces']}")
+
     # ------------------------------------------------------------------
     # Export
     # ------------------------------------------------------------------

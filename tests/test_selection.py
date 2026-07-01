@@ -520,3 +520,24 @@ def test_export_separate_stl_includes_filled_patch(tmp_path):
     assert inlet_file.exists(), "inlet.stl not written by export_separate_stl"
     assert "solid inlet" in inlet_file.read_text()
     assert (sep_dir / "wall.stl").exists()
+
+
+def test_auto_repair_returns_summary_and_replaces_mesh():
+    eng = _sphere_engine()
+    before_obj = eng.original_mesh
+    msg = eng.auto_repair()
+    assert msg.startswith("Auto-repair — ")
+    assert eng.original_mesh is not None
+    assert eng.original_mesh is not before_obj          # replaced with the repaired mesh
+
+
+def test_auto_repair_no_mesh():
+    assert STLClipperEngine().auto_repair() == "No mesh loaded."
+
+
+def test_health_stats_keys():
+    eng = _sphere_engine()
+    stats = eng._health_stats()
+    assert set(stats.keys()) == {"cells", "nm", "open", "pieces"}
+    assert stats["pieces"] == 1
+    assert stats["cells"] == eng.original_mesh.n_cells
