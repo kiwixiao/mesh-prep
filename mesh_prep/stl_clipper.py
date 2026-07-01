@@ -2865,6 +2865,8 @@ class STLClipperApp(QMainWindow):
 
     def _on_add_plane(self):
         """Start clip workflow: add interactive plane widget."""
+        if getattr(self, "_twopt_active", False):
+            self._end_two_point()               # leave two-point capture before the plane widget
         if self.engine.original_mesh is None:
             return
         mesh = self.engine.get_wall_mesh()
@@ -3406,6 +3408,7 @@ class STLClipperApp(QMainWindow):
         self.plotter.remove_actor("twopt_marker", render=False)
         if getattr(self, "_twopt_saved_style", None) is not None:
             self.plotter.iren.style = self._twopt_saved_style
+        self.plotter.render()                   # clear the marker immediately (e.g. Esc-cancel)
 
     def _update_preview(self):
         """Show a yellow slice preview (clipped to box) and a green normal arrow."""
@@ -3718,6 +3721,8 @@ class STLClipperApp(QMainWindow):
         """Install the shared Shift+drag lasso style. on_release(display_points)
         is invoked when a lasso stroke completes — Select passes _apply_select,
         Trim passes _apply_trim. Plain drag rotates the camera (trackball)."""
+        if getattr(self, "_twopt_active", False):
+            self._end_two_point()               # leave two-point capture before installing lasso
         iren = self.plotter.iren
         if isinstance(iren.style, _SelectLassoStyle):
             self._end_select_lasso()            # never stack two lasso styles
