@@ -4225,7 +4225,9 @@ class STLClipperApp(QMainWindow):
             return
         if getattr(self, "_select_mode", False):
             self._btn_select.setChecked(False)   # exits select mode via _toggle_select_mode
-        self._clear_selection()
+        self.plotter.remove_actor("tree_highlight", render=False)  # clear any tree-entity highlight
+        self._active_profile_index = None
+        self._clear_selection()                  # clears face-selection highlight + renders
 
     # ------------------------------------------------------------------
 
