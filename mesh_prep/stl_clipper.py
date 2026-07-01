@@ -1351,6 +1351,8 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
     def __init__(self, app):
         self._app = app
         self._lasso_active = False
+        self._last_click_time = 0.0
+        self._last_click_pos = None
         self.AddObserver("LeftButtonPressEvent", self._on_press)
         self.AddObserver("MouseMoveEvent", self._on_move)
         self.AddObserver("LeftButtonReleaseEvent", self._on_release)
@@ -1387,11 +1389,20 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
                 self._app._select_lasso_release()
                 return
             self.OnLeftButtonUp()
-            # A plain press+release that did not move is a click, not a rotate ->
-            # pick the single face under the cursor (Select mode only).
             pp = getattr(self, "_press_pos", None)
             rp = self._app.plotter.iren.get_event_position()
-            if pp is not None and abs(rp[0] - pp[0]) <= 3 and abs(rp[1] - pp[1]) <= 3:
+            if pp is None or abs(rp[0] - pp[0]) > 3 or abs(rp[1] - pp[1]) > 3:
+                return                                    # a rotate/drag, not a click
+            now = time.time()
+            last_t = self._last_click_time
+            last_p = self._last_click_pos
+            if (last_p is not None and (now - last_t) <= 0.4
+                    and abs(rp[0] - last_p[0]) <= 8 and abs(rp[1] - last_p[1]) <= 8):
+                self._last_click_time = 0.0               # consume; no triple-click chain
+                self._app._select_double_click(rp)
+            else:
+                self._last_click_time = now
+                self._last_click_pos = rp
                 self._app._select_click_pick(rp)
         except Exception:
             logger.exception("select release handler failed")
@@ -3706,27 +3717,50 @@ class STLClipperApp(QMainWindow):
         self.status.showMessage(f"Selected {len(self._selection)} faces.")
         self._update_button_states()
 
-    def _select_click_pick(self, pos):
-        """A single click in Select mode adds the one face under the cursor to the
-        active selection. The picker is restricted to the wall actor so it cannot
-        catch the centerline or other props."""
-        if not self._btn_select.isChecked() or not self._edit_enabled():
-            return
+    def _pick_wall_cell(self, pos):
+        """Cell id of the wall face under display position `pos`, or None. The picker
+        is restricted to the wall actor so it cannot catch the centerline or feature
+        curves. Shared by single-click and double-click selection."""
         wall_actor = getattr(self, "_wall_actor", None)
         mesh = self.engine.original_mesh
         if wall_actor is None or mesh is None:
-            return
+            return None
         picker = vtk.vtkCellPicker()
         picker.InitializePickList()
         picker.AddPickList(wall_actor)
         picker.PickFromListOn()
         picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
         cid = picker.GetCellId()
-        if cid is None or cid < 0 or cid >= mesh.n_cells:   # missed the wall
+        if cid is None or cid < 0 or cid >= mesh.n_cells:
+            return None
+        return int(cid)
+
+    def _select_click_pick(self, pos):
+        """A single click in Select mode adds the one face under the cursor to the
+        active selection."""
+        if not self._btn_select.isChecked() or not self._edit_enabled():
             return
-        self._selection.add(int(cid))
+        cid = self._pick_wall_cell(pos)
+        if cid is None:
+            return
+        self._selection.add(cid)
         self._refresh_selection_highlight()
         self.status.showMessage(f"Selected {len(self._selection)} faces.")
+        self._update_button_states()
+
+    def _select_double_click(self, pos):
+        """A double click in Select mode floods the connected surface region under the
+        cursor (bounded by feature curves) into the active selection."""
+        if not self._btn_select.isChecked() or not self._edit_enabled():
+            return
+        cid = self._pick_wall_cell(pos)
+        if cid is None:
+            return
+        region = self.engine.flood_select(cid)
+        self._selection |= set(region)
+        self._refresh_selection_highlight()
+        self.status.showMessage(
+            f"Flood-selected {len(region)} faces ({len(self._selection)} total).")
         self._update_button_states()
 
     def _refresh_selection_highlight(self):
