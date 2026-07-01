@@ -2756,7 +2756,10 @@ class STLClipperApp(QMainWindow):
     def _on_auto_repair(self):
         msg = self.engine.auto_repair()
         self._lbl_repair_status.setText(msg)
+        self._centerline_mesh = None
+        self._refresh_patch_list()
         self._refresh_display()
+        self._update_button_states()
 
     def _on_sim_type_changed(self, index: int):
         """Switch UI between LES and RANS turbulence parameters."""
@@ -2918,6 +2921,7 @@ class STLClipperApp(QMainWindow):
         # Repair buttons
         self._btn_repair_clean.setEnabled(has_mesh)
         self._btn_repair_normals.setEnabled(has_mesh)
+        self._btn_auto_repair.setEnabled(has_mesh)
 
         # Selection buttons
         has_sel = bool(getattr(self, "_selection", set()))
