@@ -250,6 +250,21 @@ def _project_to_display(points, view_matrix, viewport):
     return disp_x, disp_y
 
 
+def plane_from_two_points(a, b, view_dir):
+    """Cut plane through points a and b, parallel to view_dir (so it appears edge-on
+    from the current camera and slices along the line of sight). Returns
+    (origin, normal) with a unit normal and origin at the midpoint, or None if the
+    inputs are degenerate (a == b, or b - a parallel to view_dir → zero cross)."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    d = np.asarray(view_dir, dtype=float)
+    normal = np.cross(d, b - a)
+    n = float(np.linalg.norm(normal))
+    if n <= 1e-12:
+        return None
+    return (a + b) / 2.0, normal / n
+
+
 class STLClipperEngine:
     """
     Core mesh clipping logic — no Qt dependency.

@@ -1,6 +1,6 @@
 import numpy as np
 import pyvista as pv
-from mesh_prep.stl_clipper import STLClipperEngine
+from mesh_prep.stl_clipper import STLClipperEngine, plane_from_two_points
 
 VIEW = np.array([[0.5, 0, 0, -1],
                  [0, 0.5, 0, -1],
@@ -422,3 +422,28 @@ def test_detect_nonmanifold_edges():
     eng._wall_mesh = eng.original_mesh.copy()
     assert len(eng.detect_nonmanifold_edges()) == 1
     assert _sphere_engine().detect_nonmanifold_edges() == []        # clean sphere
+
+
+def test_plane_from_two_points_basic():
+    origin, normal = plane_from_two_points((0, 0, 0), (1, 0, 0), (0, 0, 1))
+    assert np.allclose(origin, (0.5, 0, 0))
+    assert np.isclose(np.linalg.norm(normal), 1.0)
+    assert abs(np.dot(normal, (0, 0, 1))) < 1e-9        # plane is parallel to the view axis
+    assert abs(np.dot(normal, (1, 0, 0))) < 1e-9        # plane contains the A-B line
+
+
+def test_plane_from_two_points_generic_orthogonality():
+    A = np.array([1.0, 1.0, 0.0]); B = np.array([2.0, 3.0, 1.0]); view = np.array([0.3, -0.2, 1.0])
+    origin, normal = plane_from_two_points(A, B, view)
+    assert np.isclose(np.linalg.norm(normal), 1.0)
+    assert abs(np.dot(normal, view)) < 1e-9
+    assert abs(np.dot(normal, B - A)) < 1e-9
+    assert np.allclose(origin, (A + B) / 2)
+
+
+def test_plane_from_two_points_identical_points_none():
+    assert plane_from_two_points((1, 2, 3), (1, 2, 3), (0, 0, 1)) is None
+
+
+def test_plane_from_two_points_colinear_with_view_none():
+    assert plane_from_two_points((0, 0, 0), (0, 0, 2), (0, 0, 1)) is None
