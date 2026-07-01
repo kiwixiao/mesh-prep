@@ -39,6 +39,8 @@ from PyQt5.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -1904,14 +1906,26 @@ class STLClipperApp(QMainWindow):
         # ── Tab 5: Run OpenFOAM (Beta) ──
         self._build_run_tab()
 
-        # Draggable splitter between viewport and tab panel
+        # Object tree (left) — detected surface entities
+        self._tree_mesh = False           # sentinel so the first refresh always builds
+        self._tree_profiles = []
+        self._tree_nonmanifold = []
+        self._tree_pieces = []
+        self._object_tree = QTreeWidget()
+        self._object_tree.setHeaderLabel("Objects")
+        self._object_tree.itemClicked.connect(self._on_tree_item_clicked)
+
+        # Draggable splitter: object tree | viewport | tab panel
         splitter = QSplitter(Qt.Horizontal, central)
+        splitter.addWidget(self._object_tree)
         splitter.addWidget(self.plotter.interactor)
         splitter.addWidget(self._tab_widget)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        splitter.setCollapsible(0, False)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(2, 1)
+        splitter.setCollapsible(0, True)
         splitter.setCollapsible(1, False)
+        splitter.setCollapsible(2, False)
         layout.addWidget(splitter)
 
         # Status bar
@@ -3817,6 +3831,75 @@ class STLClipperApp(QMainWindow):
                                       reset_camera=False)
         self.plotter.render()
 
+    def _refresh_object_tree(self):
+        """Rebuild the object tree from detected surface entities. Identity-guarded:
+        skips recompute when the mesh is unchanged since the last build, so view-only
+        refreshes stay free."""
+        mesh = self.engine.original_mesh
+        if mesh is self._tree_mesh:
+            return
+        self._tree_mesh = mesh
+        self._tree_profiles = self.engine.detect_open_profiles()
+        self._tree_nonmanifold = self.engine.detect_nonmanifold_edges()
+        self._tree_pieces = self.engine.detect_pieces()
+        tree = self._object_tree
+        tree.clear()
+
+        prof = QTreeWidgetItem(tree, ["Open Profiles"])
+        prof.setExpanded(True)
+        if self._tree_profiles:
+            for i, g in enumerate(self._tree_profiles):
+                it = QTreeWidgetItem(prof, [f"Open Profile {i + 1} ({g.n_cells} edges)"])
+                it.setData(0, Qt.UserRole, ("profile", i))
+        else:
+            QTreeWidgetItem(prof, ["(none)"]).setDisabled(True)
+
+        nm = QTreeWidgetItem(tree, ["Non-manifold edges"])
+        nm.setExpanded(True)
+        if self._tree_nonmanifold:
+            for i, g in enumerate(self._tree_nonmanifold):
+                it = QTreeWidgetItem(nm, [f"Non-manifold group {i + 1} ({g.n_cells} edges)"])
+                it.setData(0, Qt.UserRole, ("nonmanifold", i))
+        else:
+            QTreeWidgetItem(nm, ["(none)"]).setDisabled(True)
+
+        pc = QTreeWidgetItem(tree, ["Disconnected pieces"])
+        pc.setExpanded(True)
+        if self._tree_pieces:
+            for i, cells in enumerate(self._tree_pieces):
+                it = QTreeWidgetItem(pc, [f"Piece {i + 1} ({len(cells)} faces)"])
+                it.setData(0, Qt.UserRole, ("piece", i))
+        else:
+            QTreeWidgetItem(pc, ["(none)"]).setDisabled(True)
+
+    def _on_tree_item_clicked(self, item, column):
+        """Highlight the clicked entity (no camera move). Pieces also load into the
+        face selection so Delete faces removes them."""
+        data = item.data(0, Qt.UserRole)
+        self.plotter.remove_actor("tree_highlight", render=False)
+        if data is None:                                  # category header or (none)
+            self.plotter.render()
+            return
+        kind, index = data
+        if kind == "profile":
+            geom = self._tree_profiles[index]
+            self.plotter.add_mesh(geom, color="orange", line_width=6,
+                                  name="tree_highlight", reset_camera=False)
+            self.status.showMessage(f"Open Profile {index + 1} — {geom.n_cells} edges.")
+        elif kind == "nonmanifold":
+            geom = self._tree_nonmanifold[index]
+            self.plotter.add_mesh(geom, color="red", line_width=6,
+                                  name="tree_highlight", reset_camera=False)
+            self.status.showMessage(f"Non-manifold group {index + 1} — {geom.n_cells} edges.")
+        elif kind == "piece":
+            cells = self._tree_pieces[index]
+            self._selection = set(cells)
+            self._refresh_selection_highlight()
+            self.status.showMessage(
+                f"Piece {index + 1} — {len(cells)} faces selected. Delete faces to remove.")
+            self._update_button_states()
+        self.plotter.render()
+
     def _clear_selection(self):
         self._selection = set()
         self._refresh_selection_highlight()
@@ -4131,6 +4214,7 @@ class STLClipperApp(QMainWindow):
                 )
 
         self.plotter.render()
+        self._refresh_object_tree()
 
     def _on_toggle_mesh_edges(self):
         """Toggle surface mesh edge visualization on the wall."""
