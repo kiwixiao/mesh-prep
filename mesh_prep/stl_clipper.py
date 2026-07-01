@@ -700,6 +700,44 @@ class STLClipperEngine:
         self._feature_curves.append(cut_curve)
         return self.recompute_all()
 
+    def cut_by_box(self, box_planes_data):
+        """Split the surface along an oriented box's faces, keeping it one closed
+        surface; record the cut curve. box_planes_data: list of (normal, point).
+        Returns new _wall_mesh, or None if the box does not intersect the surface."""
+        if self.original_mesh is None or not box_planes_data:
+            return None
+        planes = vtk.vtkPlanes()
+        pts = vtk.vtkPoints()
+        norms = vtk.vtkDoubleArray()
+        norms.SetNumberOfComponents(3)
+        for normal, point in box_planes_data:
+            pts.InsertNextPoint(*point)
+            norms.InsertNextTuple3(*normal)
+        planes.SetPoints(pts)
+        planes.SetNormals(norms)
+        clipper = vtk.vtkClipPolyData()
+        clipper.SetInputData(self.original_mesh)
+        clipper.SetClipFunction(planes)
+        clipper.GenerateClippedOutputOn()
+        clipper.Update()
+        a = pv.wrap(clipper.GetOutput())
+        b = pv.wrap(clipper.GetClippedOutput())
+        # vtkClipPolyData may produce UnstructuredGrid when the implicit function
+        # introduces non-triangular cells; extract the surface as PolyData first.
+        if hasattr(a, 'extract_surface'):
+            a = a.extract_surface()
+        if hasattr(b, 'extract_surface'):
+            b = b.extract_surface()
+        if a.n_cells == 0 or b.n_cells == 0:
+            return None
+        cut_curve = a.extract_feature_edges(
+            boundary_edges=True, feature_edges=False,
+            manifold_edges=False, non_manifold_edges=False)
+        self._push_history()
+        self.original_mesh = a.merge(b, merge_points=True)
+        self._feature_curves.append(cut_curve)
+        return self.recompute_all()
+
     def _push_history(self):
         """Snapshot the base mesh + feature curves for shared Ctrl+Z undo."""
         self._trim_history.append((self.original_mesh.copy(), list(self._feature_curves)))

@@ -265,3 +265,21 @@ def test_cut_plane_miss_is_noop():
     assert out is None
     assert len(eng._trim_history) == 0
     assert len(eng._feature_curves) == 0
+
+
+def test_cut_by_box_keeps_surface_closed_and_records_curve():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=24, phi_resolution=24)
+    eng.original_mesh = sph
+    eng._wall_mesh = sph.copy()
+    n0 = sph.n_cells
+    # axis-aligned box cutting through the sphere: 6 planes as (normal, point)
+    box = [((1, 0, 0), (0.3, 0, 0)), ((-1, 0, 0), (-0.3, 0, 0)),
+           ((0, 1, 0), (0, 0.3, 0)), ((0, -1, 0), (0, -0.3, 0)),
+           ((0, 0, 1), (0, 0, 0.3)), ((0, 0, -1), (0, 0, -0.3))]
+    out = eng.cut_by_box(box)
+    assert out is not None
+    assert _n_open(eng.original_mesh) == 0          # still closed
+    assert eng.original_mesh.n_cells > n0
+    assert len(eng._feature_curves) == 1
+    assert len(eng._trim_history) == 1
