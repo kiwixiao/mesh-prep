@@ -1465,6 +1465,39 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
             logger.exception("select release handler failed")
 
 
+class _TwoPointStyle(vtk.vtkInteractorStyleTrackballCamera):
+    """Trackball camera style for the two-point plane tool. Plain drag orbits/zooms;
+    Shift+click places a plane-defining point (camera suppressed for that click).
+    Mirrors _SelectLassoStyle's subclass + AddObserver + conditional-forward pattern."""
+
+    def __init__(self, app):
+        self._app = app
+        self.AddObserver("LeftButtonPressEvent", self._on_press)
+        self.AddObserver("MouseMoveEvent", self._on_move)
+        self.AddObserver("LeftButtonReleaseEvent", self._on_release)
+
+    def _on_press(self, _obj=None, _evt=None):
+        try:
+            if bool(QApplication.keyboardModifiers() & Qt.ShiftModifier):
+                self._app._twopt_click(self._app.plotter.iren.get_event_position())
+                return                                   # suppress camera on the click
+            self.OnLeftButtonDown()                      # plain press -> orbit
+        except Exception:
+            logger.exception("two-point press handler failed")
+
+    def _on_move(self, _obj=None, _evt=None):
+        try:
+            self.OnMouseMove()
+        except Exception:
+            logger.exception("two-point move handler failed")
+
+    def _on_release(self, _obj=None, _evt=None):
+        try:
+            self.OnLeftButtonUp()
+        except Exception:
+            logger.exception("two-point release handler failed")
+
+
 class STLClipperApp(QMainWindow):
     """Qt GUI with embedded PyVista viewport and control panel."""
 
@@ -1479,6 +1512,8 @@ class STLClipperApp(QMainWindow):
         self._constraint_box_active = False     # optional constraint box on screen
         self._current_plane_origin = None       # from plane widget callback
         self._current_plane_normal = None       # from plane widget callback
+        self._twopt_active = False
+        self._twopt_first = None
         self._current_box_planes_data = None    # from constraint box callback (optional)
         self._preview_actor = None
         self._arrow_actor = None
@@ -1561,6 +1596,12 @@ class STLClipperApp(QMainWindow):
         self.btn_add_plane = QPushButton("Add Clip Plane")
         self.btn_add_plane.clicked.connect(self._on_add_plane)
         panel.addWidget(self.btn_add_plane)
+
+        self.btn_two_point_plane = QPushButton("◪ 2-Point Plane")
+        self.btn_two_point_plane.setToolTip(
+            "Shift+click two points in the viewer to define a cut plane along your line of sight")
+        self.btn_two_point_plane.clicked.connect(self._on_two_point_plane)
+        panel.addWidget(self.btn_two_point_plane)
 
         self.btn_confirm_plane = QPushButton("Confirm Plane")
         self.btn_confirm_plane.clicked.connect(self._on_confirm_plane)
@@ -3302,6 +3343,68 @@ class STLClipperApp(QMainWindow):
         )
         self._update_constraint_box()
 
+    def _on_two_point_plane(self):
+        """Enter two-point plane capture mode: orbit freely, then Shift+click two
+        points to define a cut plane parallel to the view direction."""
+        if self.engine.original_mesh is None:
+            self.status.showMessage("Load an STL first.")
+            return
+        for btn in (getattr(self, "_btn_select", None), getattr(self, "_btn_trim", None)):
+            if btn is not None and btn.isChecked():
+                btn.setChecked(False)                    # exit select/trim so styles never stack
+        self._cancel_clip_widgets()
+        self._twopt_active = True
+        self._twopt_first = None
+        self.plotter.remove_actor("twopt_marker", render=False)
+        iren = self.plotter.iren
+        self._twopt_saved_style = iren.style or iren.interactor.GetInteractorStyle()
+        self._twopt_style = _TwoPointStyle(self)
+        iren.style = self._twopt_style
+        self.status.showMessage("Shift+click two points to define the cut plane (Esc to cancel).")
+
+    def _screen_to_focal_world(self, x, y):
+        """Back-project display pixel (x, y) onto the camera focal plane -> world xyz.
+        Depth is irrelevant here since the cut plane is parallel to the view axis."""
+        ren = self.plotter.renderer
+        fp = np.asarray(self.plotter.camera.focal_point, dtype=float)
+        ren.SetWorldPoint(fp[0], fp[1], fp[2], 1.0)
+        ren.WorldToDisplay()
+        z = ren.GetDisplayPoint()[2]
+        ren.SetDisplayPoint(float(x), float(y), z)
+        ren.DisplayToWorld()
+        w = np.asarray(ren.GetWorldPoint(), dtype=float)
+        return w[:3] / w[3]
+
+    def _twopt_click(self, pos):
+        """Handle one Shift+click during two-point capture."""
+        if not self._twopt_active:
+            return
+        world = self._screen_to_focal_world(pos[0], pos[1])
+        if self._twopt_first is None:
+            self._twopt_first = world
+            b = np.asarray(self.engine.original_mesh.bounds, dtype=float)
+            r = 0.01 * float(np.linalg.norm(b[1::2] - b[0::2]))
+            self.plotter.add_mesh(pv.Sphere(radius=r, center=world),
+                                  color="yellow", name="twopt_marker", reset_camera=False)
+            self.status.showMessage("Point 1 set — Shift+click the second point.")
+            return
+        res = plane_from_two_points(self._twopt_first, world, self.plotter.camera.direction)
+        if res is None:
+            self.status.showMessage("Pick two distinct points.")
+            return
+        self._current_plane_origin, self._current_plane_normal = res
+        self._end_two_point()
+        self._update_preview()
+        self.status.showMessage("Plane set — press ✂ Cut.")
+
+    def _end_two_point(self):
+        """Exit two-point capture: clear state + marker, restore the trackball style."""
+        self._twopt_active = False
+        self._twopt_first = None
+        self.plotter.remove_actor("twopt_marker", render=False)
+        if getattr(self, "_twopt_saved_style", None) is not None:
+            self.plotter.iren.style = self._twopt_saved_style
+
     def _update_preview(self):
         """Show a yellow slice preview (clipped to box) and a green normal arrow."""
         wall = self.engine.get_wall_mesh()
@@ -3951,6 +4054,10 @@ class STLClipperApp(QMainWindow):
         self.status.showMessage(f"Deleted faces — wall now {n:,} faces.")
 
     def _on_escape_selection(self):
+        if getattr(self, "_twopt_active", False):
+            self._end_two_point()
+            self.status.showMessage("Two-point plane cancelled.")
+            return
         if getattr(self, "_select_mode", False):
             self._btn_select.setChecked(False)   # exits select mode via _toggle_select_mode
         self._clear_selection()
