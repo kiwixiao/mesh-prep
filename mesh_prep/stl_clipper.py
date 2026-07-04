@@ -3672,10 +3672,13 @@ class STLClipperApp(QMainWindow):
         self.plotter.render()                   # clear the marker immediately (e.g. Esc-cancel)
 
     def _update_preview(self):
-        """Show a yellow slice preview (clipped to box) and a green normal arrow."""
+        """Show a cyan slice preview (clipped to box) and a green normal arrow."""
         wall = self.engine.get_wall_mesh()
         if wall is None or wall.n_cells == 0:
             return
+        # A lingering tree-highlight wireframe visually mixes with the preview;
+        # drop it once the user starts placing a new plane.
+        self.plotter.remove_actor("tree_highlight", render=False)
 
         # Remove previous preview actors
         if self._preview_actor is not None:
@@ -4665,13 +4668,13 @@ class STLClipperApp(QMainWindow):
             name="wall", reset_camera=False,
         )
 
-        # Named patches — name-based colors with white edges for visibility
+        # Named patches — flat name-based colors. No edge lines: caps are sliver
+        # triangle fans over jagged rims, and white edges shred the solid color.
         for pid, pname, _nf in self.engine.named_patches():
             cap = patches.get(pid)
             if cap is not None and cap.n_cells > 0:
                 self.plotter.add_mesh(
                     cap, color=_color_for_name(pname), opacity=1.0,
-                    show_edges=True, edge_color="white", line_width=2,
                     name=f"cap_{pname}", reset_camera=False,
                 )
 
