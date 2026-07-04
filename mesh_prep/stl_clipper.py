@@ -2134,8 +2134,7 @@ class STLClipperApp(QMainWindow):
         geo_lay.addWidget(self._lbl_non_manifold)
         self._lbl_manifold = QLabel("Manifold: —")
         geo_lay.addWidget(self._lbl_manifold)
-        self._lbl_normals = QLabel("Normals: —")
-        geo_lay.addWidget(self._lbl_normals)
+        self._lbl_normals = QLabel("Normals: —")   # shown in the LEFT Geometry box
         self._btn_show_non_manifold = QPushButton("Show Non-Manifold")
         self._btn_show_non_manifold.setCheckable(True)
         self._btn_show_non_manifold.setChecked(False)
@@ -2232,6 +2231,7 @@ class STLClipperApp(QMainWindow):
         _geom_lay.addWidget(self._lbl_bounds_x)
         _geom_lay.addWidget(self._lbl_bounds_y)
         _geom_lay.addWidget(self._lbl_bounds_z)
+        _geom_lay.addWidget(self._lbl_normals)      # normal-orientation health
         _geom_lay.addWidget(self.btn_zoom_fit)
 
         _left_pane = QWidget()
