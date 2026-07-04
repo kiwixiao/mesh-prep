@@ -67,6 +67,8 @@ DEFAULT_CAP_COLOR = (0.2, 0.8, 0.3) # green (fallback)
 WALL_COLOR = (0.82, 0.82, 0.82)
 PREVIEW_COLOR = (0.0, 1.0, 1.0)  # cyan for slice preview
 
+PATCH_ID = "patch_id"   # cell-data array on current_mesh; 0 = wall, 1..N = named patch
+
 
 def _color_for_name(name: str) -> tuple:
     """Return color based on patch name: red for inlet, blue for outlet, green otherwise."""
@@ -311,6 +313,25 @@ class STLClipperEngine:
         self.filled_patches.clear()
         self._wall_mesh = mesh.copy()
         return mesh
+
+    @staticmethod
+    def _carry_labels(result: pv.PolyData, source: pv.PolyData, default_id: int = 0) -> pv.PolyData:
+        """Ensure result carries a PATCH_ID cell array. If a filter preserved it,
+        keep it; otherwise remap each result cell to the nearest source cell's label."""
+        if result is None or result.n_cells == 0:
+            return result
+        if PATCH_ID in result.cell_data and len(result.cell_data[PATCH_ID]) == result.n_cells:
+            return result
+        if source is None or PATCH_ID not in source.cell_data or source.n_cells == 0:
+            result.cell_data[PATCH_ID] = np.full(result.n_cells, default_id, dtype=np.int64)
+            return result
+        src_centers = source.cell_centers().points
+        src_labels = np.asarray(source.cell_data[PATCH_ID])
+        res_centers = result.cell_centers().points
+        from scipy.spatial import cKDTree
+        _, idx = cKDTree(src_centers).query(res_centers)
+        result.cell_data[PATCH_ID] = src_labels[idx].astype(np.int64)
+        return result
 
     # ------------------------------------------------------------------
     # Clipping helpers
@@ -1074,9 +1095,20 @@ class STLClipperEngine:
     # ------------------------------------------------------------------
 
     def _apply_repair(self, repaired_mesh) -> None:
-        """Replace original mesh with repaired version, clear all clips."""
+        """Replace the original mesh with the repaired version and reset all
+        edit-derived state.
+
+        Repair rebuilds the mesh topology, so any pre-repair undo snapshot,
+        feature curve, or filled cap refers to geometry that no longer exists.
+        Keeping them would let Ctrl+Z restore a stale mesh and leave dangling
+        overlays. Mirror load_stl's reset so edit state always matches the
+        current mesh lineage.
+        """
         self.original_mesh = repaired_mesh
         self.clips.clear()
+        self._trim_history.clear()
+        self._feature_curves.clear()
+        self.filled_patches.clear()
         self._wall_mesh = repaired_mesh.copy()
 
     def repair_clean(self) -> str:
@@ -2778,6 +2810,20 @@ class STLClipperApp(QMainWindow):
                 self, "No Case", "No case directory to open.",
             )
 
+    @staticmethod
+    def _quiesce_worker(worker, timeout_ms: int = 5000) -> bool:
+        """Detach a running QThread worker's signals and wait for it to finish.
+
+        Stops a background worker (e.g. the VMTK centerline thread, which has no
+        cancel path) from emitting into a window that is being destroyed, which
+        would crash PyQt. Returns True if the worker was already idle or finished
+        within the timeout, False if it is still running.
+        """
+        if worker is None or not worker.isRunning():
+            return True
+        worker.blockSignals(True)   # emissions can no longer reach the dying window
+        return worker.wait(timeout_ms)
+
     def closeEvent(self, event):
         """Prompt if solver is running before closing."""
         if self._openfoam_worker and self._openfoam_worker.isRunning():
@@ -2792,6 +2838,9 @@ class STLClipperApp(QMainWindow):
             else:
                 event.ignore()
                 return
+        # VMTK centerline has no cancel; detach its signals so it can't emit
+        # into the destroyed window, then give it a moment to finish.
+        self._quiesce_worker(self._centerline_worker)
         super().closeEvent(event)
 
     def _on_repair_clean(self):

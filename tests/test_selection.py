@@ -535,6 +535,31 @@ def test_auto_repair_no_mesh():
     assert STLClipperEngine().auto_repair() == "No mesh loaded."
 
 
+def test_repair_clears_undo_history_no_stale_restore():
+    # Repair rebuilds the mesh; any pre-repair undo snapshot refers to geometry
+    # that no longer exists. Undo after repair must NOT restore a stale mesh.
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    assert len(eng._trim_history) == 1
+    assert len(eng._feature_curves) == 1
+    eng.auto_repair()
+    assert len(eng._trim_history) == 0
+    assert eng._feature_curves == []
+    assert eng.undo_trim() is False          # nothing stale to undo into
+
+
+def test_repair_clears_filled_patches():
+    # Filled caps belong to the pre-repair mesh; they must not survive repair.
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    eng.fill_profile(eng.detect_open_profiles()[0], "inlet")
+    assert len(eng.filled_patches) == 1
+    eng.auto_repair()
+    assert eng.filled_patches == []
+
+
 def test_health_stats_keys():
     eng = _sphere_engine()
     stats = eng._health_stats()
