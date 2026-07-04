@@ -1118,6 +1118,42 @@ class STLClipperEngine:
     def get_wall_mesh(self) -> Optional[pv.PolyData]:
         return self.current_mesh
 
+    def check_normals(self) -> dict:
+        """Normal-orientation health of current_mesh.
+
+        consistent : neighboring triangles agree on winding (a directed edge
+                     appearing twice means two faces disagree). None if no mesh
+                     or non-triangle faces.
+        flipped_edges : number of directed edges with winding conflicts.
+        outward    : for a CLOSED consistent surface, True if the winding points
+                     outward (signed volume > 0). None when open/inconsistent.
+        """
+        m = self.current_mesh
+        if m is None or m.n_cells == 0:
+            return {"consistent": None, "flipped_edges": 0, "outward": None}
+        faces = m.faces
+        if faces.size != 4 * m.n_cells or not bool((faces.reshape(-1, 4)[:, 0] == 3).all()):
+            return {"consistent": None, "flipped_edges": 0, "outward": None}
+        tri = faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+        n = m.n_points
+        de = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+        keys = de[:, 0] * n + de[:, 1]
+        _, cnt = np.unique(keys, return_counts=True)
+        flipped = int(np.count_nonzero(cnt > 1))
+        consistent = flipped == 0
+        outward = None
+        if consistent:
+            boundary = m.extract_feature_edges(
+                boundary_edges=True, feature_edges=False,
+                manifold_edges=False, non_manifold_edges=False)
+            if boundary.n_cells == 0:                     # watertight -> signed volume
+                p = m.points
+                vol6 = float(np.einsum(
+                    'ij,ij->i', p[tri[:, 0]],
+                    np.cross(p[tri[:, 1]], p[tri[:, 2]])).sum())
+                outward = bool(vol6 > 0)
+        return {"consistent": consistent, "flipped_edges": flipped, "outward": outward}
+
     def geometry_quality(self) -> dict:
         """Return geometry quality metrics for the current mesh (caps included —
         they are part of current_mesh in the single-mesh model)."""
@@ -2098,6 +2134,8 @@ class STLClipperApp(QMainWindow):
         geo_lay.addWidget(self._lbl_non_manifold)
         self._lbl_manifold = QLabel("Manifold: —")
         geo_lay.addWidget(self._lbl_manifold)
+        self._lbl_normals = QLabel("Normals: —")
+        geo_lay.addWidget(self._lbl_normals)
         self._btn_show_non_manifold = QPushButton("Show Non-Manifold")
         self._btn_show_non_manifold.setCheckable(True)
         self._btn_show_non_manifold.setChecked(False)
@@ -4773,6 +4811,25 @@ class STLClipperApp(QMainWindow):
         else:
             self._lbl_non_manifold.setText(f"Non-manifold edges: {n_nm} \u2717")
             self._lbl_non_manifold.setStyleSheet("color: red;")
+
+        # Normal-orientation status
+        nrm = self.engine.check_normals()
+        if nrm["consistent"] is None:
+            self._lbl_normals.setText("Normals: \u2014")
+            self._lbl_normals.setStyleSheet("color: gray;")
+        elif not nrm["consistent"]:
+            self._lbl_normals.setText(
+                f"Normals: \u2717 {nrm['flipped_edges']} flipped edges (use Fix Normals)")
+            self._lbl_normals.setStyleSheet("color: red;")
+        elif nrm["outward"] is True:
+            self._lbl_normals.setText("Normals: \u2713 consistent, outward")
+            self._lbl_normals.setStyleSheet("color: green;")
+        elif nrm["outward"] is False:
+            self._lbl_normals.setText("Normals: \u2717 consistent but INWARD (use Fix Normals)")
+            self._lbl_normals.setStyleSheet("color: red;")
+        else:
+            self._lbl_normals.setText("Normals: \u2713 consistent (open surface)")
+            self._lbl_normals.setStyleSheet("color: green;")
 
         if is_mf is None:
             self._lbl_manifold.setText("Manifold: \u2014 (no named patches)")

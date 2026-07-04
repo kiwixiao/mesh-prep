@@ -235,6 +235,52 @@ def test_export_clip_planes_has_normal_and_center(tmp_path):
     assert abs(p["center"][2]) < 1e-6                      # cap centroid on z=0 plane
 
 
+def _flip_some_faces(mesh, n_flip):
+    tri = mesh.faces.reshape(-1, 4).copy()
+    tri[:n_flip, [1, 2]] = tri[:n_flip, [2, 1]]           # reverse winding
+    return pv.PolyData(mesh.points.copy(), tri.ravel())
+
+
+def test_check_normals_clean_sphere_outward():
+    eng = _labeled_engine()
+    r = eng.check_normals()
+    assert r["consistent"] is True
+    assert r["flipped_edges"] == 0
+    assert r["outward"] is True                            # pv.Sphere winds outward
+
+
+def test_check_normals_detects_flipped_faces():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=16, phi_resolution=16).triangulate()
+    eng.current_mesh = _flip_some_faces(sph, 5)
+    r = eng.check_normals()
+    assert r["consistent"] is False
+    assert r["flipped_edges"] > 0
+
+
+def test_check_normals_inverted_sphere_inward():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=16, phi_resolution=16).triangulate()
+    eng.current_mesh = _flip_some_faces(sph, sph.n_cells)  # flip ALL: consistent, inward
+    r = eng.check_normals()
+    assert r["consistent"] is True
+    assert r["outward"] is False
+
+
+def test_check_normals_open_surface_orientation_unknown():
+    eng = _labeled_engine()
+    eng.delete_cells(list(range(20)))                      # open a hole
+    r = eng.check_normals()
+    assert r["consistent"] is True
+    assert r["outward"] is None                            # not closed -> undefined
+
+
+def test_check_normals_no_mesh():
+    r = STLClipperEngine().check_normals()
+    assert r["consistent"] is None
+    assert r["outward"] is None
+
+
 def test_remove_patch_relabels_to_wall():
     eng = _labeled_engine()
     eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
