@@ -289,6 +289,9 @@ class STLClipperEngine:
 
     def __init__(self):
         self.original_mesh: Optional[pv.PolyData] = None
+        self.current_mesh: Optional[pv.PolyData] = None   # single source of truth (migration)
+        self.patch_names: dict[int, str] = {}             # patch_id -> name (0 = wall)
+        self._next_patch_id: int = 1
         self.clips: list[ClipDefinition] = []
         self._wall_mesh: Optional[pv.PolyData] = None
         self._trim_history: deque = deque(maxlen=10)
@@ -312,6 +315,12 @@ class STLClipperEngine:
         self._feature_curves.clear()
         self.filled_patches.clear()
         self._wall_mesh = mesh.copy()
+        # Single-current-mesh state: a triangulated copy with all-wall labels.
+        current = mesh.triangulate()
+        current.cell_data[PATCH_ID] = np.zeros(current.n_cells, dtype=np.int64)
+        self.current_mesh = current
+        self.patch_names = {}
+        self._next_patch_id = 1
         return mesh
 
     @staticmethod
