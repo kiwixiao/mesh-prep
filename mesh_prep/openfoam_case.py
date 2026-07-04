@@ -12,6 +12,7 @@ Mesh pipelines:
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -70,11 +71,18 @@ def _of_val(v: float) -> str:
 # ── Patch classifier ─────────────────────────────────────────────────
 
 def classify_patch(name: str) -> str:
-    """Classify patch name as 'inlet', 'outlet', or 'wall'."""
-    lower = name.lower()
-    if "inlet" in lower:
+    """Classify a patch name as 'inlet', 'outlet', or 'wall'.
+
+    Keywords are matched as whole tokens (split on any non-letter boundary,
+    e.g. digits and underscores), not as substrings, so ``outlet_2`` and
+    ``2_outlet`` classify as outlet while an incidental substring such as
+    ``outletvalve`` does not. Precedence when both appear: inlet > outlet >
+    wall (the default).
+    """
+    tokens = set(re.findall(r"[a-z]+", name.lower()))
+    if "inlet" in tokens:
         return "inlet"
-    if "outlet" in lower:
+    if "outlet" in tokens:
         return "outlet"
     return "wall"
 
@@ -901,8 +909,9 @@ def generate_mesh_dict(
     # inlets/outlets get explicit nLayers 0 so pMesh never adds layers there.
     bl_entries = []
     for name in wall_patches:
+        key = _of_key(name)
         bl_entries.append(
-            f"        {name}\n"
+            f"        {key}\n"
             f"        {{\n"
             f"            nLayers {num_layers};\n"
             f"            thicknessRatio {thickness_ratio};\n"
@@ -911,8 +920,9 @@ def generate_mesh_dict(
             f"        }}"
         )
     for name in non_wall:
+        key = _of_key(name)
         bl_entries.append(
-            f"        {name}\n"
+            f"        {key}\n"
             f"        {{\n"
             f"            nLayers 0;\n"
             f"        }}"
@@ -923,10 +933,11 @@ def generate_mesh_dict(
     rename_entries = []
     for name in patch_names:
         ptype = _patch_type(classify_patch(name))
+        key = _of_key(name)
         rename_entries.append(
-            f"        {name}\n"
+            f"        {key}\n"
             f"        {{\n"
-            f"            newName {name};\n"
+            f"            newName {key};\n"
             f"            type {ptype};\n"
             f"        }}"
         )
@@ -939,8 +950,9 @@ def generate_mesh_dict(
     if wall_cell_size is not None and wall_cell_size < boundary_cell_size:
         refine_entries = []
         for name in wall_patches:
+            key = _of_key(name)
             refine_entries.append(
-                f"        {name}\n"
+                f"        {key}\n"
                 f"        {{\n"
                 f"            cellSize {wall_cell_size};\n"
                 f"        }}"
