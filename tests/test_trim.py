@@ -33,7 +33,6 @@ def _engine_with_quad():
     mesh = pv.PolyData(np.array(pts, float), np.array(faces))
     eng = STLClipperEngine()
     eng.original_mesh = mesh
-    eng._wall_mesh = mesh.copy()
     return eng
 
 
@@ -43,7 +42,7 @@ def test_trim_removes_lassoed_cells():
     result = eng.trim_by_screen_polygon(square, VIEW, VIEWPORT)
     assert result is not None
     assert eng.original_mesh.n_cells == 3
-    assert eng._wall_mesh.n_cells == 3
+    assert eng.current_mesh.n_cells == 3
     assert len(eng._trim_history) == 1
 
 
@@ -77,7 +76,7 @@ def test_undo_restores_previous_mesh():
     assert eng.original_mesh.n_cells == 3
     assert eng.undo_trim() is True
     assert eng.original_mesh.n_cells == 4
-    assert eng._wall_mesh.n_cells == 4
+    assert eng.current_mesh.n_cells == 4
 
 
 def test_undo_multi_level():

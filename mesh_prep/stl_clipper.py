@@ -18,7 +18,6 @@ import sys
 import time
 import types
 from collections import deque
-from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -200,27 +199,6 @@ class OpenFOAMWorker(QThread):
             self.finished_ok.emit()
 
 
-@dataclass
-class ClipDefinition:
-    """Holds a single clipping definition and its extracted cap mesh."""
-    name: str
-    origin: np.ndarray          # cut plane origin (extracted from box face)
-    normal: np.ndarray          # cut plane normal — points toward KEPT side
-    box_planes: list = field(default_factory=list)  # 6 planes as [(normal, point), ...]
-    cap_mesh: Optional[pv.PolyData] = field(default=None, repr=False)
-    color: tuple = (0.9, 0.2, 0.2)
-    cap_kind: str = "closed"    # "closed": cap the cut (CFD); "open": leave a hole
-
-
-@dataclass
-class FilledPatch:
-    """A named cap patch triangulated from an open profile's boundary loop."""
-    name: str
-    cap_mesh: pv.PolyData
-    signature: tuple                       # (n_points, rounded centroid) of the filled loop
-    color: tuple = (0.2, 0.6, 0.9)
-
-
 def _points_in_polygon(xs, ys, polygon):
     """Vectorized even-odd (ray-casting) point-in-polygon test.
 
@@ -280,24 +258,21 @@ class STLClipperEngine:
     """
     Core mesh clipping logic — no Qt dependency.
 
-    Workflow:
+    Workflow (single compounding current_mesh):
         1. load_stl(path)
-        2. add_clip(name, origin, normal)  [repeat]
-        3. recompute_all()
-        4. export_combined_stl(path) or export_separate_stl(dir)
+        2. clip_and_name / cut / delete / fill / smooth / repair  [repeat, undoable]
+        3. export_combined_stl(path) or export_separate_stl(dir)  — one solid per patch_id
     """
 
     def __init__(self):
         self.original_mesh: Optional[pv.PolyData] = None
         self.patch_names: dict[int, str] = {}             # patch_id -> name (0 = wall)
         self._next_patch_id: int = 1
-        self.clips: list[ClipDefinition] = []
-        self._wall_mesh: Optional[pv.PolyData] = None
+        self._patch_normals: dict[int, tuple] = {}        # patch_id -> outward normal (clip-created)
         self._trim_history: deque = deque(maxlen=10)
         self._adj_for_mesh = None
         self._adj_ok = False
         self._feature_curves: list = []   # polylines from cuts (sub-feature A)
-        self.filled_patches: list = []     # named caps from fill_profile (sub-feature D)
         # Flood-select (sub-feature B) cached barrier edge-adjacency
         self._flood_adj_for_mesh = None
         self._flood_adj_n_curves = -1
@@ -322,13 +297,11 @@ class STLClipperEngine:
         mesh = mesh.triangulate()
         mesh.cell_data[PATCH_ID] = np.zeros(mesh.n_cells, dtype=np.int64)
         self.original_mesh = mesh
-        self.clips.clear()
         self._trim_history.clear()
         self._feature_curves.clear()
-        self.filled_patches.clear()
-        self._wall_mesh = mesh.copy()
         self.patch_names = {}
         self._next_patch_id = 1
+        self._patch_normals = {}
         return mesh
 
     @staticmethod
@@ -478,74 +451,110 @@ class STLClipperEngine:
             raise RuntimeError("Clipping produced an empty mesh.")
         return result
 
-    def add_clip(self, name: str, origin: np.ndarray, normal: np.ndarray,
-                 box_planes_data: list = None,
-                 cap_kind: str = "closed") -> ClipDefinition:
-        if cap_kind not in ("closed", "open"):
-            raise ValueError(f"cap_kind must be 'closed' or 'open', got {cap_kind!r}")
-        color = _color_for_name(name)
-        clip_def = ClipDefinition(
-            name=name,
-            origin=np.asarray(origin, dtype=float),
-            normal=np.asarray(normal, dtype=float),
-            box_planes=box_planes_data if box_planes_data else [],
-            color=color,
-            cap_kind=cap_kind,
-        )
-        self.clips.append(clip_def)
-        self.recompute_all()
-        return clip_def
+    def _ensure_labels(self) -> None:
+        """Guarantee current_mesh carries a valid PATCH_ID array (all-wall default)."""
+        m = self.current_mesh
+        if m is not None and (PATCH_ID not in m.cell_data
+                              or len(m.cell_data[PATCH_ID]) != m.n_cells):
+            m.cell_data[PATCH_ID] = np.zeros(m.n_cells, dtype=np.int64)
 
-    def set_cap_kind(self, index: int, cap_kind: str) -> None:
-        """Switch a clip between 'closed' (with cap) and 'open' (no cap)."""
-        if cap_kind not in ("closed", "open"):
-            raise ValueError(f"cap_kind must be 'closed' or 'open', got {cap_kind!r}")
-        if 0 <= index < len(self.clips):
-            self.clips[index].cap_kind = cap_kind
-            self.recompute_all()
+    def _new_patch_id(self, name: str) -> int:
+        pid = self._next_patch_id
+        self.patch_names[pid] = name
+        self._next_patch_id += 1
+        return pid
 
-    def remove_clip(self, index: int):
-        if 0 <= index < len(self.clips):
-            self.clips.pop(index)
-            self.recompute_all()
+    @staticmethod
+    def _merge_labeled(base: pv.PolyData, cap: pv.PolyData, pid: int) -> pv.PolyData:
+        """Merge cap into base keeping PATCH_ID correct. VTK's append drops the
+        cell array when the two inputs carry different array types (e.g. the
+        plane-clipper output), so the labels are assigned explicitly: a merge
+        appends cells in (base, cap) order, letting us concatenate the arrays."""
+        base_ids = np.asarray(base.cell_data[PATCH_ID])
+        merged = base.merge(cap, merge_points=True)
+        labels = np.concatenate([base_ids,
+                                 np.full(cap.n_cells, pid, dtype=np.int64)])
+        if merged.n_cells == len(labels):
+            merged.cell_data[PATCH_ID] = labels
+        else:
+            # A filter changed the cell count — map from a label-true union
+            # (merge_points=False preserves arrays; centroids are identical).
+            union = base.merge(cap, merge_points=False)
+            if PATCH_ID not in union.cell_data or len(union.cell_data[PATCH_ID]) != union.n_cells:
+                union.cell_data[PATCH_ID] = labels[:union.n_cells]
+            merged = STLClipperEngine._carry_labels(merged, union)
+        return merged
 
-    def rename_clip(self, index: int, new_name: str):
-        if 0 <= index < len(self.clips):
-            self.clips[index].name = new_name
-            self.clips[index].color = _color_for_name(new_name)
-
-    def recompute_all(self):
-        """Apply all clips from the original mesh using box-scoped cutting."""
-        if self.original_mesh is None:
+    def clip_and_name(self, name: str, origin, normal, box_planes_data: list = None):
+        """Trim current_mesh by a plane (optionally box-scoped), cap the opening,
+        and label the cap as a new named patch — one compounding step.
+        Returns the new current_mesh, or None on a no-op (miss / empty cap)."""
+        if self.current_mesh is None:
             return None
-        working = self.original_mesh.copy()
-        for clip_def in self.clips:
-            try:
-                if clip_def.box_planes:
-                    working = self.clip_with_box(
-                        working, clip_def.box_planes, clip_def.origin, clip_def.normal
-                    )
-                else:
-                    working = self.clip_with_plane(
-                        working, clip_def.origin, clip_def.normal
-                    )
-                if clip_def.cap_kind == "closed":
-                    clip_def.cap_mesh = self._generate_cap(
-                        self.original_mesh, clip_def.origin, clip_def.normal,
-                        clip_def.box_planes if clip_def.box_planes else None
-                    )
-                else:
-                    # Open profile: leave a hole at the cut, no cap mesh.
-                    clip_def.cap_mesh = None
-            except RuntimeError:
-                clip_def.cap_mesh = pv.PolyData()
-        self._wall_mesh = working
-        return self._wall_mesh
+        self._ensure_labels()
+        origin = np.asarray(origin, dtype=float)
+        normal = np.asarray(normal, dtype=float)
+        try:
+            if box_planes_data:
+                trimmed = self.clip_with_box(self.current_mesh, box_planes_data, origin, normal)
+            else:
+                trimmed = self.clip_with_plane(self.current_mesh, origin, normal)
+        except RuntimeError:
+            return None
+        trimmed = self._carry_labels(trimmed, self.current_mesh)
+        cap = self._generate_cap(self.current_mesh, origin, normal,
+                                 box_planes_data if box_planes_data else None)
+        if cap is None or cap.n_cells == 0:
+            return None
+        cap = cap.triangulate()
+        self._push_history()
+        pid = self._new_patch_id(name)
+        mag = float(np.linalg.norm(normal))
+        if mag > 0:
+            # Outward-pointing (out of the kept domain), matching the old -clip.normal
+            self._patch_normals[pid] = tuple(-normal / mag)
+        self.original_mesh = self._merge_labeled(trimmed, cap, pid)
+        return self.current_mesh
+
+    def rename_patch(self, pid: int, new_name: str) -> bool:
+        if pid in self.patch_names:
+            self.patch_names[pid] = new_name
+            return True
+        return False
+
+    def remove_patch(self, pid: int) -> bool:
+        """Un-name a patch: relabel its faces back to wall (0). Geometry is kept
+        (this is the single-mesh model — use undo to restore geometry)."""
+        if self.current_mesh is None or pid == 0 or pid not in self.patch_names:
+            return False
+        self._ensure_labels()
+        self._push_history()
+        ids = np.asarray(self.current_mesh.cell_data[PATCH_ID]).copy()
+        ids[ids == pid] = 0
+        self.current_mesh.cell_data[PATCH_ID] = ids
+        self.patch_names.pop(pid, None)
+        self._patch_normals.pop(pid, None)
+        return True
+
+    def patches_by_id(self) -> dict:
+        """{patch_id: PolyData} grouping current_mesh faces by PATCH_ID."""
+        out = {}
+        if self.current_mesh is None:
+            return out
+        self._ensure_labels()
+        ids = np.asarray(self.current_mesh.cell_data[PATCH_ID])
+        for pid in np.unique(ids):
+            cells = np.nonzero(ids == pid)[0]
+            out[int(pid)] = self.current_mesh.extract_cells(cells).extract_surface()
+        return out
+
+    def patch_name_for(self, pid: int) -> str:
+        return "wall" if pid == 0 else self.patch_names.get(pid, f"patch_{pid}")
 
     def trim_by_screen_polygon(self, polygon_xy, view_matrix, viewport):
         """Permanently delete cells of original_mesh whose centroid projects
         inside the freehand outline polygon_xy (through-model). Mutates the base
-        mesh and re-applies clips. Returns the new _wall_mesh, or None on a no-op.
+        mesh and re-applies clips. Returns the new current_mesh, or None on a no-op.
 
         polygon_xy : list[(x, y)] display-space points (logical pixels)
         view_matrix: 4x4 array-like, world->clip (camera composite projection)
@@ -568,7 +577,7 @@ class STLClipperEngine:
         self._push_history()
         keep_ids = np.where(~inside)[0]
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
-        return self.recompute_all()
+        return self.current_mesh
 
     def select_cells_in_polygon(self, polygon_xy, view_matrix, viewport,
                                 view_direction, front_only=True):
@@ -680,7 +689,7 @@ class STLClipperEngine:
     def smooth_cells(self, cell_ids, iterations=5, relaxation=0.5):
         """Constrained Laplacian smoothing of the points of the selected cells.
         Points not in any selected cell stay fixed (the patch blends into the rest).
-        Mutates original_mesh, pushes undo history, returns the new _wall_mesh."""
+        Mutates original_mesh, pushes undo history, returns the new current_mesh."""
         if self.original_mesh is None:
             return None
         mesh = self.original_mesh
@@ -738,7 +747,7 @@ class STLClipperEngine:
         smoothed = mesh.copy()
         smoothed.points = pts
         self.original_mesh = smoothed
-        return self.recompute_all()
+        return self.current_mesh
 
     def _barrier_edge_keys(self, mesh):
         """Edge keys (min*n_points + max) for every feature-curve segment, mapped to
@@ -892,17 +901,11 @@ class STLClipperEngine:
         return [(pid, name, int(np.count_nonzero(ids == pid)))
                 for pid, name in sorted(self.patch_names.items())]
 
-    @staticmethod
-    def _profile_signature(edges):
-        """Stable key for a boundary loop: (point count, rounded centroid)."""
-        c = np.asarray(edges.points).mean(axis=0)
-        return (int(edges.n_points), tuple(np.round(c, 6)))
-
     def fill_profile(self, profile_edges, name):
-        """Triangulate an open profile's boundary loop into a named cap patch and
-        append it to filled_patches. Returns the FilledPatch, or None if the edges
-        are empty or cannot be triangulated. Does not modify original_mesh."""
-        if profile_edges is None or profile_edges.n_cells == 0:
+        """Triangulate an open profile's boundary loop into a named cap and merge
+        it into current_mesh (closing the hole). Returns the new current_mesh, or
+        None if the edges are empty or cannot be triangulated."""
+        if self.current_mesh is None or profile_edges is None or profile_edges.n_cells == 0:
             return None
         strip = vtk.vtkStripper()
         strip.SetInputData(profile_edges)
@@ -915,17 +918,17 @@ class STLClipperEngine:
             cap = pv.PolyData(profile_edges.points).delaunay_2d()     # fallback
         if cap is None or cap.n_cells == 0:
             return None
-        patch = FilledPatch(name=name, cap_mesh=cap,
-                            signature=self._profile_signature(profile_edges),
-                            color=_color_for_name(name))
-        self.filled_patches.append(patch)
-        return patch
+        cap = cap.triangulate()
+        self._ensure_labels()
+        self._push_history()
+        pid = self._new_patch_id(name)
+        self.original_mesh = self._merge_labeled(self.current_mesh, cap, pid)
+        return self.current_mesh
 
     def unfilled_open_profiles(self):
-        """Open profiles that have not been filled (matched by signature)."""
-        filled = {fp.signature for fp in self.filled_patches}
-        return [p for p in self.detect_open_profiles()
-                if self._profile_signature(p) not in filled]
+        """Open profiles not yet filled. Filling merges the cap into current_mesh
+        (the hole closes), so every remaining open profile is by definition unfilled."""
+        return self.detect_open_profiles()
 
     def drawable_feature_curves(self):
         """Feature curves that still lie on the CLOSED interior of the surface, i.e.
@@ -975,7 +978,7 @@ class STLClipperEngine:
 
     def delete_cells(self, cell_ids):
         """Permanently delete the given cells from original_mesh (shared undo).
-        Returns the new _wall_mesh, or None on a no-op (no mesh, empty/stale
+        Returns the new current_mesh, or None on a no-op (no mesh, empty/stale
         selection, or a selection covering the whole mesh)."""
         if self.original_mesh is None:
             return None
@@ -986,7 +989,7 @@ class STLClipperEngine:
         self._push_history()
         keep_ids = np.array([i for i in range(n) if i not in ids], dtype=np.int64)
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
-        return self.recompute_all()
+        return self.current_mesh
 
     def cut_by_plane(self, origin, normal):
         """Split the surface along the plane but keep it one connected, still-closed
@@ -1004,12 +1007,12 @@ class STLClipperEngine:
         self._push_history()
         self.original_mesh = a.merge(b, merge_points=True)
         self._feature_curves.append(cut_curve)
-        return self.recompute_all()
+        return self.current_mesh
 
     def cut_by_box(self, box_planes_data):
         """Split the surface along an oriented box's faces, keeping it one closed
         surface; record the cut curve. box_planes_data: list of (normal, point).
-        Returns new _wall_mesh, or None if the box does not intersect the surface."""
+        Returns new current_mesh, or None if the box does not intersect the surface."""
         if self.original_mesh is None or not box_planes_data:
             return None
         planes = vtk.vtkPlanes()
@@ -1042,31 +1045,39 @@ class STLClipperEngine:
         self._push_history()
         self.original_mesh = a.merge(b, merge_points=True)
         self._feature_curves.append(cut_curve)
-        return self.recompute_all()
+        return self.current_mesh
 
     def _push_history(self):
-        """Snapshot the base mesh + feature curves for shared Ctrl+Z undo."""
-        self._trim_history.append((self.original_mesh.copy(), list(self._feature_curves)))
+        """Snapshot the full edit state (mesh with labels, curves, patch registry)
+        for shared Ctrl+Z undo."""
+        self._trim_history.append((self.current_mesh.copy(), list(self._feature_curves),
+                                   dict(self.patch_names), self._next_patch_id,
+                                   dict(self._patch_normals)))
 
     def undo_trim(self) -> bool:
-        """Restore the mesh from before the most recent trim and re-apply clips.
-        Returns True if a state was restored, False if there is no trim history."""
+        """Restore the state from before the most recent operation.
+        Returns True if a state was restored, False if there is no history."""
         if not self._trim_history:
             return False
-        mesh, curves = self._trim_history.pop()
+        mesh, curves, names, next_id, normals = self._trim_history.pop()
         self.original_mesh = mesh
         self._feature_curves = curves
-        self.recompute_all()
+        self.patch_names = names
+        self._next_patch_id = next_id
+        self._patch_normals = normals
         return True
 
     def get_wall_mesh(self) -> Optional[pv.PolyData]:
         return self.current_mesh
 
     def geometry_quality(self) -> dict:
-        """Return geometry quality metrics for the current wall mesh."""
-        wall = self._wall_mesh
+        """Return geometry quality metrics for the current mesh (caps included —
+        they are part of current_mesh in the single-mesh model)."""
+        wall = self.current_mesh
         if wall is None or wall.n_cells == 0:
-            return {"open_edges": 0, "open_profiles": 0, "boundary_mesh": None}
+            return {"open_edges": 0, "open_profiles": 0, "boundary_mesh": None,
+                    "non_manifold_edges": 0, "is_manifold": None,
+                    "non_manifold_mesh": None}
 
         boundary = wall.extract_feature_edges(
             boundary_edges=True, feature_edges=False,
@@ -1080,31 +1091,13 @@ class STLClipperEngine:
         else:
             n_profiles = 0
 
-        # Combined manifold check: wall + all caps, tolerance merge
-        if self.clips:
-            combined = wall.copy()
-            for clip_def in self.clips:
-                if clip_def.cap_mesh and clip_def.cap_mesh.n_cells > 0:
-                    combined = combined.merge(clip_def.cap_mesh)
-            mesh_diag = np.linalg.norm(
-                np.ptp(np.array(wall.bounds).reshape(3, 2), axis=1)
-            )
-            combined = combined.clean(tolerance=mesh_diag * 1e-6)
-
-            non_manifold = combined.extract_feature_edges(
-                boundary_edges=False, feature_edges=False,
-                manifold_edges=False, non_manifold_edges=True,
-            )
-            n_nm = non_manifold.n_cells
-            is_mf = combined.is_manifold
-        else:
-            # No clips yet — check original mesh for defects only
-            non_manifold = wall.extract_feature_edges(
-                boundary_edges=False, feature_edges=False,
-                manifold_edges=False, non_manifold_edges=True,
-            )
-            n_nm = non_manifold.n_cells
-            is_mf = None  # indeterminate without caps
+        non_manifold = wall.extract_feature_edges(
+            boundary_edges=False, feature_edges=False,
+            manifold_edges=False, non_manifold_edges=True,
+        )
+        n_nm = non_manifold.n_cells
+        # Manifoldness only meaningful once openings are named/capped
+        is_mf = wall.is_manifold if self.patch_names else None
 
         return {
             "open_edges": n_open_edges,
@@ -1120,21 +1113,12 @@ class STLClipperEngine:
     # ------------------------------------------------------------------
 
     def _apply_repair(self, repaired_mesh) -> None:
-        """Replace the original mesh with the repaired version and reset all
-        edit-derived state.
-
-        Repair rebuilds the mesh topology, so any pre-repair undo snapshot,
-        feature curve, or filled cap refers to geometry that no longer exists.
-        Keeping them would let Ctrl+Z restore a stale mesh and leave dangling
-        overlays. Mirror load_stl's reset so edit state always matches the
-        current mesh lineage.
-        """
-        self.original_mesh = repaired_mesh
-        self.clips.clear()
-        self._trim_history.clear()
-        self._feature_curves.clear()
-        self.filled_patches.clear()
-        self._wall_mesh = repaired_mesh.copy()
+        """Replace current_mesh with the repaired version. Snapshot-first so
+        repair is undoable like every other operation; patch labels ride the
+        mesh (re-attached by nearest-face mapping if a filter dropped them)."""
+        self._push_history()
+        repaired = repaired_mesh.triangulate()
+        self.original_mesh = self._carry_labels(repaired, self.current_mesh)
 
     def repair_clean(self) -> str:
         """Remove duplicate points and degenerate triangles from original mesh."""
@@ -1228,19 +1212,13 @@ class STLClipperEngine:
         return "\n".join(lines) + "\n"
 
     def export_combined_stl(self, filepath: str, scale_factor: float = 1.0):
-        """Write a single ASCII STL with multiple solid blocks.
-
-        Open-profile clips contribute no cap solid; their boundary is left as
-        an open hole on the wall solid.
-        """
+        """Write a single ASCII STL with one solid block per patch label
+        (named patches first, wall last — solid names become pMesh patch names)."""
+        patches = self.patches_by_id()
         blocks = []
-        for clip_def in self.clips:
-            if clip_def.cap_kind != "closed":
-                continue
-            blocks.append(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name, scale_factor))
-        for patch in self.filled_patches:
-            blocks.append(self._polydata_to_ascii_stl_block(patch.cap_mesh, patch.name, scale_factor))
-        blocks.append(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall", scale_factor))
+        for pid in sorted(patches, key=lambda p: (p == 0, p)):   # named first, wall last
+            blocks.append(self._polydata_to_ascii_stl_block(
+                patches[pid], self.patch_name_for(pid), scale_factor))
         with open(filepath, "w") as f:
             f.write("".join(blocks))
 
@@ -1262,46 +1240,36 @@ class STLClipperEngine:
 
         Returns a dict with face counts and clip categorisation.
         """
-        if self._wall_mesh is None or self._wall_mesh.n_cells == 0:
-            raise RuntimeError("No wall mesh to export.")
+        if self.current_mesh is None or self.current_mesh.n_cells == 0:
+            raise RuntimeError("No mesh to export.")
 
-        # Use vtkAppendPolyData so the result stays a PolyData (merge() can
-        # promote to UnstructuredGrid, which _polydata_to_ascii_stl_block
-        # cannot consume).
-        appender = vtk.vtkAppendPolyData()
-        appender.AddInputData(self._wall_mesh)
-        n_caps = 0
-        for clip_def in self.clips:
-            if clip_def.cap_kind == "closed" \
-                    and clip_def.cap_mesh is not None \
-                    and clip_def.cap_mesh.n_cells > 0:
-                appender.AddInputData(clip_def.cap_mesh)
-                n_caps += 1
-        appender.Update()
-        combined = pv.wrap(appender.GetOutput())
-
+        # current_mesh already includes every cap — it IS the combined surface.
+        combined = self.current_mesh
         block = self._polydata_to_ascii_stl_block(combined, solid_name, scale_factor)
         with open(filepath, "w") as f:
             f.write(block)
 
+        ids = np.asarray(combined.cell_data[PATCH_ID]) if PATCH_ID in combined.cell_data else None
+        n_wall = int(np.count_nonzero(ids == 0)) if ids is not None else int(combined.n_cells)
         return {
             "filepath": filepath,
-            "n_wall_cells": int(self._wall_mesh.n_cells),
-            "n_caps_merged": n_caps,
-            "n_open_clips": sum(1 for c in self.clips if c.cap_kind == "open"),
+            "n_wall_cells": n_wall,
+            "n_caps_merged": len(self.patch_names),
+            "n_open_clips": 0,
             "n_total_cells": int(combined.n_cells),
         }
 
     def export_clip_planes(self, filepath: str):
-        """Save clip plane origins and normals as JSON."""
+        """Save the named-patch registry (and outward normals where known) as JSON."""
         data = {
-            "clips": [
+            "patches": [
                 {
-                    "name": c.name,
-                    "origin": c.origin.tolist(),
-                    "normal": c.normal.tolist(),
+                    "name": name,
+                    "patch_id": pid,
+                    "outward_normal": list(self._patch_normals[pid])
+                    if pid in self._patch_normals else None,
                 }
-                for c in self.clips
+                for pid, name in sorted(self.patch_names.items())
             ]
         }
         with open(filepath, "w") as f:
@@ -1364,14 +1332,24 @@ class STLClipperEngine:
         # 1. Existing export: STL + clip_planes.json
         base_result = self.export_openfoam(case_dir, stl_filename, scale_factor)
 
-        # 2. Collect patch metadata
+        # 2. Collect patch metadata from the label registry
         stl_stem = stl_filename.rsplit(".", 1)[0] if "." in stl_filename else stl_filename
-        patch_names = [c.name for c in self.clips] + ["wall"]
-        inlet_normals = {
-            c.name: tuple(-c.normal)    # Flip to STL/CFD convention: outward-pointing
-            for c in self.clips
-            if "inlet" in c.name.lower()
-        }
+        patch_names = list(self.patch_names.values()) + ["wall"]
+        patches = self.patches_by_id()
+        inlet_normals = {}
+        for pid, name in self.patch_names.items():
+            if openfoam_case.classify_patch(name) != "inlet":
+                continue
+            if pid in self._patch_normals:      # clip-created: exact outward normal
+                inlet_normals[name] = tuple(self._patch_normals[pid])
+            else:                                # fill-created: mean cap normal
+                cap = patches.get(pid)
+                if cap is not None and cap.n_cells > 0:
+                    capn = cap.compute_normals(cell_normals=True, point_normals=False)
+                    nvec = np.asarray(capn.cell_normals).mean(axis=0)
+                    mag = float(np.linalg.norm(nvec))
+                    if mag > 0:
+                        inlet_normals[name] = tuple(nvec / mag)
 
         # 3. Create subdirectories
         dirs = {
@@ -1407,7 +1385,8 @@ class STLClipperEngine:
             ),
             "controlDict": openfoam_case.generate_control_dict(
                 outlet_patches=[
-                    c.name for c in self.clips if "outlet" in c.name.lower()
+                    n for n in self.patch_names.values()
+                    if openfoam_case.classify_patch(n) == "outlet"
                 ],
                 geo_name="",
                 end_time=solver_p.get("endTime", 1.6),
@@ -1527,11 +1506,13 @@ class STLClipperEngine:
 
         clips_data = [
             {
-                "name": c.name,
-                "origin": tuple(float(v) for v in c.origin),
-                "normal": tuple(float(v) for v in c.normal),
+                "name": name,
+                "origin": tuple(float(v) for v in (
+                    patches[pid].center if pid in patches and patches[pid].n_cells > 0
+                    else (0.0, 0.0, 0.0))),
+                "normal": tuple(float(v) for v in self._patch_normals.get(pid, (0.0, 0.0, 1.0))),
             }
-            for c in self.clips
+            for pid, name in sorted(self.patch_names.items())
         ]
         viz_content = openfoam_case.generate_visualize_py(stl_filename, clips_data)
         viz_path = os.path.join(case_dir, "visualize.py")
@@ -1562,25 +1543,13 @@ class STLClipperEngine:
         return written
 
     def export_separate_stl(self, output_dir: str, scale_factor: float = 1.0):
-        """Write one STL file per patch into output_dir.
-
-        Open-profile clips contribute no cap file.  Filled patches (from
-        fill_profile) each produce their own file, mirroring export_combined_stl.
-        """
+        """Write one STL file per patch label into output_dir (wall included)."""
         os.makedirs(output_dir, exist_ok=True)
-        for clip_def in self.clips:
-            if clip_def.cap_kind != "closed":
-                continue
-            path = os.path.join(output_dir, f"{clip_def.name}.stl")
+        for pid, mesh in self.patches_by_id().items():
+            name = self.patch_name_for(pid)
+            path = os.path.join(output_dir, f"{name}.stl")
             with open(path, "w") as f:
-                f.write(self._polydata_to_ascii_stl_block(clip_def.cap_mesh, clip_def.name, scale_factor))
-        for patch in self.filled_patches:
-            path = os.path.join(output_dir, f"{patch.name}.stl")
-            with open(path, "w") as f:
-                f.write(self._polydata_to_ascii_stl_block(patch.cap_mesh, patch.name, scale_factor))
-        wall_path = os.path.join(output_dir, "wall.stl")
-        with open(wall_path, "w") as f:
-            f.write(self._polydata_to_ascii_stl_block(self._wall_mesh, "wall", scale_factor))
+                f.write(self._polydata_to_ascii_stl_block(mesh, name, scale_factor))
 
 
 class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
@@ -2529,21 +2498,22 @@ class STLClipperApp(QMainWindow):
             if w is not None:
                 w.deleteLater()
 
-        if not self.engine.clips:
-            placeholder = QLabel("(no clips — add some on the Clipping tab)")
+        named = self.engine.named_patches()
+        if not named:
+            placeholder = QLabel("(no named patches — clip or fill to create some)")
             placeholder.setStyleSheet("color: #888;")
             self._clip_save_list_layout.addWidget(placeholder)
-            self.btn_save_clipped_stl.setEnabled(False)
+            self.btn_save_clipped_stl.setEnabled(self.engine.current_mesh is not None)
             return
 
         self.btn_save_clipped_stl.setEnabled(True)
 
-        for idx, clip_def in enumerate(self.engine.clips):
+        for pid, name, nfaces in named:
             row_widget = QWidget()
             row = QHBoxLayout(row_widget)
             row.setContentsMargins(0, 0, 0, 0)
 
-            r, g, b = [int(c * 255) for c in clip_def.color]
+            r, g, b = [int(c * 255) for c in _color_for_name(name)]
             swatch = QLabel("  ")
             swatch.setFixedWidth(14)
             swatch.setFixedHeight(14)
@@ -2552,40 +2522,16 @@ class STLClipperApp(QMainWindow):
             )
             row.addWidget(swatch)
 
-            n = clip_def.cap_mesh.n_cells if clip_def.cap_mesh else 0
-            face_info = f"{n:,} cap faces" if clip_def.cap_kind == "closed" else "no cap"
-            lbl = QLabel(f"{clip_def.name}  ({face_info})")
+            lbl = QLabel(f"{name}  ({nfaces:,} cap faces)")
             lbl.setMinimumWidth(180)
             row.addWidget(lbl, stretch=1)
 
-            combo = QComboBox()
-            combo.addItem("Closed (cap)", "closed")
-            combo.addItem("Open (no cap)", "open")
-            combo.setCurrentIndex(0 if clip_def.cap_kind == "closed" else 1)
-            combo.currentIndexChanged.connect(
-                lambda i, _idx=idx: self._on_cap_kind_changed(_idx, i)
-            )
-            self._clip_save_combos.append(combo)
-            row.addWidget(combo)
-
             self._clip_save_list_layout.addWidget(row_widget)
 
-    def _on_cap_kind_changed(self, idx: int, combo_index: int):
-        """Slot for per-clip Open/Closed combo box."""
-        kind = "closed" if combo_index == 0 else "open"
-        if idx < 0 or idx >= len(self.engine.clips):
-            return
-        if self.engine.clips[idx].cap_kind == kind:
-            return
-        self.engine.set_cap_kind(idx, kind)
-        # _refresh_patch_list calls _refresh_clip_save_list internally.
-        self._refresh_patch_list()
-        self._refresh_display()
-
     def _on_save_clipped_stl(self):
-        """File-dialog save of a single-solid STL with current open/closed mix."""
-        if not self.engine.clips:
-            QMessageBox.warning(self, "No Clips", "Add at least one clip first.")
+        """File-dialog save of the current surface as a single-solid STL."""
+        if self.engine.current_mesh is None:
+            QMessageBox.warning(self, "No Mesh", "Load an STL first.")
             return
         default_name = "clipped.stl"
         if self._loaded_filepath:
@@ -2601,21 +2547,18 @@ class STLClipperApp(QMainWindow):
         sf = self._spin_scale_save.value()
         try:
             result = self.engine.export_clipped_surface_stl(filepath, scale_factor=sf)
-            opened = [c.name for c in self.engine.clips if c.cap_kind == "open"]
-            closed = [c.name for c in self.engine.clips if c.cap_kind == "closed"]
+            names = list(self.engine.patch_names.values())
             self._clip_save_status.setText(
                 f"Saved: {os.path.basename(filepath)}  "
                 f"({result['n_total_cells']:,} faces, "
-                f"{result['n_caps_merged']} caps merged, "
-                f"{result['n_open_clips']} open)"
+                f"{result['n_caps_merged']} named patches)"
             )
             QMessageBox.information(
                 self, "Saved",
                 f"Single-solid STL saved to:\n{filepath}\n"
                 f"Scale factor: ×{sf}\n"
                 f"Total faces: {result['n_total_cells']:,}\n\n"
-                f"Open (hole) clips: {', '.join(opened) if opened else 'none'}\n"
-                f"Closed (merged-cap) clips: {', '.join(closed) if closed else 'none'}",
+                f"Named patches: {', '.join(names) if names else 'none'}",
             )
         except Exception as e:
             self._clip_save_status.setText(f"Error: {e}")
@@ -3023,8 +2966,8 @@ class STLClipperApp(QMainWindow):
         return lbl
 
     def _update_button_states(self):
-        has_mesh = self.engine.original_mesh is not None
-        has_clips = len(self.engine.clips) > 0
+        has_mesh = self.engine.current_mesh is not None
+        has_patches = bool(self.engine.patch_names)
         plane_active = self._plane_widget_active
 
         self.btn_add_plane.setEnabled(has_mesh and not plane_active)
@@ -3033,17 +2976,18 @@ class STLClipperApp(QMainWindow):
         self.btn_confirm.setEnabled(self._plane_confirmed)
         self.btn_cancel.setEnabled(plane_active)
         self.btn_flip.setEnabled(plane_active and not self._plane_confirmed)
-        self.btn_rename.setEnabled(has_clips)
-        self.btn_delete.setEnabled(has_clips)
-        has_export = bool(self.engine.clips or self.engine.filled_patches)
+        self.btn_rename.setEnabled(has_patches)
+        self.btn_delete.setEnabled(has_patches)
+        has_export = has_patches
         self.btn_export_foam.setEnabled(has_export)
         self.btn_export_sep.setEnabled(has_export)
         self.btn_export_comb.setEnabled(has_export)
         self.btn_save_of_stl.setEnabled(has_export)
 
         # Centerline buttons
-        has_inlet = any("inlet" in c.name.lower() for c in self.engine.clips)
-        has_outlet = any("outlet" in c.name.lower() for c in self.engine.clips)
+        names = list(self.engine.patch_names.values())
+        has_inlet = any(openfoam_case.classify_patch(n) == "inlet" for n in names)
+        has_outlet = any(openfoam_case.classify_patch(n) == "outlet" for n in names)
         computing = self._centerline_worker is not None and self._centerline_worker.isRunning()
         self.btn_compute_cl.setEnabled(has_inlet and has_outlet and not computing)
         self.btn_clear_cl.setEnabled(self._centerline_mesh is not None)
@@ -3847,7 +3791,7 @@ class STLClipperApp(QMainWindow):
             return
 
         # Suggest a default name
-        existing_names = {c.name for c in self.engine.clips} | {p.name for p in self.engine.filled_patches}
+        existing_names = set(self.engine.patch_names.values())
         if "inlet" not in existing_names:
             default = "inlet"
         else:
@@ -3874,17 +3818,20 @@ class STLClipperApp(QMainWindow):
         if self._current_box_planes_data:
             box_planes_data = [(n.copy(), p.copy()) for n, p in self._current_box_planes_data]
 
-        try:
-            self.engine.add_clip(name, origin, normal, box_planes_data)
-        except RuntimeError as e:
-            QMessageBox.warning(self, "Clip Error", str(e))
+        result = self.engine.clip_and_name(name, origin, normal, box_planes_data)
+        if result is None:
+            QMessageBox.warning(
+                self, "Clip Error",
+                "Clip produced no surface — the plane may not intersect the geometry.")
             return
 
         self._cancel_clip_widgets()
         self._refresh_display()
         self._refresh_patch_list()
+        self._refresh_object_tree()
         self._update_status()
         self._update_button_states()
+        self.status.showMessage(f"Clipped and named patch '{name}'. Ctrl+Z to undo.")
 
     def _on_cut(self):
         if self.engine.original_mesh is None:
@@ -3912,39 +3859,45 @@ class STLClipperApp(QMainWindow):
 
     def _on_rename(self):
         row = self.patch_list.currentRow()
-        if row < 0 or row >= len(self.engine.clips):
+        named = self.engine.named_patches()
+        if row < 0 or row >= len(named):
             return
-        old_name = self.engine.clips[row].name
+        pid, old_name, _ = named[row]
         new_name, ok = QInputDialog.getText(
             self, "Rename Patch", "New name:", text=old_name,
         )
         if not ok or not new_name.strip():
             return
         new_name = new_name.strip()
-        existing = {c.name for i, c in enumerate(self.engine.clips) if i != row}
+        existing = {n for p, n in self.engine.patch_names.items() if p != pid}
         if new_name in existing or new_name == "wall":
             QMessageBox.warning(self, "Duplicate Name", f"'{new_name}' is already used.")
             return
-        self.engine.rename_clip(row, new_name)
+        self.engine.rename_patch(pid, new_name)
         self._centerline_mesh = None  # invalidate — inlet/outlet classification may have changed
         self._refresh_patch_list()
+        self._refresh_object_tree()
         self._refresh_display()
         self._update_status()
 
     def _on_delete(self):
         row = self.patch_list.currentRow()
-        if row < 0 or row >= len(self.engine.clips):
+        named = self.engine.named_patches()
+        if row < 0 or row >= len(named):
             return
-        name = self.engine.clips[row].name
+        pid, name, _ = named[row]
         reply = QMessageBox.question(
-            self, "Delete Clip", f"Remove clip '{name}'?",
+            self, "Remove Patch Name",
+            f"Un-name patch '{name}'? Its faces become wall again "
+            f"(geometry is kept; Ctrl+Z to restore the name).",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            self.engine.remove_clip(row)
-            self._centerline_mesh = None  # invalidate — clip set changed
+            self.engine.remove_patch(pid)
+            self._centerline_mesh = None  # invalidate — patch set changed
             self._refresh_display()
             self._refresh_patch_list()
+            self._refresh_object_tree()
             self._update_status()
             self._update_button_states()
 
@@ -4091,8 +4044,8 @@ class STLClipperApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _edit_enabled(self):
-        """Editing targets the unclipped base mesh (v1)."""
-        return (self.engine.original_mesh is not None) and (not self.engine.clips)
+        """Every operation compounds on the single current mesh."""
+        return self.engine.current_mesh is not None
 
     def _toggle_select_mode(self, checked):
         self._select_mode = checked
@@ -4195,17 +4148,17 @@ class STLClipperApp(QMainWindow):
         """Rebuild the object tree from detected surface entities. Identity-guarded:
         skips recompute when the mesh is unchanged since the last build, so view-only
         refreshes stay free."""
-        mesh = self.engine.current_mesh if self.engine.current_mesh is not None else self.engine.original_mesh
-        npatch = len(self.engine.filled_patches)
-        if mesh is self._tree_mesh and npatch == self._tree_n_patches:
+        mesh = self.engine.current_mesh
+        patch_sig = tuple(sorted(self.engine.patch_names.items()))
+        if mesh is self._tree_mesh and patch_sig == self._tree_n_patches:
             return
         self._tree_mesh = mesh
-        self._tree_n_patches = npatch
+        self._tree_n_patches = patch_sig
         self._active_profile_index = None       # stale once the profile list is rebuilt
         self._tree_profiles = self.engine.unfilled_open_profiles()
         self._tree_nonmanifold = self.engine.detect_nonmanifold_edges()
         self._tree_pieces = self.engine.detect_pieces()
-        self._tree_patches = self.engine.filled_patches
+        self._tree_patches = self.engine.named_patches()
         tree = self._object_tree
         tree.clear()
 
@@ -4239,9 +4192,9 @@ class STLClipperApp(QMainWindow):
         pt = QTreeWidgetItem(tree, ["Named patches"])
         pt.setExpanded(True)
         if self._tree_patches:
-            for i, p in enumerate(self._tree_patches):
-                it = QTreeWidgetItem(pt, [f"{p.name} ({p.cap_mesh.n_cells} faces)"])
-                it.setData(0, Qt.UserRole, ("patch", i))
+            for pid, pname, nfaces in self._tree_patches:
+                it = QTreeWidgetItem(pt, [f"{pname} ({nfaces} faces)"])
+                it.setData(0, Qt.UserRole, ("patch", pid))
         else:
             QTreeWidgetItem(pt, ["(none)"]).setDisabled(True)
 
@@ -4273,10 +4226,12 @@ class STLClipperApp(QMainWindow):
                 f"Piece {index + 1} — {len(cells)} faces selected. Delete faces to remove.")
             self._update_button_states()
         elif kind == "patch":
-            patch = self._tree_patches[index]
-            self.plotter.add_mesh(patch.cap_mesh, color="green", opacity=0.8,
-                                  name="tree_highlight", reset_camera=False)
-            self.status.showMessage(f"Patch '{patch.name}' — {patch.cap_mesh.n_cells} faces.")
+            cap = self.engine.patches_by_id().get(index)   # index carries the patch_id
+            pname = self.engine.patch_name_for(index)
+            if cap is not None and cap.n_cells > 0:
+                self.plotter.add_mesh(cap, color="green", opacity=0.8,
+                                      name="tree_highlight", reset_camera=False)
+                self.status.showMessage(f"Patch '{pname}' — {cap.n_cells} faces.")
         self.plotter.render()
 
     def _clear_selection(self):
@@ -4324,8 +4279,7 @@ class STLClipperApp(QMainWindow):
         if idx is None or not (0 <= idx < len(profiles)):
             self.status.showMessage("Select an open profile in the Objects tree first.")
             return
-        used = ({c.name for c in self.engine.clips}
-                | {p.name for p in self.engine.filled_patches} | {"wall"})
+        used = set(self.engine.patch_names.values()) | {"wall"}
         if "inlet" not in used:
             default = "inlet"
         else:
@@ -4340,14 +4294,16 @@ class STLClipperApp(QMainWindow):
         if name in used:
             QMessageBox.warning(self, "Duplicate Name", f"'{name}' is already used. Choose another.")
             return
-        patch = self.engine.fill_profile(profiles[idx], name)
-        if patch is None:
+        result = self.engine.fill_profile(profiles[idx], name)
+        if result is None:
             self.status.showMessage("Could not fill this profile.")
             return
         self._active_profile_index = None
         self._refresh_display()
         self._refresh_object_tree()
-        self.status.showMessage(f"Filled patch '{name}' ({patch.cap_mesh.n_cells} faces).")
+        self._refresh_patch_list()
+        self._update_button_states()
+        self.status.showMessage(f"Filled patch '{name}'. Ctrl+Z to undo.")
 
     def _on_escape_selection(self):
         if getattr(self, "_twopt_active", False):
@@ -4364,10 +4320,9 @@ class STLClipperApp(QMainWindow):
 
     def _refresh_patch_list(self):
         self.patch_list.clear()
-        for clip_def in self.engine.clips:
-            n = clip_def.cap_mesh.n_cells if clip_def.cap_mesh else 0
-            r, g, b = [int(c * 255) for c in clip_def.color]
-            item = QListWidgetItem(f"{clip_def.name}  ({n:,} faces)")
+        for pid, name, nfaces in self.engine.named_patches():
+            r, g, b = [int(c * 255) for c in _color_for_name(name)]
+            item = QListWidgetItem(f"{name}  ({nfaces:,} faces)")
             item.setForeground(Qt.black)
             item.setBackground(QColor(r, g, b, 60))
             self.patch_list.addItem(item)
@@ -4379,36 +4334,28 @@ class STLClipperApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_compute_centerline(self):
-        """Build capped surface + cap-centroid seeds, launch VMTK."""
-        clips = self.engine.clips
-        inlet_clips = [c for c in clips if "inlet" in c.name.lower()]
-        outlet_clips = [c for c in clips if "outlet" in c.name.lower()]
+        """Seed VMTK from named-patch centroids on the (already capped) current mesh."""
+        capped = self.engine.current_mesh
+        if capped is None or capped.n_cells == 0:
+            return
 
-        if not inlet_clips or not outlet_clips:
+        patches = self.engine.patches_by_id()
+        source_pts, target_pts = [], []
+        for pid, name, _nfaces in self.engine.named_patches():
+            cap = patches.get(pid)
+            if cap is None or cap.n_cells == 0:
+                continue
+            kind = openfoam_case.classify_patch(name)
+            if kind == "inlet":
+                source_pts.extend(list(cap.center))
+            elif kind == "outlet":
+                target_pts.extend(list(cap.center))
+
+        if not source_pts or not target_pts:
             QMessageBox.warning(self, "Centerline Error",
-                                "Need at least one clip named 'inlet' and one named 'outlet'.")
+                                "Need at least one patch named 'inlet' and one named 'outlet'.")
             return
-
-        wall = self.engine.get_wall_mesh()
-        if wall is None or wall.n_cells == 0:
-            return
-
-        # Cap the open wall mesh so VMTK's Voronoi diagram doesn't degenerate
-        capped = wall.copy()
-        for c in clips:
-            if c.cap_mesh is not None and c.cap_mesh.n_cells > 0:
-                capped = capped.merge(c.cap_mesh)
-
-        # Use cap centroids as seeds (guaranteed on surface); fall back to origin
-        source_pts = []
-        for c in inlet_clips:
-            pt = c.cap_mesh.center if (c.cap_mesh is not None and c.cap_mesh.n_cells > 0) else c.origin.tolist()
-            source_pts.extend(list(pt))
-        target_pts = []
-        for c in outlet_clips:
-            pt = c.cap_mesh.center if (c.cap_mesh is not None and c.cap_mesh.n_cells > 0) else c.origin.tolist()
-            target_pts.extend(list(pt))
-        logger.info("Seed points (cap centroids): source=%s, target=%s", source_pts, target_pts)
+        logger.info("Seed points (patch centroids): source=%s, target=%s", source_pts, target_pts)
 
         worker = CenterlineWorker(capped, source_pts, target_pts)
         worker.result_ready.connect(self._on_centerline_finished)
@@ -4483,10 +4430,15 @@ class STLClipperApp(QMainWindow):
         # renders with proper shading.
         self.plotter.enable_lightkit()
 
-        wall = self.engine.get_wall_mesh()
-        if wall is None or wall.n_cells == 0:
+        if self.engine.current_mesh is None or self.engine.current_mesh.n_cells == 0:
             self.plotter.render()
             return
+
+        # Split the single current mesh into wall (patch 0) + named patches
+        patches = self.engine.patches_by_id()
+        wall = patches.get(0)
+        if wall is None or wall.n_cells == 0:
+            wall = self.engine.current_mesh
 
         # Wall mesh — optionally opaque, optionally with surface mesh edges
         show_mesh = self._btn_show_mesh_edges.isChecked()
@@ -4498,13 +4450,14 @@ class STLClipperApp(QMainWindow):
             name="wall", reset_camera=False,
         )
 
-        # Cap patches — name-based colors with white edges for visibility
-        for clip_def in self.engine.clips:
-            if clip_def.cap_mesh and clip_def.cap_mesh.n_cells > 0:
+        # Named patches — name-based colors with white edges for visibility
+        for pid, pname, _nf in self.engine.named_patches():
+            cap = patches.get(pid)
+            if cap is not None and cap.n_cells > 0:
                 self.plotter.add_mesh(
-                    clip_def.cap_mesh, color=clip_def.color, opacity=1.0,
+                    cap, color=_color_for_name(pname), opacity=1.0,
                     show_edges=True, edge_color="white", line_width=2,
-                    name=f"cap_{clip_def.name}", reset_camera=False,
+                    name=f"cap_{pname}", reset_camera=False,
                 )
 
         # Centerline — yellow tube
@@ -4546,11 +4499,6 @@ class STLClipperApp(QMainWindow):
             else:
                 self.plotter.add_mesh(curve, color="cyan", line_width=6,
                                       name=f"feature_curve_{i}", reset_camera=False)
-
-        for i, patch in enumerate(self.engine.filled_patches):
-            if patch.cap_mesh is not None and patch.cap_mesh.n_cells > 0:
-                self.plotter.add_mesh(patch.cap_mesh, color=patch.color,
-                                      name=f"patch_{i}", reset_camera=False)
 
         if fit_camera:
             self.plotter.reset_camera()
@@ -4599,7 +4547,7 @@ class STLClipperApp(QMainWindow):
             self._lbl_non_manifold.setStyleSheet("color: red;")
 
         if is_mf is None:
-            self._lbl_manifold.setText("Manifold: \u2014 (no clips)")
+            self._lbl_manifold.setText("Manifold: \u2014 (no named patches)")
             self._lbl_manifold.setStyleSheet("color: gray;")
         elif is_mf:
             self._lbl_manifold.setText("Manifold: \u2713")
@@ -4669,12 +4617,13 @@ class STLClipperApp(QMainWindow):
         self.plotter.reset_camera()
 
     def _update_status(self):
-        if self.engine.original_mesh is None:
+        if self.engine.current_mesh is None:
             return
-        n = self.engine.original_mesh.n_cells
-        nc = len(self.engine.clips)
-        names = ", ".join(c.name for c in self.engine.clips) if nc else "none"
-        self.status.showMessage(f"Original: {n:,} faces | {nc} clips ({names})")
+        n = self.engine.current_mesh.n_cells
+        names_list = list(self.engine.patch_names.values())
+        names = ", ".join(names_list) if names_list else "none"
+        self.status.showMessage(
+            f"Current mesh: {n:,} faces | {len(names_list)} named patches ({names})")
 
     # ------------------------------------------------------------------
     # Export helpers
@@ -4710,7 +4659,7 @@ class STLClipperApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_export_separate(self):
-        if not (self.engine.clips or self.engine.filled_patches):
+        if not self.engine.patch_names:
             return
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
@@ -4721,7 +4670,7 @@ class STLClipperApp(QMainWindow):
             self.engine.export_separate_stl(sep_dir, scale_factor=sf)
             planes_path = os.path.join(case_dir, "clip_planes.json")
             self.engine.export_clip_planes(planes_path)
-            patch_names = [c.name for c in self.engine.clips] + [p.name for p in self.engine.filled_patches]
+            patch_names = list(self.engine.patch_names.values())
             files = [f"{n}.stl" for n in patch_names] + ["wall.stl"]
             QMessageBox.information(
                 self, "Export Complete",
@@ -4734,7 +4683,7 @@ class STLClipperApp(QMainWindow):
             QMessageBox.critical(self, "Export Error", str(e))
 
     def _on_export_combined(self):
-        if not (self.engine.clips or self.engine.filled_patches):
+        if not self.engine.patch_names:
             return
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
@@ -4745,7 +4694,7 @@ class STLClipperApp(QMainWindow):
             self.engine.export_combined_stl(filepath, scale_factor=sf)
             planes_path = os.path.join(case_dir, "clip_planes.json")
             self.engine.export_clip_planes(planes_path)
-            patch_names = [c.name for c in self.engine.clips] + [p.name for p in self.engine.filled_patches]
+            patch_names = list(self.engine.patch_names.values())
             QMessageBox.information(
                 self, "Export Complete",
                 f"Combined STL saved to:\n{filepath}\n"
@@ -4757,7 +4706,7 @@ class STLClipperApp(QMainWindow):
             QMessageBox.critical(self, "Export Error", str(e))
 
     def _on_save_openfoam_stl(self):
-        if not (self.engine.clips or self.engine.filled_patches):
+        if not self.engine.patch_names:
             return
         default_name = "boundary.stl"
         if self._loaded_filepath:
@@ -4773,7 +4722,7 @@ class STLClipperApp(QMainWindow):
         sf = self._spin_scale.value()
         try:
             self.engine.export_combined_stl(filepath, scale_factor=sf)
-            patch_names = [c.name for c in self.engine.clips] + [p.name for p in self.engine.filled_patches]
+            patch_names = list(self.engine.patch_names.values())
             patches = ", ".join(patch_names) + ", wall"
             QMessageBox.information(
                 self, "Saved",
@@ -4785,7 +4734,7 @@ class STLClipperApp(QMainWindow):
             QMessageBox.critical(self, "Save Error", str(e))
 
     def _on_export_openfoam(self):
-        if not (self.engine.clips or self.engine.filled_patches) or self._loaded_filepath is None:
+        if not self.engine.patch_names or self._loaded_filepath is None:
             return
         case_dir = self._get_or_create_case_dir()
         if not case_dir:
@@ -4837,7 +4786,7 @@ class STLClipperApp(QMainWindow):
             )
             self._last_case_dir = case_dir
             self._run_case_label.setText(f"Case: {case_dir}")
-            patch_names = [c.name for c in self.engine.clips] + [p.name for p in self.engine.filled_patches]
+            patch_names = list(self.engine.patch_names.values())
             patches = ", ".join(patch_names) + ", wall"
             # Summarise generated files by category
             bc_files = [k for k in ("p", "U", "nut", "k", "omega") if k in result]

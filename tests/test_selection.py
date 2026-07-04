@@ -17,7 +17,6 @@ def _two_triangles():
     faces = np.array([3, 0, 1, 2, 3, 3, 4, 5])
     eng = STLClipperEngine()
     eng.original_mesh = pv.PolyData(pts, faces)
-    eng._wall_mesh = eng.original_mesh.copy()
     return eng
 
 
@@ -50,7 +49,6 @@ def test_select_any_vertex_inside_catches_boundary_cell():
     faces = np.array([3, 0, 1, 2])
     eng = STLClipperEngine()
     eng.original_mesh = pv.PolyData(pts, faces)
-    eng._wall_mesh = eng.original_mesh.copy()
     poly = [(0, 0), (30, 0), (30, 30), (0, 30)]
     ids = eng.select_cells_in_polygon(poly, VIEW, VIEWPORT, (0, 0, 1), front_only=False)
     assert ids == [0]   # selected: a vertex is inside even though the centroid is not
@@ -59,7 +57,6 @@ def test_select_any_vertex_inside_catches_boundary_cell():
 def _grid():
     eng = STLClipperEngine()
     eng.original_mesh = pv.Plane(i_resolution=5, j_resolution=5).triangulate()
-    eng._wall_mesh = eng.original_mesh.copy()
     return eng
 
 
@@ -88,7 +85,6 @@ def test_smooth_cells_relaxes_spike_and_leaves_rest_fixed():
     pts[spike, 2] = 1.0
     grid.points = pts
     eng.original_mesh = grid
-    eng._wall_mesh = grid.copy()
 
     sel = list(grid.point_cell_ids(spike))      # cells touching the spike
     movable = set()
@@ -109,7 +105,6 @@ def test_smooth_cells_relaxes_spike_and_leaves_rest_fixed():
 def test_smooth_cells_empty_is_noop():
     eng = STLClipperEngine()
     eng.original_mesh = pv.Plane(i_resolution=3, j_resolution=3).triangulate()
-    eng._wall_mesh = eng.original_mesh.copy()
     assert eng.smooth_cells([], iterations=5) is None
     assert len(eng._trim_history) == 0
 
@@ -154,7 +149,6 @@ def test_smooth_fast_matches_reference_loop():
     p0[spike, 2] = 1.0
     grid.points = p0
     eng.original_mesh = grid.copy()
-    eng._wall_mesh = eng.original_mesh.copy()
     sel = list(grid.point_cell_ids(spike))
 
     rel, iters = 0.5, 5
@@ -194,7 +188,6 @@ def test_delete_cells_removes_and_undo_restores():
     eng = STLClipperEngine()
     grid = pv.Plane(i_resolution=6, j_resolution=6).triangulate()
     eng.original_mesh = grid
-    eng._wall_mesh = grid.copy()
     n0 = grid.n_cells
     sel = [0, 1, 2, 5, 9]
     out = eng.delete_cells(sel)
@@ -208,7 +201,6 @@ def test_delete_cells_removes_and_undo_restores():
 def test_delete_cells_empty_is_noop():
     eng = STLClipperEngine()
     eng.original_mesh = pv.Plane(i_resolution=3, j_resolution=3).triangulate()
-    eng._wall_mesh = eng.original_mesh.copy()
     assert eng.delete_cells([]) is None
     assert len(eng._trim_history) == 0
 
@@ -217,7 +209,6 @@ def test_delete_cells_whole_mesh_is_noop():
     eng = STLClipperEngine()
     grid = pv.Plane(i_resolution=3, j_resolution=3).triangulate()
     eng.original_mesh = grid
-    eng._wall_mesh = grid.copy()
     assert eng.delete_cells(list(range(grid.n_cells))) is None
     assert len(eng._trim_history) == 0
     assert eng.original_mesh.n_cells == grid.n_cells
@@ -232,7 +223,6 @@ def test_cut_by_plane_keeps_surface_closed_and_records_curve():
     eng = STLClipperEngine()
     sph = pv.Sphere(theta_resolution=24, phi_resolution=24)
     eng.original_mesh = sph
-    eng._wall_mesh = sph.copy()
     n0 = sph.n_cells
     assert _n_open(eng.original_mesh) == 0
     out = eng.cut_by_plane((0, 0, 0), (0, 0, 1))
@@ -248,7 +238,6 @@ def test_cut_undo_restores_mesh_and_removes_curve():
     eng = STLClipperEngine()
     sph = pv.Sphere(theta_resolution=20, phi_resolution=20)
     eng.original_mesh = sph
-    eng._wall_mesh = sph.copy()
     n0 = sph.n_cells
     eng.cut_by_plane((0, 0, 0), (0, 0, 1))
     assert eng.undo_trim() is True
@@ -260,7 +249,6 @@ def test_cut_plane_miss_is_noop():
     eng = STLClipperEngine()
     sph = pv.Sphere(radius=1.0)
     eng.original_mesh = sph
-    eng._wall_mesh = sph.copy()
     out = eng.cut_by_plane((0, 0, 100), (0, 0, 1))  # plane outside the sphere -> one side empty
     assert out is None
     assert len(eng._trim_history) == 0
@@ -271,7 +259,6 @@ def test_cut_by_box_keeps_surface_closed_and_records_curve():
     eng = STLClipperEngine()
     sph = pv.Sphere(theta_resolution=24, phi_resolution=24)
     eng.original_mesh = sph
-    eng._wall_mesh = sph.copy()
     n0 = sph.n_cells
     # axis-aligned box cutting through the sphere: 6 planes as (normal, point)
     box = [((1, 0, 0), (0.3, 0, 0)), ((-1, 0, 0), (-0.3, 0, 0)),
@@ -304,7 +291,6 @@ def _sphere_engine(theta=24, phi=24):
     eng = STLClipperEngine()
     sph = pv.Sphere(theta_resolution=theta, phi_resolution=phi)
     eng.original_mesh = sph
-    eng._wall_mesh = sph.copy()
     return eng
 
 
@@ -376,7 +362,6 @@ def test_detect_open_profiles_two_loops():
     eng = STLClipperEngine()
     cyl = pv.Cylinder(radius=1, height=4, resolution=40, capping=True).triangulate()
     eng.original_mesh = cyl
-    eng._wall_mesh = cyl.copy()
     eng.cut_by_plane((0, 0, 1.0), (0, 0, 1))
     eng.cut_by_plane((0, 0, -1.0), (0, 0, 1))
     mid = int(np.where(np.abs(eng.original_mesh.cell_centers().points[:, 2]) < 0.5)[0][0])
@@ -395,7 +380,6 @@ def test_detect_pieces_body_and_stray():
                         np.array([3, 0, 1, 2]))
     combined = sph.merge(stray, merge_points=False)
     eng.original_mesh = combined
-    eng._wall_mesh = combined.copy()
     pieces = eng.detect_pieces()
     assert len(pieces) == 2
     assert sorted(len(p) for p in pieces) == [1, 720]
@@ -419,7 +403,6 @@ def test_detect_nonmanifold_edges():
     pts = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1)], float)
     faces = np.hstack([[3, 0, 1, 2], [3, 0, 1, 3], [3, 0, 1, 4]])   # 3 tris share edge (0,1)
     eng.original_mesh = pv.PolyData(pts, faces)
-    eng._wall_mesh = eng.original_mesh.copy()
     assert len(eng.detect_nonmanifold_edges()) == 1
     assert _sphere_engine().detect_nonmanifold_edges() == []        # clean sphere
 
@@ -455,13 +438,10 @@ def test_fill_profile_caps_the_hole():
     top = _cell_on_side(eng.original_mesh, 2, True)
     eng.delete_cells(eng.flood_select(top))
     prof = eng.detect_open_profiles()[0]
-    patch = eng.fill_profile(prof, "inlet")
-    assert patch is not None
-    assert patch.name == "inlet"
-    assert patch.cap_mesh.n_cells > 0
-    assert len(eng.filled_patches) == 1
-    merged = eng.original_mesh.merge(patch.cap_mesh, merge_points=True)
-    assert _n_open(merged) == 0                       # cap closes the hole
+    out = eng.fill_profile(prof, "inlet")
+    assert out is eng.current_mesh
+    assert eng.patch_names == {1: "inlet"}
+    assert _n_open(eng.current_mesh) == 0             # cap merged in closes the hole
 
 
 def test_unfilled_open_profiles_excludes_filled():
@@ -478,7 +458,7 @@ def test_fill_profile_none_on_empty():
     eng = _sphere_engine()
     assert eng.fill_profile(None, "x") is None
     assert eng.fill_profile(pv.PolyData(), "x") is None
-    assert eng.filled_patches == []
+    assert eng.patch_names == {}
 
 
 def test_load_stl_resets_filled_patches(tmp_path):
@@ -490,9 +470,9 @@ def test_load_stl_resets_filled_patches(tmp_path):
     top = _cell_on_side(eng.original_mesh, 2, True)
     eng.delete_cells(eng.flood_select(top))
     eng.fill_profile(eng.detect_open_profiles()[0], "inlet")
-    assert len(eng.filled_patches) == 1
+    assert eng.patch_names == {1: "inlet"}
     eng.load_stl(str(p1))
-    assert eng.filled_patches == []
+    assert eng.patch_names == {}
 
 
 def test_export_combined_stl_includes_filled_patch(tmp_path):
@@ -535,29 +515,31 @@ def test_auto_repair_no_mesh():
     assert STLClipperEngine().auto_repair() == "No mesh loaded."
 
 
-def test_repair_clears_undo_history_no_stale_restore():
-    # Repair rebuilds the mesh; any pre-repair undo snapshot refers to geometry
-    # that no longer exists. Undo after repair must NOT restore a stale mesh.
+def test_repair_is_undoable():
+    # Single-mesh model: repair snapshots first like every op, so Ctrl+Z after
+    # repair restores the exact pre-repair state (labels ride the snapshot).
     eng = _sphere_engine()
     eng.cut_by_plane((0, 0, 0), (0, 0, 1))
-    assert len(eng._trim_history) == 1
-    assert len(eng._feature_curves) == 1
+    n_before = eng.current_mesh.n_cells
+    hist_before = len(eng._trim_history)
     eng.auto_repair()
-    assert len(eng._trim_history) == 0
-    assert eng._feature_curves == []
-    assert eng.undo_trim() is False          # nothing stale to undo into
+    assert len(eng._trim_history) == hist_before + 1
+    assert eng.undo_trim() is True
+    assert eng.current_mesh.n_cells == n_before
 
 
-def test_repair_clears_filled_patches():
-    # Filled caps belong to the pre-repair mesh; they must not survive repair.
+def test_repair_keeps_named_patches():
+    # Patch labels live on the mesh; repair carries them through clean/normals.
     eng = _sphere_engine()
     eng.cut_by_plane((0, 0, 0), (0, 0, 1))
     top = _cell_on_side(eng.original_mesh, 2, True)
     eng.delete_cells(eng.flood_select(top))
     eng.fill_profile(eng.detect_open_profiles()[0], "inlet")
-    assert len(eng.filled_patches) == 1
+    assert eng.patch_names == {1: "inlet"}
     eng.auto_repair()
-    assert eng.filled_patches == []
+    assert eng.patch_names == {1: "inlet"}
+    from mesh_prep.stl_clipper import PATCH_ID
+    assert 1 in np.unique(eng.current_mesh.cell_data[PATCH_ID])
 
 
 def test_health_stats_keys():
