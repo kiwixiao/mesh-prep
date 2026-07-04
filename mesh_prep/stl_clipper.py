@@ -38,6 +38,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QTreeWidget,
     QTreeWidgetItem,
     QMainWindow,
@@ -535,6 +536,42 @@ class STLClipperEngine:
         self.patch_names.pop(pid, None)
         self._patch_normals.pop(pid, None)
         return True
+
+    def split_patch(self, pid: int):
+        """Split a named patch into its disconnected face components (e.g. a clip
+        cap across a bifurcation). Each component becomes its own patch named
+        ``{name}_1..N``; the parent name is retired; children inherit the parent's
+        outward normal. Relabel-only (no geometry change), one undo step.
+        Returns the list of new patch ids, or None if the patch has fewer than
+        two components (or pid is invalid)."""
+        if self.current_mesh is None or pid == 0 or pid not in self.patch_names:
+            return None
+        self._ensure_labels()
+        ids = np.asarray(self.current_mesh.cell_data[PATCH_ID])
+        cell_idx = np.nonzero(ids == pid)[0]
+        if len(cell_idx) == 0:
+            return None
+        sub = self.current_mesh.extract_cells(cell_idx)
+        conn = sub.connectivity('all')
+        rid = np.asarray(conn.cell_data['RegionId'])
+        regions = np.unique(rid)
+        if len(regions) < 2:
+            return None
+        self._push_history()
+        name = self.patch_names[pid]
+        normal = self._patch_normals.get(pid)
+        new_ids = ids.copy()
+        new_pids = []
+        for k, r in enumerate(regions, start=1):
+            child = self._new_patch_id(f"{name}_{k}")
+            new_ids[cell_idx[rid == r]] = child
+            if normal is not None:
+                self._patch_normals[child] = normal
+            new_pids.append(child)
+        self.current_mesh.cell_data[PATCH_ID] = new_ids
+        self.patch_names.pop(pid, None)
+        self._patch_normals.pop(pid, None)
+        return new_pids
 
     def patches_by_id(self) -> dict:
         """{patch_id: PolyData} grouping current_mesh faces by PATCH_ID."""
@@ -2118,6 +2155,8 @@ class STLClipperApp(QMainWindow):
         self._object_tree = QTreeWidget()
         self._object_tree.setHeaderLabel("Objects")
         self._object_tree.itemClicked.connect(self._on_tree_item_clicked)
+        self._object_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._object_tree.customContextMenuRequested.connect(self._on_tree_context_menu)
 
         # Geometry status (X/Y/Z range + Fit) — pinned to the bottom of the left
         # (Objects) panel. Wrapping the TREE widget is safe; the interactor stays a
@@ -2148,13 +2187,18 @@ class STLClipperApp(QMainWindow):
         splitter.addWidget(_left_pane)
         splitter.addWidget(self.plotter.interactor)
         splitter.addWidget(self._tab_widget)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 4)
-        splitter.setStretchFactor(2, 1)
+        # Side panels keep their content-sized width on window resize (stretch 0);
+        # the viewport absorbs all extra space. Manual dragging still works.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
         splitter.setCollapsible(0, True)
         splitter.setCollapsible(1, False)
         splitter.setCollapsible(2, False)
         layout.addWidget(splitter)
+        self._splitter = splitter
+        # Size the panels to their content once the window has real geometry.
+        QTimer.singleShot(0, self._init_splitter_sizes)
 
         # Status bar
         self.status = QStatusBar()
@@ -3862,44 +3906,14 @@ class STLClipperApp(QMainWindow):
         named = self.engine.named_patches()
         if row < 0 or row >= len(named):
             return
-        pid, old_name, _ = named[row]
-        new_name, ok = QInputDialog.getText(
-            self, "Rename Patch", "New name:", text=old_name,
-        )
-        if not ok or not new_name.strip():
-            return
-        new_name = new_name.strip()
-        existing = {n for p, n in self.engine.patch_names.items() if p != pid}
-        if new_name in existing or new_name == "wall":
-            QMessageBox.warning(self, "Duplicate Name", f"'{new_name}' is already used.")
-            return
-        self.engine.rename_patch(pid, new_name)
-        self._centerline_mesh = None  # invalidate — inlet/outlet classification may have changed
-        self._refresh_patch_list()
-        self._refresh_object_tree()
-        self._refresh_display()
-        self._update_status()
+        self._rename_patch_dialog(named[row][0])
 
     def _on_delete(self):
         row = self.patch_list.currentRow()
         named = self.engine.named_patches()
         if row < 0 or row >= len(named):
             return
-        pid, name, _ = named[row]
-        reply = QMessageBox.question(
-            self, "Remove Patch Name",
-            f"Un-name patch '{name}'? Its faces become wall again "
-            f"(geometry is kept; Ctrl+Z to restore the name).",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply == QMessageBox.Yes:
-            self.engine.remove_patch(pid)
-            self._centerline_mesh = None  # invalidate — patch set changed
-            self._refresh_display()
-            self._refresh_patch_list()
-            self._refresh_object_tree()
-            self._update_status()
-            self._update_button_states()
+        self._remove_patch_by_pid(named[row][0])
 
     # ------------------------------------------------------------------
     # Trim region (freehand lasso)
@@ -4233,6 +4247,105 @@ class STLClipperApp(QMainWindow):
                                       name="tree_highlight", reset_camera=False)
                 self.status.showMessage(f"Patch '{pname}' — {cap.n_cells} faces.")
         self.plotter.render()
+
+    def _init_splitter_sizes(self):
+        """Give each side panel its content-sized width; the viewport gets the rest."""
+        total = self._splitter.width()
+        if total <= 0:
+            return
+        left = max(self._splitter.widget(0).sizeHint().width(), 220)
+        right = max(self._tab_widget.sizeHint().width(), 300)
+        right = min(right, int(total * 0.30))       # never let the panel eat the viewport
+        center = max(total - left - right, 400)
+        self._splitter.setSizes([left, center, right])
+
+    def _on_tree_context_menu(self, pos):
+        """Right-click menu on Objects tree entries. Named patches get
+        Rename / Split disconnected / Remove name; everything gets Highlight."""
+        item = self._object_tree.itemAt(pos)
+        if item is None:
+            return
+        data = item.data(0, Qt.UserRole)
+        if data is None:
+            return
+        kind, index = data
+        menu = QMenu(self._object_tree)
+        act_hl = menu.addAction("Highlight")
+        act_rename = act_split = act_remove = None
+        if kind == "patch":
+            act_rename = menu.addAction("Rename…")
+            act_split = menu.addAction("Split disconnected components")
+            act_remove = menu.addAction("Remove name (faces → wall)")
+        chosen = menu.exec_(self._object_tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_hl:
+            self._on_tree_item_clicked(item, 0)
+        elif chosen is act_rename:
+            self._rename_patch_dialog(index)
+        elif chosen is act_split:
+            self._split_patch_from_tree(index)
+        elif chosen is act_remove:
+            self._remove_patch_by_pid(index)
+
+    def _rename_patch_dialog(self, pid):
+        """Prompt for a new name for patch `pid` and apply it everywhere."""
+        if pid not in self.engine.patch_names:
+            return
+        old_name = self.engine.patch_names[pid]
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Patch", "New name:", text=old_name,
+        )
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        existing = {n for p, n in self.engine.patch_names.items() if p != pid}
+        if new_name in existing or new_name == "wall":
+            QMessageBox.warning(self, "Duplicate Name", f"'{new_name}' is already used.")
+            return
+        self.engine.rename_patch(pid, new_name)
+        self._centerline_mesh = None  # invalidate — inlet/outlet classification may have changed
+        self._refresh_patch_list()
+        self._refresh_object_tree()
+        self._refresh_display()
+        self._update_status()
+
+    def _split_patch_from_tree(self, pid):
+        """Split a patch into its disconnected components (bifurcation case)."""
+        name = self.engine.patch_name_for(pid)
+        new_pids = self.engine.split_patch(pid)
+        if new_pids is None:
+            self.status.showMessage(
+                f"'{name}' is a single connected piece — nothing to split.")
+            return
+        self.plotter.remove_actor("tree_highlight", render=False)
+        self._refresh_display()
+        self._refresh_object_tree()
+        self._refresh_patch_list()
+        self._update_status()
+        self._update_button_states()
+        names = ", ".join(self.engine.patch_names[p] for p in new_pids)
+        self.status.showMessage(
+            f"Split '{name}' into {len(new_pids)}: {names}. "
+            f"Right-click each to rename. Ctrl+Z to undo.")
+
+    def _remove_patch_by_pid(self, pid):
+        """Un-name a patch (faces → wall) after confirmation."""
+        name = self.engine.patch_name_for(pid)
+        reply = QMessageBox.question(
+            self, "Remove Patch Name",
+            f"Un-name patch '{name}'? Its faces become wall again "
+            f"(geometry is kept; Ctrl+Z to restore the name).",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.engine.remove_patch(pid)
+            self._centerline_mesh = None  # invalidate — patch set changed
+            self._refresh_display()
+            self._refresh_patch_list()
+            self._refresh_object_tree()
+            self._update_status()
+            self._update_button_states()
 
     def _clear_selection(self):
         self._selection = set()

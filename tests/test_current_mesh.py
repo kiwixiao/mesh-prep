@@ -112,6 +112,60 @@ def test_export_separate_groups_by_label(tmp_path):
     assert "solid inlet" in (d / "inlet.stl").read_text()
 
 
+def _bifurcation_patch_engine():
+    """Wall sphere + a patch whose faces form TWO disconnected islands
+    (two small spheres), all labeled pid 1 — like a clip cap across a bifurcation."""
+    eng = STLClipperEngine()
+    wall = pv.Sphere(theta_resolution=16, phi_resolution=16).triangulate()
+    left = pv.Sphere(radius=0.2, center=(3, 0, 0), theta_resolution=8, phi_resolution=8).triangulate()
+    right = pv.Sphere(radius=0.2, center=(-3, 0, 0), theta_resolution=8, phi_resolution=8).triangulate()
+    wall.cell_data[PATCH_ID] = np.zeros(wall.n_cells, dtype=np.int64)
+    left.cell_data[PATCH_ID] = np.ones(left.n_cells, dtype=np.int64)
+    right.cell_data[PATCH_ID] = np.ones(right.n_cells, dtype=np.int64)
+    combined = wall.merge(left, merge_points=False).merge(right, merge_points=False)
+    eng.current_mesh = combined
+    eng.patch_names = {1: "inlet"}
+    eng._next_patch_id = 2
+    eng._patch_normals = {1: (0.0, 0.0, -1.0)}
+    return eng, left.n_cells, right.n_cells
+
+
+def test_split_patch_separates_disconnected_components():
+    eng, n_left, n_right = _bifurcation_patch_engine()
+    new_pids = eng.split_patch(1)
+    assert new_pids is not None and len(new_pids) == 2
+    assert 1 not in eng.patch_names                      # parent name retired
+    names = sorted(eng.patch_names.values())
+    assert names == ["inlet_1", "inlet_2"]
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    counts = sorted(int(np.count_nonzero(ids == p)) for p in new_pids)
+    assert counts == sorted([n_left, n_right])           # faces partitioned exactly
+    # children inherit the parent's outward normal
+    assert all(eng._patch_normals.get(p) == (0.0, 0.0, -1.0) for p in new_pids)
+
+
+def test_split_patch_single_component_is_noop():
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))     # one connected cap
+    assert eng.split_patch(1) is None
+    assert eng.patch_names == {1: "inlet"}
+
+
+def test_split_patch_undo_restores_parent():
+    eng, _, _ = _bifurcation_patch_engine()
+    eng.split_patch(1)
+    assert eng.undo_trim() is True
+    assert eng.patch_names == {1: "inlet"}
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    assert set(np.unique(ids)) == {0, 1}
+
+
+def test_split_patch_invalid_pid_is_noop():
+    eng = _labeled_engine()
+    assert eng.split_patch(99) is None
+    assert eng.split_patch(0) is None                     # wall is not splittable
+
+
 def test_remove_patch_relabels_to_wall():
     eng = _labeled_engine()
     eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
