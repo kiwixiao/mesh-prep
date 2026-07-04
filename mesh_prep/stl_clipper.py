@@ -517,6 +517,7 @@ class STLClipperEngine:
 
     def rename_patch(self, pid: int, new_name: str) -> bool:
         if pid in self.patch_names:
+            self._push_history()                 # renames are undoable like any op
             self.patch_names[pid] = new_name
             return True
         return False
@@ -1040,7 +1041,10 @@ class STLClipperEngine:
             boundary_edges=True, feature_edges=False,
             manifold_edges=False, non_manifold_edges=False)
         self._push_history()
-        self.original_mesh = a.merge(b, merge_points=True)
+        # _carry_labels: the two halves' label arrays can be dropped by merge on
+        # array-type mismatch; remap from the pre-cut mesh (still current here).
+        self.original_mesh = self._carry_labels(
+            a.merge(b, merge_points=True), self.current_mesh)
         self._feature_curves.append(cut_curve)
         return self.current_mesh
 
@@ -1078,7 +1082,10 @@ class STLClipperEngine:
             boundary_edges=True, feature_edges=False,
             manifold_edges=False, non_manifold_edges=False)
         self._push_history()
-        self.original_mesh = a.merge(b, merge_points=True)
+        # _carry_labels: the two halves' label arrays can be dropped by merge on
+        # array-type mismatch; remap from the pre-cut mesh (still current here).
+        self.original_mesh = self._carry_labels(
+            a.merge(b, merge_points=True), self.current_mesh)
         self._feature_curves.append(cut_curve)
         return self.current_mesh
 
@@ -3097,9 +3104,12 @@ class STLClipperApp(QMainWindow):
         self._clear_selection()
         self._refresh_display(fit_camera=True)
 
+        self._refresh_patch_list()          # previous file's patches are gone
+        self._refresh_object_tree()
+        self._update_status()
         fname = os.path.basename(filepath)
         n = mesh.n_cells
-        self.status.showMessage(f"Loaded: {fname} | {n:,} faces | 0 clips defined")
+        self.status.showMessage(f"Loaded: {fname} | {n:,} faces")
         self._update_button_states()
 
     # ------------------------------------------------------------------
@@ -3592,8 +3602,11 @@ class STLClipperApp(QMainWindow):
         """Enter two-point plane capture mode: orbit freely, then Shift+click two
         points to define a cut plane parallel to the view direction."""
         if self._twopt_active:
-            self._end_two_point()      # re-entry: restore the real style before re-arming
+            self._end_two_point()      # click while armed = cancel (real toggle)
+            self.status.showMessage("2-Point Plane cancelled.")
+            return
         if self.engine.original_mesh is None:
+            self.btn_two_point_plane.setChecked(False)   # don't look armed when we aren't
             self.status.showMessage("Load an STL first.")
             return
         for btn in (getattr(self, "_btn_select", None), getattr(self, "_btn_trim", None)):
@@ -4074,7 +4087,13 @@ class STLClipperApp(QMainWindow):
         if self.engine.undo_trim():
             self._clear_selection()
             self._refresh_display()
-            self.status.showMessage("Undid last trim.")
+            # The registry may have changed (clip/fill/split/remove undone):
+            # every patch-derived panel must follow.
+            self._refresh_patch_list()
+            self._refresh_object_tree()
+            self._update_status()
+            self._update_button_states()
+            self.status.showMessage("Undid last operation.")
         else:
             self.status.showMessage("Nothing to undo.")
 
@@ -4137,7 +4156,16 @@ class STLClipperApp(QMainWindow):
         picker.PickFromListOn()
         picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
         cid = picker.GetCellId()
-        if cid is None or cid < 0 or cid >= mesh.n_cells:
+        if cid is None or cid < 0:
+            return None
+        # The wall actor shows only the pid-0 subset once patches exist; translate
+        # its cell id back into current_mesh space before anyone consumes it.
+        cmap = getattr(self, "_wall_cell_map", None)
+        if cmap is not None:
+            if cid >= len(cmap):
+                return None
+            cid = int(cmap[cid])
+        if cid >= mesh.n_cells:
             return None
         return int(cid)
 
@@ -4299,11 +4327,15 @@ class STLClipperApp(QMainWindow):
         kind, index = data
         menu = QMenu(self._object_tree)
         act_hl = menu.addAction("Highlight")
-        act_rename = act_split = act_remove = None
+        act_rename = act_split = act_remove = act_fill = act_del_piece = None
         if kind == "patch":
             act_rename = menu.addAction("Rename…")
             act_split = menu.addAction("Split disconnected components")
             act_remove = menu.addAction("Remove name (faces → wall)")
+        elif kind == "profile":
+            act_fill = menu.addAction("Fill as named patch…")
+        elif kind == "piece":
+            act_del_piece = menu.addAction("Delete piece (faces)")
         chosen = menu.exec_(self._object_tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
@@ -4315,6 +4347,28 @@ class STLClipperApp(QMainWindow):
             self._split_patch_from_tree(index)
         elif chosen is act_remove:
             self._remove_patch_by_pid(index)
+        elif chosen is act_fill:
+            self._fill_profile_dialog(index)
+        elif chosen is act_del_piece:
+            self._delete_piece(index)
+
+    def _delete_piece(self, index):
+        """Delete a disconnected piece's faces from the current mesh (undoable)."""
+        pieces = self._tree_pieces
+        if not (0 <= index < len(pieces)):
+            return
+        cells = pieces[index]
+        result = self.engine.delete_cells(cells)
+        if result is None:
+            self.status.showMessage(
+                "Cannot delete this piece (it may be the whole mesh).")
+            return
+        self._clear_selection()
+        self._refresh_display()
+        self._refresh_object_tree()
+        self._update_status()
+        self.status.showMessage(
+            f"Deleted piece ({len(cells)} faces). Ctrl+Z to undo.")
 
     def _rename_patch_dialog(self, pid):
         """Prompt for a new name for patch `pid` and apply it everywhere."""
@@ -4412,13 +4466,22 @@ class STLClipperApp(QMainWindow):
 
     def _on_fill_profile(self):
         """Fill the open profile selected in the Objects tree into a named patch."""
-        if self.engine.original_mesh is None:
+        idx = self._active_profile_index
+        if idx is None:
+            self.status.showMessage("Select an open profile in the Objects tree first.")
+            return
+        self._fill_profile_dialog(idx)
+
+    def _fill_profile_dialog(self, idx):
+        """Prompt for a patch name and fill open profile `idx` (shared by the
+        right-panel Fill button and the tree's right-click menu)."""
+        if self.engine.current_mesh is None:
             self.status.showMessage("Load an STL first.")
             return
-        idx = self._active_profile_index
         profiles = self._tree_profiles
-        if idx is None or not (0 <= idx < len(profiles)):
-            self.status.showMessage("Select an open profile in the Objects tree first.")
+        if not (0 <= idx < len(profiles)):
+            self.status.showMessage("That open profile is stale — refreshing the tree.")
+            self._refresh_object_tree()
             return
         used = set(self.engine.patch_names.values()) | {"wall"}
         if "inlet" not in used:
@@ -4578,8 +4641,19 @@ class STLClipperApp(QMainWindow):
         # Split the single current mesh into wall (patch 0) + named patches
         patches = self.engine.patches_by_id()
         wall = patches.get(0)
+        self._wall_cell_map = None       # subset-actor cell id -> current_mesh cell id
         if wall is None or wall.n_cells == 0:
             wall = self.engine.current_mesh
+        elif wall.n_cells != self.engine.current_mesh.n_cells:
+            ids = np.asarray(self.engine.current_mesh.cell_data[PATCH_ID])
+            wall_idx = np.nonzero(ids == 0)[0]
+            if "vtkOriginalCellIds" in wall.cell_data:
+                # extract_surface may reorder; its original-ids array indexes into
+                # the extract_cells order, which is wall_idx's order.
+                sub = np.asarray(wall.cell_data["vtkOriginalCellIds"])
+                self._wall_cell_map = wall_idx[sub]
+            else:
+                self._wall_cell_map = wall_idx
 
         # Wall mesh — optionally opaque, optionally with surface mesh edges
         show_mesh = self._btn_show_mesh_edges.isChecked()
@@ -4625,8 +4699,8 @@ class STLClipperApp(QMainWindow):
         # the curve pokes out from the surface — coincident thin lines z-fight with
         # the opaque wall and are invisible.
         wall_bounds = self.engine.original_mesh.bounds if self.engine.original_mesh is not None else None
-        tube_r = 0.003 * float(np.linalg.norm(
-            np.array(wall_bounds[1::2]) - np.array(wall_bounds[0::2]))) if wall_bounds else 0.3
+        tube_r = 0.001 * float(np.linalg.norm(
+            np.array(wall_bounds[1::2]) - np.array(wall_bounds[0::2]))) if wall_bounds else 0.1
         for i, curve in enumerate(self.engine.drawable_feature_curves()):
             if curve is None or curve.n_cells == 0:
                 continue
@@ -4638,7 +4712,7 @@ class STLClipperApp(QMainWindow):
                 self.plotter.add_mesh(tube, color="cyan", name=f"feature_curve_{i}",
                                       reset_camera=False)
             else:
-                self.plotter.add_mesh(curve, color="cyan", line_width=6,
+                self.plotter.add_mesh(curve, color="cyan", line_width=2,
                                       name=f"feature_curve_{i}", reset_camera=False)
 
         if fit_camera:

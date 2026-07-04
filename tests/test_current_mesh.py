@@ -183,6 +183,44 @@ def test_split_patch_invalid_pid_is_noop():
     assert eng.split_patch(0) is None                     # wall is not splittable
 
 
+def test_wall_subset_original_ids_map_back_to_wall_faces():
+    # The viewport draws the pid-0 subset; the picker maps its cell ids back to
+    # current_mesh via vtkOriginalCellIds. Verify that mapping is exact.
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    wall_idx = np.nonzero(ids == 0)[0]
+    wall = eng.patches_by_id()[0]
+    assert "vtkOriginalCellIds" in wall.cell_data
+    sub = np.asarray(wall.cell_data["vtkOriginalCellIds"])
+    mapped = wall_idx[sub]
+    assert np.all(ids[mapped] == 0)                      # all map to wall faces
+    c_sub = wall.cell_centers().points
+    c_full = eng.current_mesh.cell_centers().points[mapped]
+    assert np.allclose(c_sub, c_full, atol=1e-9)          # same physical faces
+
+
+def test_rename_patch_is_undoable():
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
+    eng.rename_patch(1, "outlet_left")
+    assert eng.patch_names[1] == "outlet_left"
+    assert eng.undo_trim() is True
+    assert eng.patch_names[1] == "inlet"
+
+
+def test_cut_by_plane_preserves_labels():
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0.3), (0, 0, -1))   # named patch exists
+    n_named = int(np.count_nonzero(
+        np.asarray(eng.current_mesh.cell_data[PATCH_ID]) == 1))
+    assert n_named > 0
+    eng.cut_by_plane((0, 0, -0.2), (0, 0, 1))             # cut elsewhere
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    assert len(ids) == eng.current_mesh.n_cells
+    assert int(np.count_nonzero(ids == 1)) >= n_named     # patch survived the cut
+
+
 def test_remove_patch_relabels_to_wall():
     eng = _labeled_engine()
     eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
