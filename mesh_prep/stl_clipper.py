@@ -4974,7 +4974,19 @@ class STLClipperApp(QMainWindow):
         if not case_dir:
             return
         sf = self._spin_scale.value()
-        filepath = os.path.join(case_dir, "boundary.stl")
+        default_name = "boundary.stl"
+        if self._loaded_filepath:
+            stem = os.path.splitext(os.path.basename(self._loaded_filepath))[0]
+            default_name = f"{stem}_boundary.stl"
+        name, ok = QInputDialog.getText(
+            self, "Combined STL Name", "File name:", text=default_name,
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if not name.lower().endswith(".stl"):
+            name += ".stl"
+        filepath = os.path.join(case_dir, name)
         try:
             self.engine.export_combined_stl(filepath, scale_factor=sf)
             planes_path = os.path.join(case_dir, "clip_planes.json")
