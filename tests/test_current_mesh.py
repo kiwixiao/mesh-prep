@@ -66,6 +66,23 @@ def test_clip_and_name_trims_and_labels():
     assert len(eng._trim_history) == 1                        # one undo step
 
 
+def test_clip_and_name_cap_is_on_plane_and_connected():
+    # Order-sensitive guard: the faces labeled as the cap must actually BE the
+    # cap — flat on the cut plane and one connected region. Catches any merge
+    # cell-reordering that scatters labels onto wall faces.
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
+    m = eng.current_mesh
+    ids = np.asarray(m.cell_data[PATCH_ID])
+    cap_idx = np.nonzero(ids == 1)[0]
+    assert len(cap_idx) > 0
+    centers = m.cell_centers().points[cap_idx]
+    assert np.abs(centers[:, 2]).max() < 1e-6          # flat on z=0 plane
+    sub = m.extract_cells(cap_idx)
+    rid = np.asarray(sub.connectivity('all').cell_data['RegionId'])
+    assert len(np.unique(rid)) == 1                     # one connected disc
+
+
 def test_clip_and_name_undo_restores_everything():
     eng = _labeled_engine()
     n0 = eng.current_mesh.n_cells

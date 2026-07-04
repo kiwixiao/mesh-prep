@@ -467,22 +467,20 @@ class STLClipperEngine:
 
     @staticmethod
     def _merge_labeled(base: pv.PolyData, cap: pv.PolyData, pid: int) -> pv.PolyData:
-        """Merge cap into base keeping PATCH_ID correct. VTK's append drops the
-        cell array when the two inputs carry different array types (e.g. the
-        plane-clipper output), so the labels are assigned explicitly: a merge
-        appends cells in (base, cap) order, letting us concatenate the arrays."""
-        base_ids = np.asarray(base.cell_data[PATCH_ID])
+        """Merge cap into base keeping PATCH_ID attached to the right faces.
+
+        Never assumes anything about merged cell order (pyvista's merge appends
+        (other, base) — the opposite of intuition). Instead both inputs get
+        type-identical int64 label arrays BEFORE merging, which VTK then
+        preserves per-cell. (The array was only ever dropped when types differed,
+        e.g. the plane-clipper's output vs a fresh numpy array.)"""
+        base.cell_data[PATCH_ID] = np.asarray(base.cell_data[PATCH_ID], dtype=np.int64)
+        cap.cell_data[PATCH_ID] = np.full(cap.n_cells, pid, dtype=np.int64)
         merged = base.merge(cap, merge_points=True)
-        labels = np.concatenate([base_ids,
-                                 np.full(cap.n_cells, pid, dtype=np.int64)])
-        if merged.n_cells == len(labels):
-            merged.cell_data[PATCH_ID] = labels
-        else:
-            # A filter changed the cell count — map from a label-true union
-            # (merge_points=False preserves arrays; centroids are identical).
+        if PATCH_ID not in merged.cell_data or len(merged.cell_data[PATCH_ID]) != merged.n_cells:
+            # Order-independent fallback: map by nearest cell centroid from a
+            # plain append union, which preserves both label arrays.
             union = base.merge(cap, merge_points=False)
-            if PATCH_ID not in union.cell_data or len(union.cell_data[PATCH_ID]) != union.n_cells:
-                union.cell_data[PATCH_ID] = labels[:union.n_cells]
             merged = STLClipperEngine._carry_labels(merged, union)
         return merged
 
@@ -1788,6 +1786,7 @@ class STLClipperApp(QMainWindow):
         panel.addWidget(self.btn_add_plane)
 
         self.btn_two_point_plane = QPushButton("◪ 2-Point Plane")
+        self.btn_two_point_plane.setCheckable(True)   # stays pressed while capture mode is armed
         self.btn_two_point_plane.setToolTip(
             "Shift+click two points in the viewer to define a cut plane along your line of sight")
         self.btn_two_point_plane.clicked.connect(self._on_two_point_plane)
@@ -3587,7 +3586,10 @@ class STLClipperApp(QMainWindow):
         self._twopt_saved_style = iren.style or iren.interactor.GetInteractorStyle()
         self._twopt_style = _TwoPointStyle(self)
         iren.style = self._twopt_style
-        self.status.showMessage("Shift+click two points to define the cut plane (Esc to cancel).")
+        self.btn_two_point_plane.setChecked(True)
+        self.status.showMessage(
+            "2-Point Plane armed: Shift+click the FIRST point on the surface "
+            "(then a second; Esc cancels).")
 
     def _screen_to_focal_world(self, x, y):
         """Back-project display pixel (x, y) onto the camera focal plane -> world xyz.
@@ -3628,6 +3630,8 @@ class STLClipperApp(QMainWindow):
         """Exit two-point capture: clear state + marker, restore the trackball style."""
         self._twopt_active = False
         self._twopt_first = None
+        if hasattr(self, "btn_two_point_plane"):
+            self.btn_two_point_plane.setChecked(False)
         self.plotter.remove_actor("twopt_marker", render=False)
         if getattr(self, "_twopt_saved_style", None) is not None:
             self.plotter.iren.style = self._twopt_saved_style
@@ -4243,8 +4247,11 @@ class STLClipperApp(QMainWindow):
             cap = self.engine.patches_by_id().get(index)   # index carries the patch_id
             pname = self.engine.patch_name_for(index)
             if cap is not None and cap.n_cells > 0:
-                self.plotter.add_mesh(cap, color="green", opacity=0.8,
-                                      name="tree_highlight", reset_camera=False)
+                # Wireframe overlay: a solid highlight would z-fight with the
+                # already-drawn colored cap (identical faces) and look broken.
+                self.plotter.add_mesh(cap, color="yellow", style="wireframe",
+                                      line_width=4, name="tree_highlight",
+                                      reset_camera=False)
                 self.status.showMessage(f"Patch '{pname}' — {cap.n_cells} faces.")
         self.plotter.render()
 
