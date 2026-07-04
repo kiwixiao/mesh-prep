@@ -281,6 +281,37 @@ def test_check_normals_no_mesh():
     assert r["outward"] is None
 
 
+def test_faces_on_edges_finds_nonmanifold_fan():
+    # 3 triangles share edge (0,1) — all three attach to the non-manifold group.
+    eng = STLClipperEngine()
+    pts = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1)], float)
+    faces = np.hstack([[3, 0, 1, 2], [3, 0, 1, 3], [3, 0, 1, 4]])
+    eng.current_mesh = pv.PolyData(pts, faces)
+    grp = eng.detect_nonmanifold_edges()[0]
+    assert eng.faces_on_edges(grp) == [0, 1, 2]
+
+
+def test_remesh_patch_rebuilds_cap_and_stays_closed():
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
+    out = eng.remesh_patch(1)
+    assert out is eng.current_mesh
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    assert int(np.count_nonzero(ids == 1)) > 0            # cap still labeled
+    assert eng.patch_names == {1: "inlet"}                # same name kept
+    boundary = eng.current_mesh.extract_feature_edges(
+        boundary_edges=True, feature_edges=False,
+        manifold_edges=False, non_manifold_edges=False)
+    assert boundary.n_cells == 0                           # still watertight
+    assert eng.undo_trim() is True                         # undoable
+
+
+def test_remesh_patch_invalid_pid_is_noop():
+    eng = _labeled_engine()
+    assert eng.remesh_patch(0) is None
+    assert eng.remesh_patch(99) is None
+
+
 def test_remove_patch_relabels_to_wall():
     eng = _labeled_engine()
     eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))

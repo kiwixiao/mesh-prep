@@ -572,6 +572,63 @@ class STLClipperEngine:
         self._patch_normals.pop(pid, None)
         return new_pids
 
+    def faces_on_edges(self, edges) -> list:
+        """Cell ids of current_mesh faces that use both endpoints of any edge in
+        `edges` (a PolyData of line cells, e.g. one non-manifold group)."""
+        m = self.current_mesh
+        if m is None or edges is None or edges.n_cells == 0:
+            return []
+        b = np.asarray(m.bounds, dtype=float)
+        diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+        tol = 1e-6 * diag if diag > 0 else 1e-6
+        pts = np.asarray(edges.points)
+        pid = np.empty(edges.n_points, dtype=np.int64)
+        ok = np.zeros(edges.n_points, dtype=bool)
+        for i in range(edges.n_points):
+            j = int(m.find_closest_point(pts[i]))
+            pid[i] = j
+            ok[i] = float(np.linalg.norm(pts[i] - m.points[j])) <= tol
+        out = set()
+        for seg in edges.lines.reshape(-1, 3):
+            i0, i1 = int(seg[1]), int(seg[2])
+            if ok[i0] and ok[i1]:
+                c0 = {int(c) for c in m.point_cell_ids(int(pid[i0]))}
+                c1 = {int(c) for c in m.point_cell_ids(int(pid[i1]))}
+                out |= (c0 & c1)
+        return sorted(out)
+
+    def remesh_patch(self, pid: int):
+        """Replace a cap patch's triangulation with a constrained-Delaunay one
+        built on its rim (well-shaped triangles instead of a sliver fan).
+        Relabels with the same patch id/name; one undo step. Returns the new
+        current_mesh, or None if the patch is missing or triangulation fails."""
+        if self.current_mesh is None or pid == 0 or pid not in self.patch_names:
+            return None
+        self._ensure_labels()
+        ids = np.asarray(self.current_mesh.cell_data[PATCH_ID])
+        cell_idx = np.nonzero(ids == pid)[0]
+        if len(cell_idx) == 0:
+            return None
+        cap = self.current_mesh.extract_cells(cell_idx).extract_surface()
+        rim = cap.extract_feature_edges(
+            boundary_edges=True, feature_edges=False,
+            manifold_edges=False, non_manifold_edges=False)
+        if rim.n_cells == 0:
+            return None
+        try:
+            new_cap = rim.delaunay_2d(edge_source=rim)
+        except Exception:
+            new_cap = None
+        if new_cap is None or new_cap.n_cells == 0:
+            return None
+        new_cap = new_cap.triangulate()
+        self._push_history()
+        keep = np.nonzero(ids != pid)[0]
+        base = self.current_mesh.extract_cells(keep).extract_surface()
+        base = self._carry_labels(base, self.current_mesh)
+        self.original_mesh = self._merge_labeled(base, new_cap, pid)
+        return self.current_mesh
+
     def patches_by_id(self) -> dict:
         """{patch_id: PolyData} grouping current_mesh faces by PATCH_ID."""
         out = {}
@@ -2231,7 +2288,16 @@ class STLClipperApp(QMainWindow):
         _geom_lay.addWidget(self._lbl_bounds_x)
         _geom_lay.addWidget(self._lbl_bounds_y)
         _geom_lay.addWidget(self._lbl_bounds_z)
-        _geom_lay.addWidget(self._lbl_normals)      # normal-orientation health
+        _nrm_row = QHBoxLayout()                     # normal health + quick fix
+        _nrm_row.addWidget(self._lbl_normals, 1)
+        self._btn_fix_normals_quick = QPushButton("Fix")
+        self._btn_fix_normals_quick.setFixedWidth(44)
+        self._btn_fix_normals_quick.setToolTip(
+            "Fix Normals (consistent winding) — same as the Repair tab button")
+        self._btn_fix_normals_quick.clicked.connect(self._on_repair_normals)
+        self._btn_fix_normals_quick.setVisible(False)
+        _nrm_row.addWidget(self._btn_fix_normals_quick)
+        _geom_lay.addLayout(_nrm_row)
         _geom_lay.addWidget(self.btn_zoom_fit)
 
         _left_pane = QWidget()
@@ -4379,14 +4445,18 @@ class STLClipperApp(QMainWindow):
         menu = QMenu(self._object_tree)
         act_hl = menu.addAction("Highlight")
         act_rename = act_split = act_remove = act_fill = act_del_piece = None
+        act_remesh = act_del_nm = None
         if kind == "patch":
             act_rename = menu.addAction("Rename…")
             act_split = menu.addAction("Split disconnected components")
+            act_remesh = menu.addAction("Remesh (smoother cap)")
             act_remove = menu.addAction("Remove name (faces → wall)")
         elif kind == "profile":
             act_fill = menu.addAction("Fill as named patch…")
         elif kind == "piece":
             act_del_piece = menu.addAction("Delete piece (faces)")
+        elif kind == "nonmanifold":
+            act_del_nm = menu.addAction("Delete attached faces")
         chosen = menu.exec_(self._object_tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
@@ -4402,6 +4472,45 @@ class STLClipperApp(QMainWindow):
             self._fill_profile_dialog(index)
         elif chosen is act_del_piece:
             self._delete_piece(index)
+        elif chosen is act_remesh:
+            self._remesh_patch_from_tree(index)
+        elif chosen is act_del_nm:
+            self._delete_nonmanifold_group(index)
+
+    def _remesh_patch_from_tree(self, pid):
+        """Rebuild a cap patch with well-shaped triangles (constrained Delaunay)."""
+        name = self.engine.patch_name_for(pid)
+        out = self.engine.remesh_patch(pid)
+        if out is None:
+            self.status.showMessage(
+                f"Could not remesh '{name}' (needs a rim to triangulate).")
+            return
+        self.plotter.remove_actor("tree_highlight", render=False)
+        self._refresh_display()
+        self._refresh_object_tree()
+        self._refresh_patch_list()
+        self._update_status()
+        self.status.showMessage(f"Remeshed '{name}'. Ctrl+Z to undo.")
+
+    def _delete_nonmanifold_group(self, index):
+        """Delete the faces attached to one non-manifold edge group (undoable)."""
+        groups = self._tree_nonmanifold
+        if not (0 <= index < len(groups)):
+            return
+        cells = self.engine.faces_on_edges(groups[index])
+        if not cells:
+            self.status.showMessage("No faces found on those edges.")
+            return
+        result = self.engine.delete_cells(cells)
+        if result is None:
+            self.status.showMessage("Cannot delete those faces (would empty the mesh).")
+            return
+        self._clear_selection()
+        self._refresh_display()
+        self._refresh_object_tree()
+        self._update_status()
+        self.status.showMessage(
+            f"Deleted {len(cells)} faces on non-manifold edges. Ctrl+Z to undo.")
 
     def _delete_piece(self, index):
         """Delete a disconnected piece's faces from the current mesh (undoable)."""
@@ -4830,6 +4939,9 @@ class STLClipperApp(QMainWindow):
         else:
             self._lbl_normals.setText("Normals: \u2713 consistent (open surface)")
             self._lbl_normals.setStyleSheet("color: green;")
+        if hasattr(self, "_btn_fix_normals_quick"):
+            self._btn_fix_normals_quick.setVisible(
+                nrm["consistent"] is False or nrm["outward"] is False)
 
         if is_mf is None:
             self._lbl_manifold.setText("Manifold: \u2014 (no named patches)")
