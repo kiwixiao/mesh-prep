@@ -35,3 +35,11 @@ def test_named_patches_reports_labeled_faces():
     eng.current_mesh = sph
     eng.patch_names = {1: "inlet"}
     assert eng.named_patches() == [(1, "inlet", 10)]
+
+
+def test_get_wall_mesh_returns_current(tmp_path):
+    p = tmp_path / "s.stl"
+    pv.Sphere(theta_resolution=16, phi_resolution=16).save(str(p))
+    eng = STLClipperEngine()
+    eng.load_stl(str(p))
+    assert eng.get_wall_mesh() is eng.current_mesh

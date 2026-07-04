@@ -1060,7 +1060,7 @@ class STLClipperEngine:
         return True
 
     def get_wall_mesh(self) -> Optional[pv.PolyData]:
-        return self._wall_mesh
+        return self.current_mesh
 
     def geometry_quality(self) -> dict:
         """Return geometry quality metrics for the current wall mesh."""
