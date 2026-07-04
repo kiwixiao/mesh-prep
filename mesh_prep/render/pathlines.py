@@ -206,46 +206,9 @@ cell2point.CellDataArraytoprocess = ["U"]
 # Flatten multi-block to single dataset for ParticleTracer compatibility
 vol_merged = MergeBlocks(Input=cell2point)
 
-# Match wall points to volume mesh point IDs client-side (one-time cost).
-# Wall geometry is static — point IDs in the merged volume mesh are consistent
-# across timesteps, so we compute the mapping once and embed only the IDs.
-print("Matching wall points to volume mesh point IDs ...")
-wall_merged = MergeBlocks(Input=foam_wall)
-wall_merged.UpdatePipeline(timesteps[0])
-vol_merged.UpdatePipeline(timesteps[0])
-from paraview.servermanager import Fetch as _smFetch
-_wall_local = _smFetch(wall_merged)
-_vol_local = _smFetch(vol_merged)
-
-# Build a coordinate-rounded lookup set from wall points, then scan volume points
-_wall_set = set()
-for _i in range(_wall_local.GetNumberOfPoints()):
-    _p = _wall_local.GetPoint(_i)
-    _wall_set.add((round(_p[0], 8), round(_p[1], 8), round(_p[2], 8)))
-
-_wall_vol_ids = []
-for _i in range(_vol_local.GetNumberOfPoints()):
-    _p = _vol_local.GetPoint(_i)
-    if (round(_p[0], 8), round(_p[1], 8), round(_p[2], 8)) in _wall_set:
-        _wall_vol_ids.append(_i)
-
-print(f"  Wall points: {len(_wall_set)}, matched volume IDs: {len(_wall_vol_ids)}")
-
-# ProgrammableFilter: zero wall-boundary velocities to prevent particle escape.
-# CellDatatoPointData extrapolates cell-center velocities to boundary vertices,
-# creating spurious outward vectors at the wall. The matching was done above;
-# this filter just zeros the U array at pre-computed point IDs each timestep.
-wall_vel_filter = ProgrammableFilter(Input=vol_merged)
-wall_vel_filter.Script = """
-inp = self.GetInputDataObject(0, 0)
-out = self.GetOutputDataObject(0)
-out.DeepCopy(inp)
-"""
-wall_vel_filter.CopyArrays = 1
-
 # ParticleTracer with custom source — seed from actual inlet patch mesh points
 particle_tracer = ParticleTracer(
-    Input=wall_vel_filter,
+    Input=vol_merged,
     SeedSource=inlet_seeds,
 )
 particle_tracer.SelectInputVectors = ["POINTS", "U"]
