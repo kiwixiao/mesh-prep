@@ -1696,6 +1696,7 @@ class STLClipperApp(QMainWindow):
 
         self.engine = STLClipperEngine()
         self._loaded_filepath = None
+        self.setAcceptDrops(True)   # drag & drop an .stl anywhere on the window
         self._plane_widget_active = False       # plane widget on screen
         self._constraint_box_active = False     # optional constraint box on screen
         self._current_plane_origin = None       # from plane widget callback
@@ -2834,6 +2835,21 @@ class STLClipperApp(QMainWindow):
             return True
         worker.blockSignals(True)   # emissions can no longer reach the dying window
         return worker.wait(timeout_ms)
+
+    def dragEnterEvent(self, event):
+        """Accept drags carrying at least one local .stl file (whole window,
+        viewport included — unhandled child drags propagate up to here)."""
+        if any(u.isLocalFile() and u.toLocalFile().lower().endswith(".stl")
+               for u in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """Load the first dropped .stl through the same path as the Load button."""
+        for u in event.mimeData().urls():
+            if u.isLocalFile() and u.toLocalFile().lower().endswith(".stl"):
+                event.acceptProposedAction()
+                self._load_file(u.toLocalFile())
+                return
 
     def closeEvent(self, event):
         """Prompt if solver is running before closing."""
