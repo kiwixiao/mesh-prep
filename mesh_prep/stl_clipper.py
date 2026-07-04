@@ -1756,6 +1756,11 @@ class STLClipperApp(QMainWindow):
 
         # 3D viewport
         self.plotter = QtInteractor(central)
+        # pyvistaqt's interactor has its own file-drop handler that add_mesh()es
+        # the file directly (default light-blue, bypassing the engine entirely).
+        # Disable it so viewport drops bubble up to the window's dropEvent and
+        # load through engine.load_stl like everywhere else.
+        self.plotter.interactor.setAcceptDrops(False)
         self.plotter.set_background("black")
         self.plotter.enable_parallel_projection()
         # Interactive axes gizmo in the corner: click a face/arrow to snap to that
