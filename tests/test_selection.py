@@ -560,6 +560,22 @@ def test_drawable_feature_curves_excludes_deleted_side():
     assert eng.drawable_feature_curves() == []          # no longer interior -> not drawn
 
 
+def test_drawable_feature_curves_trims_floating_segments():
+    # Trim a notch through part of the seam: the floating piece of the curve
+    # must disappear while the rest of the curve stays visible.
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    n_full = eng._feature_curves[0].n_cells
+    c = eng.original_mesh.cell_centers().points
+    near = [int(i) for i in
+            np.where(np.linalg.norm(c - np.array([0.5, 0.0, 0.0]), axis=1) < 0.25)[0]]
+    assert near                                  # the notch overlaps the seam
+    eng.delete_cells(near)
+    drawn = eng.drawable_feature_curves()
+    assert len(drawn) == 1
+    assert 0 < drawn[0].n_cells < n_full          # trimmed, not gone / not full
+
+
 def test_drawable_feature_curves_excludes_floating():
     eng = _sphere_engine()
     eng.cut_by_plane((0, 0, 0), (0, 0, 1))

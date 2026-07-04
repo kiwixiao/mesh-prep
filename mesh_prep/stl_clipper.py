@@ -998,18 +998,24 @@ class STLClipperEngine:
                 j = int(m.find_closest_point(pts[i]))
                 pid[i] = j
                 ok[i] = float(np.linalg.norm(pts[i] - m.points[j])) <= tol
-            interior = total = 0
-            for seg in cur.lines.reshape(-1, 3):
+            # Per-SEGMENT filter: keep exactly the pieces still on interior
+            # surface. An all-or-nothing threshold left whole curves floating
+            # over trimmed-away regions (or hid valid remainders).
+            keep = []
+            for ci, seg in enumerate(cur.lines.reshape(-1, 3)):
                 i0, i1 = int(seg[1]), int(seg[2])
-                total += 1
                 if ok[i0] and ok[i1]:
                     u, v = int(pid[i0]), int(pid[i1])
                     if u != v:
                         a, bb = (u, v) if u < v else (v, u)
                         if share.get(a * n_points + bb, 0) == 2:
-                            interior += 1
-            if total > 0 and interior / total >= 0.5:      # still mostly an interior feature
+                            keep.append(ci)
+            if not keep:
+                continue
+            if len(keep) == cur.n_cells:
                 out.append(cur)
+            else:
+                out.append(cur.extract_cells(keep).extract_surface())
         return out
 
     def delete_cells(self, cell_ids):
