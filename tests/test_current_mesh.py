@@ -221,6 +221,20 @@ def test_cut_by_plane_preserves_labels():
     assert int(np.count_nonzero(ids == 1)) >= n_named     # patch survived the cut
 
 
+def test_export_clip_planes_has_normal_and_center(tmp_path):
+    import json
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))      # keep +z, cap at z=0
+    out = tmp_path / "clip_planes.json"
+    eng.export_clip_planes(str(out))
+    data = json.loads(out.read_text())
+    (p,) = data["patches"]
+    assert p["name"] == "inlet"
+    assert np.allclose(p["outward_normal"], (0, 0, -1))    # out of the kept domain
+    assert p["center"] is not None
+    assert abs(p["center"][2]) < 1e-6                      # cap centroid on z=0 plane
+
+
 def test_remove_patch_relabels_to_wall():
     eng = _labeled_engine()
     eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))

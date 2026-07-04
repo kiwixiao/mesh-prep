@@ -1308,20 +1308,24 @@ class STLClipperEngine:
         }
 
     def export_clip_planes(self, filepath: str):
-        """Save the named-patch registry (and outward normals where known) as JSON."""
-        data = {
-            "patches": [
-                {
-                    "name": name,
-                    "patch_id": pid,
-                    "outward_normal": list(self._patch_normals[pid])
-                    if pid in self._patch_normals else None,
-                }
-                for pid, name in sorted(self.patch_names.items())
-            ]
-        }
+        """Save the named-patch registry as JSON: name, patch_id, outward normal
+        (exact clip-plane normal for clip-created patches, null for filled ones)
+        and the cap centroid as center."""
+        patches = self.patches_by_id()
+        entries = []
+        for pid, name in sorted(self.patch_names.items()):
+            cap = patches.get(pid)
+            center = (list(float(v) for v in cap.center)
+                      if cap is not None and cap.n_cells > 0 else None)
+            entries.append({
+                "name": name,
+                "patch_id": pid,
+                "outward_normal": list(self._patch_normals[pid])
+                if pid in self._patch_normals else None,
+                "center": center,
+            })
         with open(filepath, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump({"patches": entries}, f, indent=2)
 
     def export_openfoam(self, case_dir: str, stl_filename: str, scale_factor: float = 1.0) -> dict:
         """
