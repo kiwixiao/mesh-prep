@@ -15,3 +15,23 @@ def test_load_stl_initializes_current_mesh_labels(tmp_path):
     assert np.all(eng.current_mesh.cell_data[PATCH_ID] == 0)   # all wall initially
     assert eng.patch_names == {}
     assert eng._next_patch_id == 1
+
+
+def test_detection_follows_current_mesh():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=24, phi_resolution=24).triangulate()
+    eng.current_mesh = sph                          # aliases original_mesh during migration
+    eng.current_mesh.cell_data[PATCH_ID] = np.zeros(sph.n_cells, dtype=np.int64)
+    assert len(eng.detect_pieces()) == 1            # one watertight component
+    assert eng.detect_open_profiles() == []         # sphere is watertight
+
+
+def test_named_patches_reports_labeled_faces():
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=16, phi_resolution=16).triangulate()
+    ids = np.zeros(sph.n_cells, dtype=np.int64)
+    ids[:10] = 1
+    sph.cell_data[PATCH_ID] = ids
+    eng.current_mesh = sph
+    eng.patch_names = {1: "inlet"}
+    assert eng.named_patches() == [(1, "inlet", 10)]

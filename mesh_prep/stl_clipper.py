@@ -289,7 +289,6 @@ class STLClipperEngine:
 
     def __init__(self):
         self.original_mesh: Optional[pv.PolyData] = None
-        self.current_mesh: Optional[pv.PolyData] = None   # single source of truth (migration)
         self.patch_names: dict[int, str] = {}             # patch_id -> name (0 = wall)
         self._next_patch_id: int = 1
         self.clips: list[ClipDefinition] = []
@@ -305,20 +304,29 @@ class STLClipperEngine:
         self._flood_adj = None
         self._flood_ok = False
 
+    @property
+    def current_mesh(self):
+        """The single working surface. Aliases original_mesh during the migration;
+        Task 9 renames the field and drops the alias."""
+        return self.original_mesh
+
+    @current_mesh.setter
+    def current_mesh(self, mesh):
+        self.original_mesh = mesh
+
     def load_stl(self, filepath: str) -> pv.PolyData:
         mesh = pv.read(filepath)
         if not isinstance(mesh, pv.PolyData):
             raise ValueError(f"Expected PolyData, got {type(mesh).__name__}")
+        # Single working surface: triangulated, all-wall labels (0).
+        mesh = mesh.triangulate()
+        mesh.cell_data[PATCH_ID] = np.zeros(mesh.n_cells, dtype=np.int64)
         self.original_mesh = mesh
         self.clips.clear()
         self._trim_history.clear()
         self._feature_curves.clear()
         self.filled_patches.clear()
         self._wall_mesh = mesh.copy()
-        # Single-current-mesh state: a triangulated copy with all-wall labels.
-        current = mesh.triangulate()
-        current.cell_data[PATCH_ID] = np.zeros(current.n_cells, dtype=np.int64)
-        self.current_mesh = current
         self.patch_names = {}
         self._next_patch_id = 1
         return mesh
@@ -849,7 +857,7 @@ class STLClipperEngine:
     def detect_open_profiles(self):
         """List of boundary-edge loops (open profiles / holes), one pv.PolyData per
         connected loop. [] if watertight or no mesh."""
-        m = self.original_mesh
+        m = self.current_mesh if self.current_mesh is not None else self.original_mesh
         if m is None:
             return []
         edges = m.extract_feature_edges(boundary_edges=True, feature_edges=False,
@@ -859,7 +867,7 @@ class STLClipperEngine:
     def detect_nonmanifold_edges(self):
         """List of non-manifold edge groups (edges shared by >2 faces), one
         pv.PolyData per connected group. [] if none or no mesh."""
-        m = self.original_mesh
+        m = self.current_mesh if self.current_mesh is not None else self.original_mesh
         if m is None:
             return []
         edges = m.extract_feature_edges(boundary_edges=False, feature_edges=False,
@@ -868,13 +876,21 @@ class STLClipperEngine:
 
     def detect_pieces(self):
         """List of connected components; each entry is a sorted list of cell ids into
-        original_mesh. [] if no mesh. Single watertight body -> one entry."""
-        m = self.original_mesh
+        current_mesh. [] if no mesh. Single watertight body -> one entry."""
+        m = self.current_mesh if self.current_mesh is not None else self.original_mesh
         if m is None:
             return []
         conn = m.connectivity('all')
         rid = np.asarray(conn.cell_data['RegionId'])
         return [sorted(int(c) for c in np.nonzero(rid == r)[0]) for r in np.unique(rid)]
+
+    def named_patches(self):
+        """(patch_id, name, face_count) for each named patch present on current_mesh."""
+        if self.current_mesh is None or PATCH_ID not in self.current_mesh.cell_data:
+            return []
+        ids = np.asarray(self.current_mesh.cell_data[PATCH_ID])
+        return [(pid, name, int(np.count_nonzero(ids == pid)))
+                for pid, name in sorted(self.patch_names.items())]
 
     @staticmethod
     def _profile_signature(edges):
@@ -4179,7 +4195,7 @@ class STLClipperApp(QMainWindow):
         """Rebuild the object tree from detected surface entities. Identity-guarded:
         skips recompute when the mesh is unchanged since the last build, so view-only
         refreshes stay free."""
-        mesh = self.engine.original_mesh
+        mesh = self.engine.current_mesh if self.engine.current_mesh is not None else self.engine.original_mesh
         npatch = len(self.engine.filled_patches)
         if mesh is self._tree_mesh and npatch == self._tree_n_patches:
             return
