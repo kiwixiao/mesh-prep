@@ -1278,17 +1278,30 @@ class STLClipperEngine:
         self._apply_repair(repaired)
         return f"Cleaned: {before} \u2192 {after} faces ({before - after} removed)"
 
+    def _is_closed(self) -> bool:
+        m = self.current_mesh
+        if m is None or m.n_cells == 0:
+            return False
+        boundary = m.extract_feature_edges(
+            boundary_edges=True, feature_edges=False,
+            manifold_edges=False, non_manifold_edges=False)
+        return boundary.n_cells == 0
+
     def repair_normals(self) -> str:
-        """Fix inconsistent face normals on original mesh."""
+        """Fix face-normal winding: consistent everywhere, and auto-oriented
+        OUTWARD when the surface is closed (auto-orient is undefined on open
+        surfaces, so it is only applied when watertight)."""
         if self.original_mesh is None:
             return "No mesh loaded."
+        orient = self._is_closed()
         repaired = self.original_mesh.compute_normals(
             cell_normals=False, point_normals=True,
             split_vertices=False, consistent_normals=True,
-            auto_orient_normals=False,
+            auto_orient_normals=orient,
         )
         self._apply_repair(repaired)
-        return "Normals fixed (consistent winding)"
+        return ("Normals fixed (consistent winding, oriented outward)"
+                if orient else "Normals fixed (consistent winding)")
 
     def _health_stats(self):
         """Mesh health snapshot for the auto-repair summary."""
@@ -1309,7 +1322,7 @@ class STLClipperEngine:
         m = self.original_mesh.clean()
         m = m.compute_normals(cell_normals=False, point_normals=True,
                               split_vertices=False, consistent_normals=True,
-                              auto_orient_normals=False)
+                              auto_orient_normals=self._is_closed())
         self._apply_repair(m)
         after = self._health_stats()
         return ("Auto-repair — "
@@ -2781,7 +2794,10 @@ class STLClipperApp(QMainWindow):
         tab4_widget = QWidget()
         tab4 = QVBoxLayout(tab4_widget)
         scroll.setWidget(tab4_widget)
-        self._tab_widget.addTab(scroll, "Run OpenFOAM (Beta)")
+        # Tab intentionally NOT added: solver runs are out of scope for now.
+        # Widgets are still built because export handlers update _run_case_label
+        # and the worker plumbing stays valid. Re-enable by restoring addTab.
+        # self._tab_widget.addTab(scroll, "Run OpenFOAM (Beta)")
 
         tab4.addWidget(QLabel("Run Docker pipeline from the app."))
 

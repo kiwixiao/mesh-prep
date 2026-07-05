@@ -267,6 +267,22 @@ def test_check_normals_inverted_sphere_inward():
     assert r["outward"] is False
 
 
+def test_repair_normals_fixes_inward_closed_surface():
+    # Fix Normals must also auto-orient OUTWARD on a closed surface — the
+    # status/[Fix] button flags 'consistent but INWARD', so the repair has to
+    # actually cure it.
+    eng = STLClipperEngine()
+    sph = pv.Sphere(theta_resolution=16, phi_resolution=16).triangulate()
+    inv = _flip_some_faces(sph, sph.n_cells)               # fully inverted
+    inv.cell_data[PATCH_ID] = np.zeros(inv.n_cells, dtype=np.int64)
+    eng.current_mesh = inv
+    assert eng.check_normals()["outward"] is False
+    eng.repair_normals()
+    r = eng.check_normals()
+    assert r["consistent"] is True
+    assert r["outward"] is True
+
+
 def test_check_normals_open_surface_orientation_unknown():
     eng = _labeled_engine()
     eng.delete_cells(list(range(20)))                      # open a hole
