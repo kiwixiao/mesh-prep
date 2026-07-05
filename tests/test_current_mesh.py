@@ -306,6 +306,19 @@ def test_remesh_patch_rebuilds_cap_and_stays_closed():
     assert eng.undo_trim() is True                         # undoable
 
 
+def test_remesh_patch_preserves_area_and_bounds():
+    # Remesh must ONLY retriangulate: total surface area and bounding box of
+    # the whole mesh stay identical (no extension, no shrinkage) — whether the
+    # remesh is applied or rejected.
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
+    area0 = float(eng.current_mesh.area)
+    bounds0 = np.asarray(eng.current_mesh.bounds)
+    eng.remesh_patch(1)                                   # applied or declined
+    assert abs(float(eng.current_mesh.area) - area0) < 0.01 * area0
+    assert np.allclose(np.asarray(eng.current_mesh.bounds), bounds0, atol=1e-9)
+
+
 def test_remesh_patch_invalid_pid_is_noop():
     eng = _labeled_engine()
     assert eng.remesh_patch(0) is None

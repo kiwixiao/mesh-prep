@@ -622,6 +622,13 @@ class STLClipperEngine:
         if new_cap is None or new_cap.n_cells == 0:
             return None
         new_cap = new_cap.triangulate()
+        # Retriangulation must cover EXACTLY the same surface — same rim, same
+        # area. If the Delaunay constraint failed on a concave rim, VTK falls
+        # back to the convex hull, which would ADD surface beyond the original
+        # boundary. Reject rather than extend the mesh.
+        old_area = float(cap.area)
+        if old_area > 0 and abs(float(new_cap.area) - old_area) > 0.01 * old_area:
+            return None
         self._push_history()
         keep = np.nonzero(ids != pid)[0]
         base = self.current_mesh.extract_cells(keep).extract_surface()
