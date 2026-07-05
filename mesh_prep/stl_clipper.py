@@ -1303,6 +1303,60 @@ class STLClipperEngine:
         return ("Normals fixed (consistent winding, oriented outward)"
                 if orient else "Normals fixed (consistent winding)")
 
+    def repair_fill_pinholes(self, max_radius: float) -> str:
+        """Fill small holes (boundary loops) up to max_radius via vtkFillHolesFilter.
+        Intended for tiny scan defects — named openings should be larger than the
+        radius so they stay open. Undoable; labels re-carried (new fill triangles
+        inherit the nearest face's patch)."""
+        if self.original_mesh is None:
+            return "No mesh loaded."
+        before = len(self.detect_open_profiles())
+        if before == 0:
+            return "No open profiles — nothing to fill."
+        f = vtk.vtkFillHolesFilter()
+        f.SetInputData(self.current_mesh)
+        f.SetHoleSize(float(max_radius))
+        f.Update()
+        out = pv.wrap(f.GetOutput())
+        if out is None or out.n_cells == 0:
+            return "Fill pinholes produced nothing — no change."
+        out = out.triangulate()
+        # New fill triangles can come out with arbitrary winding; re-consist.
+        out = out.compute_normals(cell_normals=False, point_normals=True,
+                                  split_vertices=False, consistent_normals=True,
+                                  auto_orient_normals=False)
+        self._apply_repair(out)
+        after = len(self.detect_open_profiles())
+        return f"Pinholes filled: open profiles {before} → {after}"
+
+    def repair_make_watertight(self) -> str:
+        """MeshFix (pymeshfix): close ALL holes, remove self-intersections and
+        non-manifold geometry, keep the largest component. Use BEFORE clipping —
+        it will also fill named inlet/outlet openings. Undoable."""
+        if self.original_mesh is None:
+            return "No mesh loaded."
+        try:
+            import pymeshfix
+        except ImportError:
+            return ("pymeshfix is not installed — run: "
+                    "conda run -n mesh-prep pip install pymeshfix")
+        before = self._health_stats()
+        try:
+            mf = pymeshfix.MeshFix(self.current_mesh.triangulate())
+            mf.repair()
+            out = mf.mesh
+        except Exception as e:
+            return f"MeshFix failed: {e}"
+        if out is None or out.n_cells == 0:
+            return "MeshFix produced an empty mesh — no change."
+        self._apply_repair(out)
+        after = self._health_stats()
+        return ("MeshFix — "
+                f"faces {before['cells']}→{after['cells']}, "
+                f"open {before['open']}→{after['open']}, "
+                f"non-manifold {before['nm']}→{after['nm']}, "
+                f"pieces {before['pieces']}→{after['pieces']}")
+
     def _health_stats(self):
         """Mesh health snapshot for the auto-repair summary."""
         m = self.original_mesh
@@ -2781,6 +2835,29 @@ class STLClipperApp(QMainWindow):
         self._btn_auto_repair.clicked.connect(self._on_auto_repair)
         tab3.addWidget(self._btn_auto_repair)
 
+        pin_row = QHBoxLayout()
+        self._btn_fill_pinholes = QPushButton("Fill Pinholes")
+        self._btn_fill_pinholes.setToolTip(
+            "Fill small holes up to the given size (tiny scan defects). "
+            "Named openings larger than the size stay open.")
+        self._btn_fill_pinholes.clicked.connect(self._on_fill_pinholes)
+        pin_row.addWidget(self._btn_fill_pinholes)
+        self._spin_pinhole_pct = QDoubleSpinBox()
+        self._spin_pinhole_pct.setRange(0.1, 50.0)
+        self._spin_pinhole_pct.setValue(2.0)
+        self._spin_pinhole_pct.setSuffix(" % of size")
+        self._spin_pinhole_pct.setToolTip("Max hole size as % of the bounding-box diagonal")
+        pin_row.addWidget(self._spin_pinhole_pct)
+        tab3.addLayout(pin_row)
+
+        self._btn_watertight = QPushButton("Make Watertight (MeshFix)")
+        self._btn_watertight.setToolTip(
+            "pymeshfix: close ALL holes, remove self-intersections/non-manifold "
+            "geometry, keep the largest component. Use BEFORE clipping \u2014 it also "
+            "fills named inlet/outlet openings.")
+        self._btn_watertight.clicked.connect(self._on_make_watertight)
+        tab3.addWidget(self._btn_watertight)
+
         self._lbl_repair_status = QLabel("Status: \u2014")
         tab3.addWidget(self._lbl_repair_status)
 
@@ -3034,6 +3111,43 @@ class STLClipperApp(QMainWindow):
         self._refresh_patch_list()
         self._refresh_display()
         self._update_button_states()
+
+    def _on_fill_pinholes(self):
+        if self.engine.current_mesh is None:
+            return
+        b = np.asarray(self.engine.current_mesh.bounds, dtype=float)
+        diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+        radius = diag * self._spin_pinhole_pct.value() / 100.0
+        msg = self.engine.repair_fill_pinholes(radius)
+        self._lbl_repair_status.setText(msg)
+        self._centerline_mesh = None
+        self._refresh_patch_list()
+        self._refresh_object_tree()
+        self._refresh_display()
+        self._update_button_states()
+        self.status.showMessage(f"{msg} Ctrl+Z to undo.")
+
+    def _on_make_watertight(self):
+        if self.engine.current_mesh is None:
+            return
+        if self.engine.patch_names:
+            reply = QMessageBox.question(
+                self, "MeshFix Warning",
+                "MeshFix fills ALL openings — including your named inlet/outlet "
+                "patches — and keeps only the largest piece. It is meant to run "
+                "BEFORE clipping.\n\nRun anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        msg = self.engine.repair_make_watertight()
+        self._lbl_repair_status.setText(msg)
+        self._centerline_mesh = None
+        self._refresh_patch_list()
+        self._refresh_object_tree()
+        self._refresh_display()
+        self._update_button_states()
+        self.status.showMessage(f"{msg} Ctrl+Z to undo.")
 
     def _on_auto_repair(self):
         msg = self.engine.auto_repair()

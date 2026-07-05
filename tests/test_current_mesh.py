@@ -291,6 +291,36 @@ def test_check_normals_open_surface_orientation_unknown():
     assert r["outward"] is None                            # not closed -> undefined
 
 
+def test_fill_pinholes_closes_small_hole_keeps_named_opening():
+    import pytest
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))       # named cap on z=0
+    # punch a tiny pinhole: remove ONE wall face
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    wall_face = int(np.nonzero(ids == 0)[0][0])
+    eng.delete_cells([wall_face])
+    assert len(eng.detect_open_profiles()) == 1
+    # radius: small — bigger than the pinhole, far smaller than the inlet
+    msg = eng.repair_fill_pinholes(0.05)
+    assert "open profiles 1 → 0" in msg
+    assert len(eng.detect_open_profiles()) == 0
+    assert eng.patch_names == {1: "inlet"}                  # registry intact
+    assert eng.undo_trim() is True                          # undoable
+
+
+def test_make_watertight_closes_open_sphere():
+    import pytest
+    pytest.importorskip("pymeshfix")
+    eng = _labeled_engine()
+    eng.delete_cells(list(range(40)))                       # tear a hole
+    assert len(eng.detect_open_profiles()) >= 1
+    msg = eng.repair_make_watertight()
+    assert msg.startswith("MeshFix")
+    assert len(eng.detect_open_profiles()) == 0             # watertight again
+    assert PATCH_ID in eng.current_mesh.cell_data           # labels re-carried
+    assert eng.undo_trim() is True
+
+
 def test_check_normals_no_mesh():
     r = STLClipperEngine().check_normals()
     assert r["consistent"] is None

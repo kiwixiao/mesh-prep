@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 centerline = ["vmtk"]
 run = ["matplotlib"]
+repair = ["pymeshfix"]
 
 [project.scripts]
 mesh-prep = "mesh_prep.stl_clipper:main"
