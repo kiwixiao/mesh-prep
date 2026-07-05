@@ -62,7 +62,7 @@ conda install -y -c conda-forge vmtk -q
 # ---------- Install mesh-prep + GUI deps via pip ----------
 echo ""
 echo "Installing pyvista, pyvistaqt, and mesh-prep..."
-pip install pyvista qtpy PyQt5 -q
+pip install pyvista qtpy PyQt5 scipy pymeshfix -q
 pip install pyvistaqt --no-deps -q
 pip install -e "$SCRIPT_DIR" -q
 
@@ -71,7 +71,7 @@ echo ""
 echo "Verifying dependencies..."
 deps_ok=true
 
-for dep in numpy pyvista vtk PyQt5 pyvistaqt vmtk; do
+for dep in numpy pyvista vtk PyQt5 pyvistaqt vmtk scipy pymeshfix; do
     mod=$dep
     case $dep in
         PyQt5) mod="PyQt5.QtWidgets" ;;
