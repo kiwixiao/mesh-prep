@@ -2274,6 +2274,8 @@ class STLClipperApp(QMainWindow):
         self._lbl_wall_faces = QLabel("Wall: — faces")
         geo_lay.addWidget(self._lbl_wall_faces)
         self._lbl_open_profiles = QLabel("Open profiles: —")
+        self._lbl_open_profiles.setWordWrap(True)
+        self._lbl_open_profiles.setMinimumWidth(1)   # wrap, never widen the panel
         geo_lay.addWidget(self._lbl_open_profiles)
         self._lbl_open_edges = QLabel("Open edges: —")
         geo_lay.addWidget(self._lbl_open_edges)
@@ -2293,8 +2295,12 @@ class STLClipperApp(QMainWindow):
         self._btn_show_boundary.clicked.connect(self._on_toggle_boundary_edges)
         geo_lay.addWidget(self._btn_show_boundary)
         self._lbl_non_manifold = QLabel("Non-manifold edges: —")
+        self._lbl_non_manifold.setWordWrap(True)
+        self._lbl_non_manifold.setMinimumWidth(1)   # wrap, never widen the panel
         geo_lay.addWidget(self._lbl_non_manifold)
         self._lbl_manifold = QLabel("Manifold: —")
+        self._lbl_manifold.setWordWrap(True)
+        self._lbl_manifold.setMinimumWidth(1)   # wrap, never widen the panel
         geo_lay.addWidget(self._lbl_manifold)
         self._lbl_normals = QLabel("Normals: —")   # shown in the LEFT Geometry box
         self._lbl_normals.setWordWrap(True)        # long messages wrap to new lines…
@@ -2745,6 +2751,8 @@ class STLClipperApp(QMainWindow):
 
         self._clip_save_status = QLabel("Status: —")
         self._clip_save_status.setWordWrap(True)
+        self._clip_save_status.setMinimumWidth(1)   # wrap, never widen the panel
+        self._clip_save_status.setWordWrap(True)
         tab_layout.addWidget(self._clip_save_status)
 
         tab_layout.addStretch()
@@ -2906,6 +2914,8 @@ class STLClipperApp(QMainWindow):
         tab3.addWidget(self._btn_watertight)
 
         self._lbl_repair_status = QLabel("Status: \u2014")
+        self._lbl_repair_status.setWordWrap(True)
+        self._lbl_repair_status.setMinimumWidth(1)   # wrap, never widen the panel
         tab3.addWidget(self._lbl_repair_status)
 
         tab3.addStretch()
@@ -4597,7 +4607,16 @@ class STLClipperApp(QMainWindow):
             geom = self._tree_nonmanifold[index]
             self.plotter.add_mesh(geom, color="red", line_width=6,
                                   name="tree_highlight", reset_camera=False)
-            self.status.showMessage(f"Non-manifold group {index + 1} — {geom.n_cells} edges.")
+            # Load the attached faces into the selection so Grow/Smooth/Delete
+            # work from here — growing a few rings makes a tiny edge findable.
+            cells = self.engine.faces_on_edges(geom)
+            if cells:
+                self._selection = set(cells)
+                self._refresh_selection_highlight()
+                self._update_button_states()
+            self.status.showMessage(
+                f"Non-manifold group {index + 1} — {geom.n_cells} edges, "
+                f"{len(cells)} attached faces selected. Grow to see the area.")
         elif kind == "piece":
             cells = self._tree_pieces[index]
             self._selection = set(cells)
