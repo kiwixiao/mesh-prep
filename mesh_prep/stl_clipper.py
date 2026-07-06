@@ -1994,6 +1994,21 @@ class STLClipperApp(QMainWindow):
         # orthographic view (replaces the old +X/-X..+Z/-Z panel buttons).
         self.plotter.add_camera_orientation_widget()
 
+        # Floating "Fit view" button overlaid in the viewport's top-left corner —
+        # recenter/zoom to the geometry without reaching to the side panel.
+        self._btn_fit_overlay = QPushButton("⤢ Fit", self.plotter.interactor)
+        self._btn_fit_overlay.setToolTip("Recenter and zoom to fit the geometry")
+        self._btn_fit_overlay.setCursor(Qt.PointingHandCursor)
+        self._btn_fit_overlay.setStyleSheet(
+            "QPushButton { background: rgba(45,45,45,190); color: white; "
+            "border: 1px solid #999; border-radius: 4px; padding: 3px 9px; } "
+            "QPushButton:hover { background: rgba(80,80,80,220); }")
+        self._btn_fit_overlay.clicked.connect(self._on_zoom_to_fit)
+        self._btn_fit_overlay.adjustSize()
+        self._btn_fit_overlay.move(10, 10)
+        self._btn_fit_overlay.raise_()
+        self._btn_fit_overlay.show()
+
         # Tabbed control panel
         self._tab_widget = QTabWidget()
         self._tab_widget.setMinimumWidth(220)
