@@ -18,15 +18,15 @@ fill, smooth, repair) edits the current surface and compounds on the last;
 Any Python ≥ 3.9 (native arm64 works and is fastest):
 
 ```bash
-pip install "git+https://github.com/kiwixiao/mesh-prep.git@dev"
+pip install "git+https://github.com/kiwixiao/mesh-prep.git"
 mesh-prep                     # launch the GUI
 ```
 
 Isolated app-style install (recommended for end users):
 
 ```bash
-pipx install "git+https://github.com/kiwixiao/mesh-prep.git@dev"
-# or: uv tool install "git+https://github.com/kiwixiao/mesh-prep.git@dev"
+pipx install "git+https://github.com/kiwixiao/mesh-prep.git"
+# or: uv tool install "git+https://github.com/kiwixiao/mesh-prep.git"
 ```
 
 ### Linux / Windows (WSL2) — pip
@@ -37,7 +37,7 @@ Install the Qt/OpenGL system libraries once, then pip as above:
 sudo apt-get update
 sudo apt-get install -y libgl1-mesa-glx libglib2.0-0 libxkbcommon-x11-0 \
                         libfontconfig1 libdbus-1-3 libxcb-xinerama0
-pip install "git+https://github.com/kiwixiao/mesh-prep.git@dev"
+pip install "git+https://github.com/kiwixiao/mesh-prep.git"
 mesh-prep
 ```
 
