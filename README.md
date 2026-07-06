@@ -52,17 +52,21 @@ patterns):
   `LIBGL_ALWAYS_SOFTWARE=1 mesh-prep`.
 - The Docker solver workflow works through Docker Desktop's WSL integration.
 
-### Conda (full install, including centerlines)
+### Centerlines
 
-Centerline computation uses [vmtk](http://www.vmtk.org), which has no PyPI
-wheels. vmtk exists on conda-forge for **linux-64** (native in WSL) and
-**osx-64** (Rosetta on Apple Silicon). Everything else works without it — the
-pip installs above simply report centerlines as unavailable.
+Centerlines compute **natively** (a pure numpy/scipy/VTK reimplementation of the
+Voronoi / maximal-inscribed-sphere method with branch decomposition), so they
+work in every install above — no vmtk, no compilation, native Apple Silicon.
+Seeds come automatically from your named inlet/outlet patch centers.
+
+[vmtk](http://www.vmtk.org) is an optional fallback (used only if the native
+engine fails and vmtk is installed). It has no PyPI wheels — install it via
+conda if you want it:
 
 ```bash
 git clone https://github.com/kiwixiao/mesh-prep.git
 cd mesh-prep
-./setup.sh                    # creates the 'mesh-prep' conda env
+./setup.sh                    # creates the 'mesh-prep' conda env (adds vmtk)
 conda run -n mesh-prep mesh-prep
 ```
 
@@ -139,8 +143,8 @@ mesh-render --case CASE_DIR --mode velocity|streamlines|...      # needs ParaVie
 - **Black/crashing 3D viewport in WSL or VMs** — `LIBGL_ALWAYS_SOFTWARE=1 mesh-prep`.
 - **"pymeshfix is not installed"** — `pip install pymeshfix`
   (or `pip install "mesh-prep[repair] @ git+…"`)
-- **Centerline button unavailable** — expected outside conda; see the conda
-  install above.
+- **Centerline needs a closed surface** — name an inlet and an outlet first
+  (that caps their openings); the native engine tetrahedralizes the interior.
 
 ## Development
 

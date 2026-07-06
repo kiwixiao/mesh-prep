@@ -93,8 +93,20 @@ class CenterlineWorker(QThread):
 
     def run(self):
         try:
-            from mesh_prep.centerline import compute_centerlines
-            result = compute_centerlines(self.surface_mesh, self.source_points, self.target_points)
+            # Native (pure numpy/scipy/VTK) engine is the default — works in the
+            # pip / Apple-Silicon install. vmtk is only a fallback: used when the
+            # native path fails AND vmtk happens to be installed (conda).
+            try:
+                from mesh_prep.centerline_native import compute_centerlines
+                result = compute_centerlines(
+                    self.surface_mesh, self.source_points, self.target_points)
+            except Exception as native_err:
+                try:
+                    from mesh_prep.centerline import compute_centerlines as _vmtk
+                except ImportError:
+                    raise native_err
+                result = _vmtk(
+                    self.surface_mesh, self.source_points, self.target_points)
             self.result_ready.emit(result)
         except Exception as e:
             self.failed.emit(str(e))
