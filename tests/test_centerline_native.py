@@ -5,7 +5,8 @@ import pyvista as pv
 import pytest
 
 from mesh_prep.centerline_native import (
-    compute_centerlines, _decompose_branches, _tet_circumcenters, RADIUS_ARRAY,
+    compute_centerlines, split_surface_by_centerline, _decompose_branches,
+    _tet_circumcenters, RADIUS_ARRAY,
 )
 
 
@@ -97,6 +98,44 @@ def test_centerline_y_detects_bifurcation():
         pytest.skip("centerline seeds unreachable on this synthetic Y")
     assert int(out["BranchId"].max()) >= 2              # >= 3 branches -> a bifurcation
     assert out.n_points > 4
+
+
+def test_split_surface_cylinder_single_region():
+    cyl = _watertight(_dense(pv.Cylinder(direction=(0, 0, 1), radius=1.0,
+                                         height=6.0, resolution=48, capping=True)))
+    cl = compute_centerlines(cyl, [0, 0, -2.7], [0, 0, 2.7])
+    surf, labels = split_surface_by_centerline(cyl, cl)
+    assert len(labels) == surf.n_cells                  # every face labeled
+    assert set(np.unique(labels)) <= {0}                # one branch -> one region
+
+
+def test_centerline_exposes_bifurcation_points_and_splits_y():
+    trunk = pv.Cylinder(center=(0, 0, -2), direction=(0, 0, 1), radius=0.6,
+                        height=4.0, resolution=40, capping=True)
+    left = pv.Cylinder(center=(-1.2, 0, 1.2), direction=(-0.6, 0, 0.8),
+                       radius=0.45, height=3.0, resolution=40, capping=True)
+    right = pv.Cylinder(center=(1.2, 0, 1.2), direction=(0.6, 0, 0.8),
+                        radius=0.45, height=3.0, resolution=40, capping=True)
+    merged = trunk.merge(left, merge_points=False).merge(right, merge_points=False)
+    try:
+        y = _watertight(_dense(merged, levels=2))
+    except Exception:
+        pytest.skip("could not build a watertight Y test surface")
+    if y is None or y.n_open_edges > 0:
+        pytest.skip("Y surface not watertight after MeshFix")
+    try:
+        cl = compute_centerlines(y, [0, 0, -3.8], [[-2.4, 0, 2.8], [2.4, 0, 2.8]])
+    except RuntimeError:
+        pytest.skip("centerline seeds unreachable on this synthetic Y")
+    # bifurcation points exposed with position + radius
+    assert "bifurcation_points" in cl.field_data
+    bifs = np.asarray(cl.field_data["bifurcation_points"])
+    assert bifs.shape[0] >= 1 and bifs.shape[1] == 3
+    assert cl.field_data["bifurcation_radius"].shape[0] == bifs.shape[0]
+    # the surface splits into >= 3 branch regions and every face is labeled
+    surf, labels = split_surface_by_centerline(y, cl)
+    assert len(labels) == surf.n_cells
+    assert len(np.unique(labels)) >= 3
 
 
 def test_centerline_empty_seeds_raises():

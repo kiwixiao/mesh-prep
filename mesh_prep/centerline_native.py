@@ -252,6 +252,53 @@ def compute_centerlines(surface_vtk, source_points, target_points,
     poly = pv.PolyData(np.vstack(all_pts), lines=np.concatenate(lines))
     poly[RADIUS_ARRAY] = np.concatenate(rad)
     poly["BranchId"] = np.concatenate(bid)
+    # Expose bifurcation points (position + MISR) so callers can split the
+    # surface / mark junctions. Carried as field data so the return type stays
+    # a plain PolyData (drop-in for the vmtk wrapper).
+    bif_ids = sorted(bifs)
+    if bif_ids:                                  # pyvista rejects empty field arrays
+        poly.field_data["bifurcation_points"] = centers[bif_ids]
+        poly.field_data["bifurcation_radius"] = radii[bif_ids]
     logger.info("Native centerline: %d branches, %d bifurcations, %d points",
                 len(branches), len(bifs), poly.n_points)
     return poly
+
+
+def split_surface_by_centerline(surface, centerline, k=8):
+    """Label each surface face by the centerline branch whose maximal-inscribed-
+    sphere tube it belongs to.
+
+    Tube-aware nearest: over the k nearest centerline points, pick the one
+    minimizing distance / local MISR (so a face joins the branch whose tube it
+    sits in, not merely the geometrically closest medial point). This partitions
+    the wall at the bifurcations.
+
+    Parameters
+    ----------
+    surface : pyvista.PolyData
+    centerline : pyvista.PolyData
+        Output of ``compute_centerlines`` (needs ``BranchId`` +
+        ``MaximumInscribedSphereRadius`` point arrays).
+    k : int
+        Neighbours considered for the tube-aware test.
+
+    Returns
+    -------
+    (surf, labels) : (pv.PolyData triangulated surface, int64 array len n_cells)
+        ``labels[i]`` is the BranchId owning face ``i``.
+    """
+    surf = surface.extract_surface().triangulate()
+    cl_pts = np.asarray(centerline.points, dtype=float)
+    if cl_pts.shape[0] == 0:
+        raise ValueError("centerline has no points")
+    cl_bid = np.asarray(centerline["BranchId"])
+    cl_rad = np.asarray(centerline[RADIUS_ARRAY])
+    fc = surf.cell_centers().points
+    kk = int(min(k, len(cl_pts)))
+    d, idx = cKDTree(cl_pts).query(fc, k=kk)
+    if kk == 1:
+        d = d[:, None]; idx = idx[:, None]
+    score = d / np.maximum(cl_rad[idx], 1e-9)
+    best = np.argmin(score, axis=1)
+    labels = cl_bid[idx[np.arange(len(fc)), best]].astype(np.int64)
+    return surf, labels
