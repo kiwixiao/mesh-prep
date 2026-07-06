@@ -10,15 +10,15 @@ OpenFOAM case.
 Native install (macOS Apple Silicon / Intel, Linux), any Python ≥ 3.9:
 
 ```bash
-pip install "git+https://github.com/kiwixiao/mesh-prep.git"
+pip install "git+https://github.com/kiwixiao/mesh-prep.git@dev"
 mesh-prep                     # launch the GUI
 ```
 
 Isolated app-style install (recommended for end users):
 
 ```bash
-pipx install "git+https://github.com/kiwixiao/mesh-prep.git"
-# or: uv tool install "git+https://github.com/kiwixiao/mesh-prep.git"
+pipx install "git+https://github.com/kiwixiao/mesh-prep.git@dev"
+# or: uv tool install "git+https://github.com/kiwixiao/mesh-prep.git@dev"
 ```
 
 ### Centerlines (optional, conda only)
