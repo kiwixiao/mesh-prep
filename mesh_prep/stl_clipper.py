@@ -1202,8 +1202,20 @@ class STLClipperEngine:
         n = m.n_points
         de = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
         keys = de[:, 0] * n + de[:, 1]
-        _, cnt = np.unique(keys, return_counts=True)
-        flipped = int(np.count_nonzero(cnt > 1))
+        und = de.min(axis=1) * n + de.max(axis=1)
+        # Winding conflicts are only meaningful on MANIFOLD edges (exactly two
+        # incident faces). A non-manifold edge (3+ faces) always yields a
+        # same-direction duplicate regardless of winding — that is a structural
+        # defect reported by the non-manifold indicator, not a fixable flip.
+        und_unique, und_cnt = np.unique(und, return_counts=True)
+        manifold_und = set(und_unique[und_cnt == 2].tolist())
+        dir_unique, dir_cnt = np.unique(keys, return_counts=True)
+        dup_dir = dir_unique[dir_cnt > 1]
+        flipped = 0
+        for k in dup_dir.tolist():
+            a, b = k // n, k % n
+            if (min(a, b) * n + max(a, b)) in manifold_und:
+                flipped += 1
         consistent = flipped == 0
         outward = None
         if consistent:

@@ -351,6 +351,21 @@ def test_decimate_no_mesh_and_clamps():
     assert eng.current_mesh.n_cells > 0
 
 
+def test_check_normals_nonmanifold_not_counted_as_flipped():
+    # A 3-face fan on one edge is NON-MANIFOLD, not a winding error: no
+    # rewinding can make three faces pairwise-consistent on a shared edge, so
+    # counting it as 'flipped' makes Fix Normals look broken. It must be
+    # reported by the non-manifold indicator only.
+    eng = STLClipperEngine()
+    pts = np.array([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1)], float)
+    faces = np.hstack([[3, 0, 1, 2], [3, 0, 1, 3], [3, 0, 1, 4]])
+    eng.current_mesh = pv.PolyData(pts, faces)
+    r = eng.check_normals()
+    assert r["flipped_edges"] == 0
+    assert r["consistent"] is True
+    assert len(eng.detect_nonmanifold_edges()) == 1        # reported where it belongs
+
+
 def test_check_normals_no_mesh():
     r = STLClipperEngine().check_normals()
     assert r["consistent"] is None
