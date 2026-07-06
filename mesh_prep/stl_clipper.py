@@ -2266,6 +2266,8 @@ class STLClipperApp(QMainWindow):
         self._lbl_manifold = QLabel("Manifold: —")
         geo_lay.addWidget(self._lbl_manifold)
         self._lbl_normals = QLabel("Normals: —")   # shown in the LEFT Geometry box
+        self._lbl_normals.setWordWrap(True)        # long messages wrap to new lines…
+        self._lbl_normals.setMinimumWidth(1)       # …instead of widening the panel
         self._btn_show_non_manifold = QPushButton("Show Non-Manifold")
         self._btn_show_non_manifold.setCheckable(True)
         self._btn_show_non_manifold.setChecked(False)
