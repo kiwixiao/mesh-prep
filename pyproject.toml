@@ -12,6 +12,7 @@ dependencies = [
     "PyQt5",
     "pyvista",
     "pyvistaqt",
+    "scipy",
     "vtk",
 ]
 
