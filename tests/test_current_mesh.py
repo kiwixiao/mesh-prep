@@ -321,6 +321,36 @@ def test_make_watertight_closes_open_sphere():
     assert eng.undo_trim() is True
 
 
+def test_decimate_reduces_faces_and_is_undoable():
+    eng = _labeled_engine()
+    n0 = eng.current_mesh.n_cells
+    msg = eng.repair_decimate(0.5)                        # ask for 50% fewer faces
+    n1 = eng.current_mesh.n_cells
+    assert msg.startswith("Decimated")
+    assert n1 < n0 * 0.7                                   # substantially reduced
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    assert len(ids) == n1                                  # labels valid on new mesh
+    assert eng.undo_trim() is True
+    assert eng.current_mesh.n_cells == n0                  # restored
+
+
+def test_decimate_keeps_named_patch():
+    eng = _labeled_engine()
+    eng.clip_and_name("inlet", (0, 0, 0), (0, 0, 1))
+    eng.repair_decimate(0.4)
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    assert 1 in np.unique(ids)                             # inlet label survives remap
+    assert eng.patch_names == {1: "inlet"}
+
+
+def test_decimate_no_mesh_and_clamps():
+    assert STLClipperEngine().repair_decimate(0.5) == "No mesh loaded."
+    eng = _labeled_engine()
+    msg = eng.repair_decimate(2.0)                         # silly input clamped, no crash
+    assert msg.startswith("Decimated")
+    assert eng.current_mesh.n_cells > 0
+
+
 def test_check_normals_no_mesh():
     r = STLClipperEngine().check_normals()
     assert r["consistent"] is None

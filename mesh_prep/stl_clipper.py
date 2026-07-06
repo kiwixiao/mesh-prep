@@ -1329,6 +1329,25 @@ class STLClipperEngine:
         after = len(self.detect_open_profiles())
         return f"Pinholes filled: open profiles {before} → {after}"
 
+    def repair_decimate(self, reduction: float) -> str:
+        """Reduce triangle density by ~`reduction` (0–1 fraction of faces to
+        remove) via quadric decimation. Undoable; patch labels are re-carried
+        onto the decimated mesh by nearest-face mapping."""
+        if self.original_mesh is None:
+            return "No mesh loaded."
+        reduction = min(max(float(reduction), 0.05), 0.95)
+        before = self.current_mesh.n_cells
+        try:
+            decimated = self.current_mesh.triangulate().decimate(reduction)
+        except Exception as e:
+            return f"Decimation failed: {e}"
+        if decimated is None or decimated.n_cells == 0:
+            return "Decimation produced an empty mesh — no change."
+        self._apply_repair(decimated)
+        after = self.current_mesh.n_cells
+        return (f"Decimated: {before:,} → {after:,} faces "
+                f"({100.0 * (before - after) / before:.0f}% removed)")
+
     def repair_make_watertight(self) -> str:
         """MeshFix (pymeshfix): close ALL holes, remove self-intersections and
         non-manifold geometry, keep the largest component. Use BEFORE clipping —
@@ -2852,6 +2871,20 @@ class STLClipperApp(QMainWindow):
         pin_row.addWidget(self._spin_pinhole_pct)
         tab3.addLayout(pin_row)
 
+        dec_row = QHBoxLayout()
+        self._btn_decimate = QPushButton("Decimate")
+        self._btn_decimate.setToolTip(
+            "Reduce triangle density by the given percentage (quadric "
+            "decimation). Best run before clipping; patch labels are remapped.")
+        self._btn_decimate.clicked.connect(self._on_decimate)
+        dec_row.addWidget(self._btn_decimate)
+        self._spin_decimate_pct = QDoubleSpinBox()
+        self._spin_decimate_pct.setRange(5.0, 95.0)
+        self._spin_decimate_pct.setValue(50.0)
+        self._spin_decimate_pct.setSuffix(" % fewer faces")
+        dec_row.addWidget(self._spin_decimate_pct)
+        tab3.addLayout(dec_row)
+
         self._btn_watertight = QPushButton("Make Watertight (MeshFix)")
         self._btn_watertight.setToolTip(
             "pymeshfix: close ALL holes, remove self-intersections/non-manifold "
@@ -3121,6 +3154,18 @@ class STLClipperApp(QMainWindow):
         diag = float(np.linalg.norm(b[1::2] - b[0::2]))
         radius = diag * self._spin_pinhole_pct.value() / 100.0
         msg = self.engine.repair_fill_pinholes(radius)
+        self._lbl_repair_status.setText(msg)
+        self._centerline_mesh = None
+        self._refresh_patch_list()
+        self._refresh_object_tree()
+        self._refresh_display()
+        self._update_button_states()
+        self.status.showMessage(f"{msg} Ctrl+Z to undo.")
+
+    def _on_decimate(self):
+        if self.engine.current_mesh is None:
+            return
+        msg = self.engine.repair_decimate(self._spin_decimate_pct.value() / 100.0)
         self._lbl_repair_status.setText(msg)
         self._centerline_mesh = None
         self._refresh_patch_list()
