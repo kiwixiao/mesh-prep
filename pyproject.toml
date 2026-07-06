@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mesh-prep"
-version = "0.1.0"
-description = "Interactive STL boundary patch clipper for CFD mesh preparation"
+version = "0.2.0"
+description = "Interactive STL surface repair and boundary-patch preparation for CFD (OpenFOAM)"
+readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "numpy",
@@ -20,6 +21,9 @@ dependencies = [
 centerline = ["vmtk"]
 run = ["matplotlib"]
 repair = ["pymeshfix"]
+
+[project.urls]
+Repository = "https://github.com/kiwixiao/mesh-prep"
 
 [project.scripts]
 mesh-prep = "mesh_prep.stl_clipper:main"
