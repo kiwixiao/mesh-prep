@@ -1,6 +1,6 @@
 import numpy as np
 import pyvista as pv
-from mesh_prep.stl_clipper import STLClipperEngine, plane_from_two_points
+from mesh_prep.stl_clipper import STLClipperEngine, plane_from_two_points, PATCH_ID
 
 VIEW = np.array([[0.5, 0, 0, -1],
                  [0, 0.5, 0, -1],
@@ -442,6 +442,32 @@ def test_fill_profile_caps_the_hole():
     assert out is eng.current_mesh
     assert eng.patch_names == {1: "inlet"}
     assert _n_open(eng.current_mesh) == 0             # cap merged in closes the hole
+
+
+def test_fill_profile_into_wall_no_name():
+    """name=None caps the hole but adds no named patch — the cap is wall (0)."""
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    before = eng.current_mesh.n_cells
+    out = eng.fill_profile(eng.detect_open_profiles()[0])          # no name
+    assert out is eng.current_mesh
+    assert eng.patch_names == {}                                  # no new patch
+    assert _n_open(eng.current_mesh) == 0                         # hole closed
+    assert eng.current_mesh.n_cells > before                     # cap faces added
+    labels = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    assert set(np.unique(labels).tolist()) == {0}                # every face is wall
+
+
+def test_fill_profile_blank_name_is_wall():
+    eng = _sphere_engine()
+    eng.cut_by_plane((0, 0, 0), (0, 0, 1))
+    top = _cell_on_side(eng.original_mesh, 2, True)
+    eng.delete_cells(eng.flood_select(top))
+    eng.fill_profile(eng.detect_open_profiles()[0], "   ")         # blank -> wall
+    assert eng.patch_names == {}
+    assert _n_open(eng.current_mesh) == 0
 
 
 def test_unfilled_open_profiles_excludes_filled():

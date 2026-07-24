@@ -1013,11 +1013,33 @@ class STLClipperEngine:
         return [(pid, name, int(np.count_nonzero(ids == pid)))
                 for pid, name in sorted(self.patch_names.items())]
 
-    def fill_profile(self, profile_edges, name):
-        """Triangulate an open profile's boundary loop into a named cap and merge
-        it into current_mesh (closing the hole). Returns the new current_mesh, or
-        None if the edges are empty or cannot be triangulated."""
-        if self.current_mesh is None or profile_edges is None or profile_edges.n_cells == 0:
+    @staticmethod
+    def _fan_fill(loop):
+        """Seal a boundary loop with a triangle fan from its centroid.
+
+        Robust for small non-planar rims (e.g. around a pinch) where contour
+        triangulation covers the loop only partially: every rim edge gets
+        exactly one fan triangle, so the loop seals by construction. Quality is
+        lower than a Delaunay cap (use for small defect rims, then Smooth)."""
+        if loop is None or loop.n_cells == 0:
+            return None
+        lines = loop.lines
+        if lines.size != 3 * loop.n_cells:               # not simple 2-pt segments
+            return None
+        pts = np.asarray(loop.points, dtype=float)
+        seg = lines.reshape(-1, 3)[:, 1:]
+        ci = len(pts)                                    # centroid index
+        new_pts = np.vstack([pts, pts.mean(axis=0)])
+        faces = np.column_stack([
+            np.full(len(seg), 3), seg[:, 0], seg[:, 1],
+            np.full(len(seg), ci)]).astype(np.int64).ravel()
+        return pv.PolyData(new_pts, faces)
+
+    @staticmethod
+    def _triangulate_loop(profile_edges):
+        """Triangulate a boundary-edge loop into a cap PolyData (contour
+        triangulation, Delaunay fallback). None if it cannot be triangulated."""
+        if profile_edges is None or profile_edges.n_cells == 0:
             return None
         strip = vtk.vtkStripper()
         strip.SetInputData(profile_edges)
@@ -1030,10 +1052,24 @@ class STLClipperEngine:
             cap = pv.PolyData(profile_edges.points).delaunay_2d()     # fallback
         if cap is None or cap.n_cells == 0:
             return None
-        cap = cap.triangulate()
+        return cap.triangulate()
+
+    def fill_profile(self, profile_edges, name=None):
+        """Triangulate an open profile's boundary loop into a cap and merge it
+        into current_mesh (closing the hole).
+
+        If `name` is given the cap becomes a new named patch; if `name` is None
+        (or blank) the cap merges into the wall (patch_id 0) — a quick fill that
+        needs no name. Returns the new current_mesh, or None if the edges are
+        empty or cannot be triangulated."""
+        if self.current_mesh is None or profile_edges is None or profile_edges.n_cells == 0:
+            return None
+        cap = self._triangulate_loop(profile_edges)
+        if cap is None:
+            return None
         self._ensure_labels()
         self._push_history()
-        pid = self._new_patch_id(name)
+        pid = self._new_patch_id(name) if name and name.strip() else 0
         self.original_mesh = self._merge_labeled(self.current_mesh, cap, pid)
         return self.current_mesh
 
@@ -1108,6 +1144,82 @@ class STLClipperEngine:
         keep_ids = np.array([i for i in range(n) if i not in ids], dtype=np.int64)
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
         return self.current_mesh
+
+    def remesh_region(self, cell_ids) -> Optional[str]:
+        """Re-triangulate a selected region: delete the selected faces, cap each
+        NEWLY created rim loop with a fresh triangulation (merged back as wall),
+        then re-wind normals. One undoable step.
+
+        This is the local fix for a non-manifold junction: select its attached
+        faces (tree click), Grow a ring or two, Remesh — the defect's faces are
+        replaced by a clean disc over the rim, so the junction is gone and the
+        surface stays closed. Pre-existing openings (inlet/outlet, open scans)
+        are matched by geometry and left open — but if the selection touches an
+        opening's rim, the merged loop counts as new and gets capped (Ctrl+Z).
+
+        Returns a status message, or None on a no-op (no mesh / empty selection /
+        selection covering the whole mesh)."""
+        if self.original_mesh is None:
+            return None
+        n = self.original_mesh.n_cells
+        ids = {int(c) for c in cell_ids if 0 <= int(c) < n}
+        if not ids or len(ids) >= n:
+            return None
+        self._ensure_labels()
+
+        # Signatures of loops that already exist (identical geometry survives the
+        # deletion untouched, so centroid + edge count match exactly within tol).
+        b = np.asarray(self.original_mesh.bounds, dtype=float)
+        diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+        tol = 1e-6 * diag if diag > 0 else 1e-6
+        before = [(g.n_cells, np.asarray(g.points).mean(axis=0))
+                  for g in self.detect_open_profiles()]
+
+        def _is_preexisting(loop):
+            c = np.asarray(loop.points).mean(axis=0)
+            return any(nc == loop.n_cells and float(np.linalg.norm(c - bc)) <= tol
+                       for nc, bc in before)
+
+        self._push_history()
+        keep = np.array([i for i in range(n) if i not in ids], dtype=np.int64)
+        result = self.original_mesh.extract_cells(keep).extract_surface()
+        result.cell_data[PATCH_ID] = np.asarray(result.cell_data[PATCH_ID], dtype=np.int64)
+
+        def _new_loops(mesh):
+            edges = mesh.extract_feature_edges(
+                boundary_edges=True, feature_edges=False,
+                manifold_edges=False, non_manifold_edges=False)
+            return [g for g in self._split_edge_groups(edges)
+                    if not _is_preexisting(g)]
+
+        # Fan-fill each new rim loop. NOT the contour triangulator used by
+        # fill_profile: on the small non-planar rims left by a defect deletion,
+        # it can pair the rim points into different EDGES than the rim's own
+        # (ambiguous projection), so the cap boundary never glues to the rim and
+        # a residual hole survives the merge. The centroid fan reuses the rim's
+        # exact edges — one triangle per rim edge — so it seals by construction
+        # (verified on real scan data; Smooth afterwards if shape matters).
+        filled = 0
+        for loop in _new_loops(result):
+            cap = self._fan_fill(loop)
+            if cap is None:
+                continue
+            result = self._merge_labeled(result, cap, 0)   # new faces are wall
+            filled += 1
+        failed = len(_new_loops(result))
+
+        # Re-wind so the fresh caps agree with the surrounding winding (and point
+        # outward when the result is watertight).
+        result = result.compute_normals(
+            cell_normals=False, point_normals=True, split_vertices=False,
+            consistent_normals=True, auto_orient_normals=self._mesh_is_closed(result))
+        self.original_mesh = self._carry_labels(result.triangulate(), self.current_mesh)
+        added = self.original_mesh.n_cells - len(keep)
+        msg = (f"Remeshed region: {len(ids)} faces removed, {added} rebuilt "
+               f"({filled} rim loop(s) re-triangulated)")
+        if failed:
+            msg += f"; {failed} small loop(s) remain open (use Fill Pinholes)"
+        return msg
 
     def cut_by_plane(self, origin, normal):
         """Split the surface along the plane but keep it one connected, still-closed
@@ -1205,41 +1317,18 @@ class STLClipperEngine:
                      outward (signed volume > 0). None when open/inconsistent.
         """
         m = self.current_mesh
-        if m is None or m.n_cells == 0:
+        flipped = self._count_winding_flips(m)
+        if flipped is None:
             return {"consistent": None, "flipped_edges": 0, "outward": None}
-        faces = m.faces
-        if faces.size != 4 * m.n_cells or not bool((faces.reshape(-1, 4)[:, 0] == 3).all()):
-            return {"consistent": None, "flipped_edges": 0, "outward": None}
-        tri = faces.reshape(-1, 4)[:, 1:].astype(np.int64)
-        n = m.n_points
-        de = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
-        keys = de[:, 0] * n + de[:, 1]
-        und = de.min(axis=1) * n + de.max(axis=1)
-        # Winding conflicts are only meaningful on MANIFOLD edges (exactly two
-        # incident faces). A non-manifold edge (3+ faces) always yields a
-        # same-direction duplicate regardless of winding — that is a structural
-        # defect reported by the non-manifold indicator, not a fixable flip.
-        und_unique, und_cnt = np.unique(und, return_counts=True)
-        manifold_und = set(und_unique[und_cnt == 2].tolist())
-        dir_unique, dir_cnt = np.unique(keys, return_counts=True)
-        dup_dir = dir_unique[dir_cnt > 1]
-        flipped = 0
-        for k in dup_dir.tolist():
-            a, b = k // n, k % n
-            if (min(a, b) * n + max(a, b)) in manifold_und:
-                flipped += 1
         consistent = flipped == 0
         outward = None
-        if consistent:
-            boundary = m.extract_feature_edges(
-                boundary_edges=True, feature_edges=False,
-                manifold_edges=False, non_manifold_edges=False)
-            if boundary.n_cells == 0:                     # watertight -> signed volume
-                p = m.points
-                vol6 = float(np.einsum(
-                    'ij,ij->i', p[tri[:, 0]],
-                    np.cross(p[tri[:, 1]], p[tri[:, 2]])).sum())
-                outward = bool(vol6 > 0)
+        if consistent and self._mesh_is_closed(m):        # watertight -> signed volume
+            tri = m.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+            p = m.points
+            vol6 = float(np.einsum(
+                'ij,ij->i', p[tri[:, 0]],
+                np.cross(p[tri[:, 1]], p[tri[:, 2]])).sum())
+            outward = bool(vol6 > 0)
         return {"consistent": consistent, "flipped_edges": flipped, "outward": outward}
 
     def geometry_quality(self) -> dict:
@@ -1302,8 +1391,9 @@ class STLClipperEngine:
         self._apply_repair(repaired)
         return f"Cleaned: {before} \u2192 {after} faces ({before - after} removed)"
 
-    def _is_closed(self) -> bool:
-        m = self.current_mesh
+    @staticmethod
+    def _mesh_is_closed(m) -> bool:
+        """True if the surface has no boundary (open) edges — i.e. watertight."""
         if m is None or m.n_cells == 0:
             return False
         boundary = m.extract_feature_edges(
@@ -1311,21 +1401,95 @@ class STLClipperEngine:
             manifold_edges=False, non_manifold_edges=False)
         return boundary.n_cells == 0
 
-    def repair_normals(self) -> str:
-        """Fix face-normal winding: consistent everywhere, and auto-oriented
-        OUTWARD when the surface is closed (auto-orient is undefined on open
-        surfaces, so it is only applied when watertight)."""
+    def _is_closed(self) -> bool:
+        return self._mesh_is_closed(self.current_mesh)
+
+    @staticmethod
+    def _count_winding_flips(m):
+        """Number of MANIFOLD-edge winding conflicts in a triangulated surface,
+        or None if the mesh is empty or has non-triangle faces.
+
+        A directed edge appearing twice in the SAME orientation means its two
+        incident faces disagree on winding. Only edges with exactly two incident
+        faces are counted: a non-manifold edge (3+ faces) always yields a
+        same-direction duplicate regardless of winding, so it is a structural
+        defect (reported separately), not a fixable flip."""
+        if m is None or m.n_cells == 0:
+            return None
+        faces = m.faces
+        if faces.size != 4 * m.n_cells or not bool((faces.reshape(-1, 4)[:, 0] == 3).all()):
+            return None
+        tri = faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+        n = m.n_points
+        de = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+        keys = de[:, 0] * n + de[:, 1]
+        und = de.min(axis=1) * n + de.max(axis=1)
+        und_unique, und_cnt = np.unique(und, return_counts=True)
+        manifold_und = set(und_unique[und_cnt == 2].tolist())
+        dir_unique, dir_cnt = np.unique(keys, return_counts=True)
+        flipped = 0
+        for k in dir_unique[dir_cnt > 1].tolist():
+            a, b = k // n, k % n
+            if (min(a, b) * n + max(a, b)) in manifold_und:
+                flipped += 1
+        return flipped
+
+    def repair_normals(self, max_nonmanifold_faces: int = 200) -> str:
+        """Fix face-normal winding, automatically clearing a small non-manifold
+        block if one prevents consistency.
+
+        First re-wind for consistency (auto-oriented OUTWARD when the surface is
+        closed — auto-orient is undefined on open surfaces). If re-winding cannot
+        reach a consistent winding, the cause is almost always a few non-manifold
+        edges (3+ faces on one edge) that make the surface locally non-orientable:
+        vtk will not propagate winding across them, stranding the flipped faces
+        behind them. When only a SMALL number of faces sit on those edges
+        (<= max_nonmanifold_faces), remove them and re-wind — that reconnects the
+        surface into orientable pieces and clears the flips. This opens small
+        holes (close them with Fill Pinholes or Make Watertight). A larger
+        non-manifold defect is left to Make Watertight (MeshFix). One undoable
+        step."""
         if self.original_mesh is None:
             return "No mesh loaded."
-        orient = self._is_closed()
-        repaired = self.original_mesh.compute_normals(
-            cell_normals=False, point_normals=True,
-            split_vertices=False, consistent_normals=True,
-            auto_orient_normals=orient,
-        )
-        self._apply_repair(repaired)
-        return ("Normals fixed (consistent winding, oriented outward)"
-                if orient else "Normals fixed (consistent winding)")
+
+        def _rewind(mesh):
+            return mesh.compute_normals(
+                cell_normals=False, point_normals=True, split_vertices=False,
+                consistent_normals=True, auto_orient_normals=self._mesh_is_closed(mesh))
+
+        base = self.current_mesh
+        candidate = _rewind(base)
+        if self._count_winding_flips(candidate) == 0:
+            self._apply_repair(candidate)
+            return ("Normals fixed (consistent winding, oriented outward)"
+                    if self._mesh_is_closed(candidate)
+                    else "Normals fixed (consistent winding)")
+
+        # Re-winding alone did not converge -> find the non-manifold block.
+        residual = self._count_winding_flips(candidate) or 0
+        groups = self.detect_nonmanifold_edges()
+        nm_faces = sorted({c for g in groups for c in self.faces_on_edges(g)})
+        if not nm_faces:
+            self._apply_repair(candidate)
+            return (f"Re-wound normals, but {residual} edge(s) remain flipped and no "
+                    f"non-manifold edges were found — inspect this region manually.")
+        if len(nm_faces) > max_nonmanifold_faces:
+            self._apply_repair(candidate)
+            return (f"Re-wound normals, but {residual} edge(s) remain flipped due to "
+                    f"{len(groups)} non-manifold junction(s) spanning {len(nm_faces)} "
+                    f"faces — too many to auto-remove. Use Make Watertight (MeshFix).")
+
+        # Small non-manifold defect: strip the offending faces, then re-wind.
+        n = base.n_cells
+        strip = set(nm_faces)
+        keep = np.array([i for i in range(n) if i not in strip], dtype=np.int64)
+        stripped = base.extract_cells(keep).extract_surface()
+        self._apply_repair(_rewind(stripped))
+        after = self._count_winding_flips(self.current_mesh)
+        tail = "winding now consistent" if after == 0 else f"{after} edge(s) still flipped"
+        return (f"Normals fixed — removed {len(nm_faces)} non-manifold face(s) at "
+                f"{len(groups)} junction(s) that blocked re-winding ({tail}); this opens "
+                f"small holes — close them with Fill Pinholes or Make Watertight.")
 
     def repair_fill_pinholes(self, max_radius: float) -> str:
         """Fill small holes (boundary loops) up to max_radius via vtkFillHolesFilter.
@@ -2270,6 +2434,13 @@ class STLClipperApp(QMainWindow):
         self._btn_smooth = QPushButton("✨ Smooth (×5)")
         self._btn_smooth.clicked.connect(self._on_smooth_selection)
         panel.addWidget(self._btn_smooth)
+
+        self._btn_remesh_sel = QPushButton("🔧 Remesh region")
+        self._btn_remesh_sel.setToolTip(
+            "Delete the selected faces and re-triangulate the rim — fixes a "
+            "non-manifold junction in place (select its faces, Grow, Remesh)")
+        self._btn_remesh_sel.clicked.connect(self._on_remesh_selection)
+        panel.addWidget(self._btn_remesh_sel)
 
         self._btn_delete = QPushButton("🗑 Delete faces")
         self._btn_delete.clicked.connect(self._on_delete_selection)
@@ -3423,6 +3594,7 @@ class STLClipperApp(QMainWindow):
             self._btn_select.setEnabled(can_edit)
             self._btn_grow.setEnabled(can_edit and has_sel)
             self._btn_smooth.setEnabled(can_edit and has_sel)
+            self._btn_remesh_sel.setEnabled(can_edit and has_sel)
             self._btn_delete.setEnabled(can_edit and has_sel)
 
     # ------------------------------------------------------------------
@@ -4547,6 +4719,21 @@ class STLClipperApp(QMainWindow):
             f"Flood-selected {len(region)} faces ({len(self._selection)} total).")
         self._update_button_states()
 
+    @staticmethod
+    def _pull_to_front(actor):
+        """Depth-bias an overlay actor toward the camera so it always wins the
+        depth test against the coplanar base surface. Selection/highlight actors
+        redraw the SAME triangles as the base mesh; without this bias the two
+        actors tie in the depth buffer and flicker while the camera moves
+        (z-fighting). Relative coincident-topology offset shifts depth only —
+        no visible geometry change. Same mechanism ParaView uses for selection."""
+        if actor is None:
+            return
+        m = actor.GetMapper()
+        if m is not None:
+            m.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -66000.0)
+            m.SetRelativeCoincidentTopologyLineOffsetParameters(-2.0, -66000.0)
+
     def _refresh_selection_highlight(self):
         try:
             self.plotter.remove_actor("selection", render=False)
@@ -4556,9 +4743,11 @@ class STLClipperApp(QMainWindow):
         if self._selection and mesh is not None:
             ids = sorted(i for i in self._selection if 0 <= i < mesh.n_cells)
             if ids:
-                self.plotter.add_mesh(mesh.extract_cells(ids), color=(1.0, 0.55, 0.0),
-                                      name="selection", lighting=True, pickable=False,
-                                      reset_camera=False)
+                actor = self.plotter.add_mesh(
+                    mesh.extract_cells(ids), color=(1.0, 0.55, 0.0),
+                    name="selection", lighting=True, pickable=False,
+                    reset_camera=False)
+                self._pull_to_front(actor)
         self.plotter.render()
 
     def _refresh_object_tree(self):
@@ -4626,14 +4815,26 @@ class STLClipperApp(QMainWindow):
         kind, index = data
         if kind == "profile":
             geom = self._tree_profiles[index]
-            self.plotter.add_mesh(geom, color="orange", line_width=6,
-                                  name="tree_highlight", reset_camera=False)
-            self.status.showMessage(f"Open Profile {index + 1} — {geom.n_cells} edges.")
+            self._pull_to_front(self.plotter.add_mesh(
+                geom, color="orange", line_width=6,
+                name="tree_highlight", reset_camera=False))
             self._active_profile_index = index
+            # Also seed the face selection from the rim faces so Grow/Smooth/Delete
+            # work from an edge — Grow then expands inward to the surrounding
+            # surface (Fill still uses _active_profile_index, unaffected).
+            cells = self.engine.faces_on_edges(geom)
+            if cells:
+                self._selection = set(cells)
+                self._refresh_selection_highlight()
+                self._update_button_states()
+            self.status.showMessage(
+                f"Open Profile {index + 1} — {geom.n_cells} edges, "
+                f"{len(cells)} rim faces selected. Grow to expand.")
         elif kind == "nonmanifold":
             geom = self._tree_nonmanifold[index]
-            self.plotter.add_mesh(geom, color="red", line_width=6,
-                                  name="tree_highlight", reset_camera=False)
+            self._pull_to_front(self.plotter.add_mesh(
+                geom, color="red", line_width=6,
+                name="tree_highlight", reset_camera=False))
             # Load the attached faces into the selection so Grow/Smooth/Delete
             # work from here — growing a few rings makes a tiny edge findable.
             cells = self.engine.faces_on_edges(geom)
@@ -4657,9 +4858,10 @@ class STLClipperApp(QMainWindow):
             if cap is not None and cap.n_cells > 0:
                 # Wireframe overlay: a solid highlight would z-fight with the
                 # already-drawn colored cap (identical faces) and look broken.
-                self.plotter.add_mesh(cap, color="yellow", style="wireframe",
-                                      line_width=4, name="tree_highlight",
-                                      reset_camera=False)
+                self._pull_to_front(self.plotter.add_mesh(
+                    cap, color="yellow", style="wireframe",
+                    line_width=4, name="tree_highlight",
+                    reset_camera=False))
                 self.status.showMessage(f"Patch '{pname}' — {cap.n_cells} faces.")
         self.plotter.render()
 
@@ -4687,13 +4889,14 @@ class STLClipperApp(QMainWindow):
         menu = QMenu(self._object_tree)
         act_hl = menu.addAction("Highlight")
         act_rename = act_split = act_remove = act_fill = act_del_piece = None
-        act_remesh = act_del_nm = None
+        act_remesh = act_del_nm = act_fill_wall = None
         if kind == "patch":
             act_rename = menu.addAction("Rename…")
             act_split = menu.addAction("Split disconnected components")
             act_remesh = menu.addAction("Remesh (smoother cap)")
             act_remove = menu.addAction("Remove name (faces → wall)")
         elif kind == "profile":
+            act_fill_wall = menu.addAction("Fill (merge into wall)")
             act_fill = menu.addAction("Fill as named patch…")
         elif kind == "piece":
             act_del_piece = menu.addAction("Delete piece (faces)")
@@ -4710,6 +4913,8 @@ class STLClipperApp(QMainWindow):
             self._split_patch_from_tree(index)
         elif chosen is act_remove:
             self._remove_patch_by_pid(index)
+        elif chosen is act_fill_wall:
+            self._fill_profile_as_wall(index)
         elif chosen is act_fill:
             self._fill_profile_dialog(index)
         elif chosen is act_del_piece:
@@ -4843,6 +5048,24 @@ class STLClipperApp(QMainWindow):
         self._refresh_selection_highlight()
         self.status.showMessage(f"Grown to {len(self._selection)} faces.")
 
+    def _on_remesh_selection(self):
+        """Remesh the selected region: delete + re-triangulate the rim (fixes a
+        non-manifold junction locally). One undo step."""
+        if not self._selection or not self._edit_enabled():
+            return
+        msg = self.engine.remesh_region(self._selection)
+        if msg is None:
+            self.status.showMessage("Could not remesh that selection.")
+            return
+        self._clear_selection()
+        self.plotter.remove_actor("tree_highlight", render=False)
+        self._refresh_display()
+        self._refresh_object_tree()
+        self._refresh_patch_list()
+        self._update_status()
+        self._update_button_states()
+        self.status.showMessage(f"{msg}. Ctrl+Z to undo.")
+
     def _on_smooth_selection(self):
         if not self._selection or not self._edit_enabled():
             return
@@ -4873,6 +5096,28 @@ class STLClipperApp(QMainWindow):
             self.status.showMessage("Select an open profile in the Objects tree first.")
             return
         self._fill_profile_dialog(idx)
+
+    def _fill_profile_as_wall(self, idx):
+        """Quick-fill open profile `idx` and merge the cap into the wall — no name
+        prompt, no new patch (right-click 'Fill (merge into wall)')."""
+        if self.engine.current_mesh is None:
+            self.status.showMessage("Load an STL first.")
+            return
+        profiles = self._tree_profiles
+        if not (0 <= idx < len(profiles)):
+            self.status.showMessage("That open profile is stale — refreshing the tree.")
+            self._refresh_object_tree()
+            return
+        result = self.engine.fill_profile(profiles[idx])          # name=None -> wall
+        if result is None:
+            self.status.showMessage("Could not fill this profile.")
+            return
+        self._active_profile_index = None
+        self._refresh_display()
+        self._refresh_object_tree()
+        self._refresh_patch_list()
+        self._update_button_states()
+        self.status.showMessage("Filled profile into wall. Ctrl+Z to undo.")
 
     def _fill_profile_dialog(self, idx):
         """Prompt for a patch name and fill open profile `idx` (shared by the
