@@ -26,7 +26,7 @@ from . import openfoam_case
 import pyvista as pv
 import vtk
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QKeySequence
+from PyQt5.QtGui import QColor, QCursor, QFont, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
@@ -524,7 +524,11 @@ class STLClipperEngine:
         if mag > 0:
             # Outward-pointing (out of the kept domain), matching the old -clip.normal
             self._patch_normals[pid] = tuple(-normal / mag)
-        self.original_mesh = self._merge_labeled(trimmed, cap, pid)
+        # Re-triangulate: plane/box clipping emits quads where triangles were cut,
+        # which would break the all-triangle current_mesh invariant that
+        # check_normals / flood / grow / sharp-select fast paths rely on.
+        # vtkTriangleFilter carries cell data, so each sub-triangle keeps its label.
+        self.original_mesh = self._merge_labeled(trimmed, cap, pid).triangulate()
         return self.current_mesh
 
     def rename_patch(self, pid: int, new_name: str) -> bool:
@@ -965,6 +969,123 @@ class STLClipperEngine:
                     stack.append(nb)
         return sorted(seen)
 
+    def select_to_sharp_edges(self, seed_cells, angle_deg: float = 30.0):
+        """Flood-select from seed faces, stopping at sharp edges.
+
+        Grows across edge-adjacent (manifold) neighbors whose dihedral angle —
+        the angle between the two faces' normals — stays within `angle_deg`.
+        A flat end cap on a curved pipe is bounded by its ~90° rim, so one seed
+        face selects exactly the cap. Feature-curve edges are walls too (same
+        rule as flood_select), so a cut still bounds the selection even where
+        the surface is geometrically smooth. Assumes consistent winding (run
+        Fix Normals first if flipped faces stop the flood early).
+
+        Returns a sorted list of cell ids; [] if no mesh/seeds; the valid seeds
+        unchanged on a non-triangle mesh."""
+        mesh = self.original_mesh
+        if mesh is None:
+            return []
+        n_cells = mesh.n_cells
+        seeds = sorted({int(c) for c in seed_cells if 0 <= int(c) < n_cells})
+        if not seeds:
+            return []
+        faces = mesh.faces
+        if faces.size != 4 * n_cells or not bool(
+                (faces.reshape(-1, 4)[:, 0] == 3).all()):
+            return seeds
+        tri = faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+        n_points = mesh.n_points
+        pts = np.asarray(mesh.points, dtype=float)
+
+        # Per-face unit normals (winding order). Degenerate faces -> zero normal,
+        # which fails every dihedral test, isolating them — the safe behavior.
+        v0, v1, v2 = pts[tri[:, 0]], pts[tri[:, 1]], pts[tri[:, 2]]
+        fn = np.cross(v1 - v0, v2 - v0)
+        mag = np.linalg.norm(fn, axis=1)
+        fn = fn / np.maximum(mag, 1e-30)[:, None]
+
+        # Manifold edge -> its two incident faces (runs of exactly 2 equal keys).
+        e = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+        e.sort(axis=1)
+        keys = e[:, 0] * n_points + e[:, 1]
+        cell_of = np.tile(np.arange(n_cells, dtype=np.int64), 3)
+        order = np.argsort(keys, kind="stable")
+        ks, cs = keys[order], cell_of[order]
+        is_start = np.r_[True, ks[1:] != ks[:-1]]
+        run_id = np.cumsum(is_start) - 1
+        counts = np.bincount(run_id)
+        starts = np.nonzero(is_start)[0]
+        two = starts[counts == 2]
+        a, b, ekey = cs[two], cs[two + 1], ks[two]
+
+        cos_thresh = float(np.cos(np.radians(angle_deg)))
+        ok = np.einsum('ij,ij->i', fn[a], fn[b]) >= cos_thresh
+        barrier = self._barrier_edge_keys(mesh)
+        if barrier:
+            ok &= ~np.isin(ekey, np.fromiter(barrier, dtype=np.int64))
+        a, b = a[ok], b[ok]
+
+        # CSR adjacency over traversable edges, then BFS from the seeds.
+        src = np.concatenate([a, b])
+        dst = np.concatenate([b, a])
+        order = np.argsort(src, kind="stable")
+        src, dst = src[order], dst[order]
+        deg = np.bincount(src, minlength=n_cells)
+        adj_starts = np.zeros(n_cells + 1, dtype=np.int64)
+        np.cumsum(deg, out=adj_starts[1:])
+        seen = np.zeros(n_cells, dtype=bool)
+        seen[seeds] = True
+        stack = list(seeds)
+        while stack:
+            c = stack.pop()
+            for nb in dst[adj_starts[c]:adj_starts[c + 1]]:
+                if not seen[nb]:
+                    seen[nb] = True
+                    stack.append(int(nb))
+        return sorted(int(i) for i in np.nonzero(seen)[0])
+
+    def assign_patch_from_cells(self, cell_ids, name: str):
+        """Label the given faces as a new named patch (e.g. an auto-selected end
+        cap -> 'outlet1'). Pure relabel — geometry untouched, one undo step.
+        Records the selection's area-weighted mean normal as the patch's outward
+        normal (used by the OpenFOAM export). Returns the new patch id, or None
+        on a no-op (no mesh / empty selection / blank name)."""
+        if self.original_mesh is None or not name or not name.strip():
+            return None
+        n = self.original_mesh.n_cells
+        ids = sorted({int(c) for c in cell_ids if 0 <= int(c) < n})
+        if not ids:
+            return None
+        self._ensure_labels()
+        self._push_history()
+        pid = self._new_patch_id(name.strip())
+        labels = np.asarray(self.original_mesh.cell_data[PATCH_ID], dtype=np.int64)
+        labels[ids] = pid
+        self.original_mesh.cell_data[PATCH_ID] = labels
+        # Relabeling can take the last faces of another named patch (e.g. a
+        # through-model lasso that swept a hidden cap). A name with zero faces
+        # would still be exported into controlDict but never into the STL —
+        # a guaranteed solver failure — so purge emptied patches now.
+        present = set(int(v) for v in np.unique(labels))
+        for old_pid in [p for p in self.patch_names if p != pid and p not in present]:
+            del self.patch_names[old_pid]
+            self._patch_normals.pop(old_pid, None)
+        faces = self.original_mesh.faces
+        if faces.size == 4 * n and bool((faces.reshape(-1, 4)[:, 0] == 3).all()):
+            tri = faces.reshape(-1, 4)[:, 1:].astype(np.int64)[ids]
+            pts = np.asarray(self.original_mesh.points, dtype=float)
+            fn = np.cross(pts[tri[:, 1]] - pts[tri[:, 0]],
+                          pts[tri[:, 2]] - pts[tri[:, 0]])   # 2*area-weighted
+            mean = fn.sum(axis=0)
+            mag = float(np.linalg.norm(mean))
+            total = float(np.linalg.norm(fn, axis=1).sum())
+            # Record only a MEANINGFUL mean direction. Opposing faces (both end
+            # caps selected at once) cancel to numerical noise; storing that
+            # noise would silently become the inlet velocity direction in 0/U.
+            if total > 0 and mag > 1e-6 * total:
+                self._patch_normals[pid] = tuple(mean / mag)
+        return pid
+
     def _split_edge_groups(self, edges):
         """Split an edge PolyData into connected groups; one geometry per group
         (line cells preserved) for highlighting. [] if empty/None."""
@@ -1237,8 +1358,9 @@ class STLClipperEngine:
         self._push_history()
         # _carry_labels: the two halves' label arrays can be dropped by merge on
         # array-type mismatch; remap from the pre-cut mesh (still current here).
+        # triangulate(): clipping emits quads — restore the all-triangle invariant.
         self.original_mesh = self._carry_labels(
-            a.merge(b, merge_points=True), self.current_mesh)
+            a.merge(b, merge_points=True).triangulate(), self.current_mesh)
         self._feature_curves.append(cut_curve)
         return self.current_mesh
 
@@ -1278,8 +1400,9 @@ class STLClipperEngine:
         self._push_history()
         # _carry_labels: the two halves' label arrays can be dropped by merge on
         # array-type mismatch; remap from the pre-cut mesh (still current here).
+        # triangulate(): clipping emits quads — restore the all-triangle invariant.
         self.original_mesh = self._carry_labels(
-            a.merge(b, merge_points=True), self.current_mesh)
+            a.merge(b, merge_points=True).triangulate(), self.current_mesh)
         self._feature_curves.append(cut_curve)
         return self.current_mesh
 
@@ -1989,9 +2112,35 @@ class _SelectLassoStyle(vtk.vtkInteractorStyleTrackballCamera):
         self._lasso_active = False
         self._last_click_time = 0.0
         self._last_click_pos = None
+        self._right_press_pos = None
         self.AddObserver("LeftButtonPressEvent", self._on_press)
         self.AddObserver("MouseMoveEvent", self._on_move)
         self.AddObserver("LeftButtonReleaseEvent", self._on_release)
+        self.AddObserver("RightButtonPressEvent", self._on_right_press)
+        self.AddObserver("RightButtonReleaseEvent", self._on_right_release)
+
+    def _on_right_press(self, _obj=None, _evt=None):
+        try:
+            if self._lasso_active:
+                return           # mid-lasso: a modal menu would eat the left release
+            self._right_press_pos = self._app.plotter.iren.get_event_position()
+            self.OnRightButtonDown()                       # keep right-drag zoom
+        except Exception:
+            logger.exception("select right-press handler failed")
+
+    def _on_right_release(self, _obj=None, _evt=None):
+        try:
+            if self._lasso_active:
+                return
+            self.OnRightButtonUp()
+            pp = self._right_press_pos
+            self._right_press_pos = None
+            rp = self._app.plotter.iren.get_event_position()
+            if pp is None or abs(rp[0] - pp[0]) > 3 or abs(rp[1] - pp[1]) > 3:
+                return                                    # a zoom drag, not a click
+            self._app._show_select_context_menu()
+        except Exception:
+            logger.exception("select right-release handler failed")
 
     def _on_press(self, _obj=None, _evt=None):
         try:
@@ -2121,6 +2270,7 @@ class STLClipperApp(QMainWindow):
 
         # Selection state
         self._selection: set = set()          # active selected cell ids (original_mesh)
+        self._cap_actor_names: set = set()    # cap actors currently drawn (for staleness)
         self._select_mode = False
 
         self._build_ui()
@@ -4734,7 +4884,10 @@ class STLClipperApp(QMainWindow):
             m.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -66000.0)
             m.SetRelativeCoincidentTopologyLineOffsetParameters(-2.0, -66000.0)
 
-    def _refresh_selection_highlight(self):
+    def _draw_selection_actor(self):
+        """(Re)draw the actor holding ONLY the selected faces — opaque orange.
+        The same faces are excluded from the wall/cap actors, so this is the
+        single on-screen copy: visually a recolor of the selected region."""
         try:
             self.plotter.remove_actor("selection", render=False)
         except Exception:
@@ -4748,6 +4901,76 @@ class STLClipperApp(QMainWindow):
                     name="selection", lighting=True, pickable=False,
                     reset_camera=False)
                 self._pull_to_front(actor)
+
+    def _draw_surface_actors(self, exclude=None):
+        """Draw/replace the wall + named-cap actors, excluding `exclude` cell ids
+        (the active selection). Excluded faces are rendered ONLY by the selection
+        actor: no duplicate coincident geometry to shade twice, and the
+        translucent wall can no longer composite over the highlight — the two
+        causes of the confusing 'double mesh' selection look."""
+        mesh = self.engine.current_mesh
+        if mesh is None or mesh.n_cells == 0:
+            return
+        n = mesh.n_cells
+        excl = {int(i) for i in (exclude or ()) if 0 <= int(i) < n}
+        if (PATCH_ID in mesh.cell_data
+                and len(mesh.cell_data[PATCH_ID]) == n):
+            labels = np.asarray(mesh.cell_data[PATCH_ID])
+        else:
+            labels = np.zeros(n, dtype=np.int64)
+        keep = np.ones(n, dtype=bool)
+        if excl:
+            keep[list(excl)] = False
+        named = self.engine.named_patches()
+        show_mesh = self._btn_show_mesh_edges.isChecked()
+        wall_opacity = 1.0 if self._btn_opaque_wall.isChecked() else 0.4
+
+        # Wall (patch 0). Fast path: pristine mesh, nothing excluded -> whole mesh.
+        self._wall_cell_map = None       # subset-actor cell id -> current_mesh cell id
+        if not excl and not named:
+            wall = mesh
+        else:
+            wall_idx = np.nonzero((labels == 0) & keep)[0]
+            wall = mesh.extract_cells(wall_idx).extract_surface() if len(wall_idx) else None
+            if wall is not None and "vtkOriginalCellIds" in wall.cell_data:
+                # extract_surface may reorder; its original-ids array indexes into
+                # the extract_cells order, which is wall_idx's order.
+                sub = np.asarray(wall.cell_data["vtkOriginalCellIds"])
+                self._wall_cell_map = wall_idx[sub]
+            elif wall is not None:
+                self._wall_cell_map = wall_idx
+        if wall is not None and wall.n_cells > 0:
+            self._wall_actor = self.plotter.add_mesh(
+                wall, color=WALL_COLOR, opacity=wall_opacity,
+                show_edges=show_mesh, edge_color="black", line_width=0.5,
+                specular=0.15, specular_power=20.0, ambient=0.15, diffuse=0.9,
+                name="wall", reset_camera=False,
+            )
+        else:                                   # everything selected -> no wall actor
+            self.plotter.remove_actor("wall", render=False)
+            self._wall_actor = None
+
+        # Named patches — flat name-based colors. No edge lines: caps are sliver
+        # triangle fans over jagged rims, and white edges shred the solid color.
+        drawn = set()
+        for pid, pname, _nf in named:
+            idx = np.nonzero((labels == pid) & keep)[0]
+            if len(idx) == 0:
+                continue                        # fully selected -> selection draws it
+            cap = mesh.extract_cells(idx).extract_surface()
+            aname = f"cap_{pname}"
+            self.plotter.add_mesh(
+                cap, color=_color_for_name(pname), opacity=1.0,
+                name=aname, reset_camera=False,
+            )
+            drawn.add(aname)
+        for stale in getattr(self, "_cap_actor_names", set()) - drawn:
+            self.plotter.remove_actor(stale, render=False)
+        self._cap_actor_names = drawn
+
+    def _refresh_selection_highlight(self):
+        self._draw_selection_actor()
+        self._draw_surface_actors(exclude=self._selection)
         self.plotter.render()
 
     def _refresh_object_tree(self):
@@ -5048,6 +5271,80 @@ class STLClipperApp(QMainWindow):
         self._refresh_selection_highlight()
         self.status.showMessage(f"Grown to {len(self._selection)} faces.")
 
+    def _show_select_context_menu(self):
+        """Right-click menu in Select mode (popped by _SelectLassoStyle on a
+        right-CLICK; right-drag still zooms). Operates on the current selection:
+        grow it to the surrounding sharp-edge boundary, or assign it as a named
+        patch — the click-a-cap -> outlet1 workflow."""
+        if not getattr(self, "_select_mode", False):
+            return
+        if not self._selection:
+            self.status.showMessage("Click or lasso a face first, then right-click.")
+            return
+        menu = QMenu(self)
+        act_sharp = menu.addAction("Select to sharp edges (30°)")
+        act_sharp_custom = menu.addAction("Select to sharp edges (custom angle…)")
+        menu.addSeparator()
+        act_assign = menu.addAction("Assign selection as patch…")
+        act_clear = menu.addAction("Clear selection")
+        chosen = menu.exec_(QCursor.pos())
+        if chosen is act_sharp:
+            self._select_to_sharp(30.0)
+        elif chosen is act_sharp_custom:
+            angle, ok = QInputDialog.getDouble(
+                self, "Sharp Edge Angle",
+                "Stop at edges sharper than (degrees):", 30.0, 1.0, 179.0, 1)
+            if ok:
+                self._select_to_sharp(float(angle))
+        elif chosen is act_assign:
+            self._assign_selection_dialog()
+        elif chosen is act_clear:
+            self._clear_selection()
+            self.status.showMessage("Selection cleared.")
+
+    def _select_to_sharp(self, angle_deg):
+        """Grow the selection to the sharp-edge boundary around it."""
+        grown = self.engine.select_to_sharp_edges(self._selection, angle_deg)
+        if not grown:
+            self.status.showMessage("Nothing to grow — select a face first.")
+            return
+        self._selection = set(grown)
+        self._refresh_selection_highlight()
+        self._update_button_states()
+        self.status.showMessage(
+            f"Selected {len(grown)} faces bounded by edges sharper than {angle_deg:g}°.")
+
+    def _assign_selection_dialog(self):
+        """Name the current selection as a new patch (outlet1, outlet2, …)."""
+        if not self._selection:
+            return
+        used = set(self.engine.patch_names.values()) | {"wall"}
+        n = 1
+        while f"outlet{n}" in used:
+            n += 1
+        default = f"outlet{n}"
+        name, ok = QInputDialog.getText(
+            self, "Patch Name", "Name for the selected faces:", text=default)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in used:
+            QMessageBox.warning(self, "Duplicate Name",
+                                f"'{name}' is already used. Choose another.")
+            return
+        pid = self.engine.assign_patch_from_cells(self._selection, name)
+        if pid is None:
+            self.status.showMessage("Could not assign the selection as a patch.")
+            return
+        count = len(self._selection)
+        self._clear_selection()
+        self._refresh_display()
+        self._refresh_object_tree()
+        self._refresh_patch_list()
+        self._update_button_states()
+        self.status.showMessage(
+            f"Assigned {count} faces as patch '{name}'. Ctrl+Z to undo.")
+
     def _on_remesh_selection(self):
         """Remesh the selected region: delete + re-triangulate the rim (fixes a
         non-manifold junction locally). One undo step."""
@@ -5285,42 +5582,11 @@ class STLClipperApp(QMainWindow):
             self.plotter.render()
             return
 
-        # Split the single current mesh into wall (patch 0) + named patches
-        patches = self.engine.patches_by_id()
-        wall = patches.get(0)
-        self._wall_cell_map = None       # subset-actor cell id -> current_mesh cell id
-        if wall is None or wall.n_cells == 0:
-            wall = self.engine.current_mesh
-        elif wall.n_cells != self.engine.current_mesh.n_cells:
-            ids = np.asarray(self.engine.current_mesh.cell_data[PATCH_ID])
-            wall_idx = np.nonzero(ids == 0)[0]
-            if "vtkOriginalCellIds" in wall.cell_data:
-                # extract_surface may reorder; its original-ids array indexes into
-                # the extract_cells order, which is wall_idx's order.
-                sub = np.asarray(wall.cell_data["vtkOriginalCellIds"])
-                self._wall_cell_map = wall_idx[sub]
-            else:
-                self._wall_cell_map = wall_idx
-
-        # Wall mesh — optionally opaque, optionally with surface mesh edges
-        show_mesh = self._btn_show_mesh_edges.isChecked()
-        wall_opacity = 1.0 if self._btn_opaque_wall.isChecked() else 0.4
-        self._wall_actor = self.plotter.add_mesh(
-            wall, color=WALL_COLOR, opacity=wall_opacity,
-            show_edges=show_mesh, edge_color="black", line_width=0.5,
-            specular=0.15, specular_power=20.0, ambient=0.15, diffuse=0.9,
-            name="wall", reset_camera=False,
-        )
-
-        # Named patches — flat name-based colors. No edge lines: caps are sliver
-        # triangle fans over jagged rims, and white edges shred the solid color.
-        for pid, pname, _nf in self.engine.named_patches():
-            cap = patches.get(pid)
-            if cap is not None and cap.n_cells > 0:
-                self.plotter.add_mesh(
-                    cap, color=_color_for_name(pname), opacity=1.0,
-                    name=f"cap_{pname}", reset_camera=False,
-                )
+        # Wall + named-cap actors (selection faces excluded — they are drawn
+        # solely by the selection actor), then the selection itself.
+        self._cap_actor_names = set()            # plotter.clear() removed them all
+        self._draw_surface_actors(exclude=self._selection)
+        self._draw_selection_actor()
 
         # Centerline — yellow tube
         has_cl = self._centerline_mesh is not None and self._centerline_mesh.n_points > 0
@@ -5372,8 +5638,13 @@ class STLClipperApp(QMainWindow):
         self.plotter.renderer.camera_set = True
         self.plotter.render()
 
-        # Update wall face count label
-        n_wall = wall.n_cells if wall else 0
+        # Update wall face count label — count patch-0 cells on the mesh itself
+        # (the true wall size, independent of the display's selection exclusion).
+        m = self.engine.current_mesh
+        if m is not None and PATCH_ID in m.cell_data and len(m.cell_data[PATCH_ID]) == m.n_cells:
+            n_wall = int((np.asarray(m.cell_data[PATCH_ID]) == 0).sum())
+        else:
+            n_wall = m.n_cells if m is not None else 0
         self._lbl_wall_faces.setText(f"Wall: {n_wall:,} faces")
 
         # Update bounding box info — show raw min..max per axis + extent
