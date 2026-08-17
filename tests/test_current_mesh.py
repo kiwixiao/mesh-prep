@@ -410,6 +410,55 @@ def test_remesh_patch_preserves_area_and_bounds():
     assert np.allclose(np.asarray(eng.current_mesh.bounds), bounds0, atol=1e-9)
 
 
+def test_remesh_patch_concave_multidisc_cap_improves_quality():
+    """A plane through TWO vessels cuts twice — the cap is two separate
+    discs. The old constrained-Delaunay filled the convex hull across both
+    (93% area error on real aortas) and the area gate made the whole remesh a
+    silent no-op. The rebuilt triangulator must handle it and produce
+    near-isotropic triangles."""
+    cyl_a = pv.Cylinder(resolution=40, capping=True).clean().triangulate()
+    cyl_b = cyl_a.copy()
+    cyl_b.points = np.asarray(cyl_b.points) + np.array([0.0, 1.6, 0.0])
+    two = cyl_a.merge(cyl_b, merge_points=False).extract_surface().triangulate()
+    two.cell_data[PATCH_ID] = np.zeros(two.n_cells, dtype=np.int64)
+    eng = STLClipperEngine()
+    eng.original_mesh = two
+    eng._trim_history.clear()
+    eng.patch_names = {}
+    eng._next_patch_id = 1
+    eng._patch_normals = {}
+    assert eng.detect_open_profiles() == []                # fixture watertight
+    eng.clip_and_name("outlet", (0.3, 0, 0), (1, 0, 0))    # cuts BOTH tubes
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    assert int((ids == 1).sum()) > 0
+    area0 = float(eng.current_mesh.area)
+
+    out = eng.remesh_patch(1)
+    assert out is not None                                 # no silent failure
+
+    # watertight, area preserved, and the cap is now well-shaped
+    boundary = eng.current_mesh.extract_feature_edges(
+        boundary_edges=True, feature_edges=False,
+        manifold_edges=False, non_manifold_edges=False)
+    assert boundary.n_cells == 0
+    assert eng.detect_nonmanifold_edges() == []
+    assert abs(float(eng.current_mesh.area) - area0) < 0.01 * area0
+    ids = np.asarray(eng.current_mesh.cell_data[PATCH_ID])
+    cap = eng.current_mesh.extract_cells(np.nonzero(ids == 1)[0]).extract_surface()
+    tri = cap.faces.reshape(-1, 4)[:, 1:]
+    p = np.asarray(cap.points, dtype=float)
+    a, b, c = p[tri[:, 0]], p[tri[:, 1]], p[tri[:, 2]]
+
+    def ang(u, v):
+        cosv = np.einsum('ij,ij->i', u, v) / np.maximum(
+            np.linalg.norm(u, axis=1) * np.linalg.norm(v, axis=1), 1e-30)
+        return np.degrees(np.arccos(np.clip(cosv, -1, 1)))
+    A, B = ang(b - a, c - a), ang(a - b, c - b)
+    min_ang = np.minimum(np.minimum(A, B), np.maximum(180 - A - B, 0))
+    assert np.median(min_ang) > 30.0                       # near-isotropic
+    assert (min_ang < 15).mean() < 0.2                     # few slivers
+
+
 def test_remesh_patch_invalid_pid_is_noop():
     eng = _labeled_engine()
     assert eng.remesh_patch(0) is None

@@ -20,7 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 centerline = ["vmtk"]
 run = ["matplotlib"]
-repair = ["pymeshfix"]
+repair = ["pymeshfix", "pyacvd"]
 
 [project.urls]
 Repository = "https://github.com/kiwixiao/mesh-prep"

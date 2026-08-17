@@ -518,6 +518,28 @@ class STLClipperEngine:
         if cap is None or cap.n_cells == 0:
             return None
         cap = cap.triangulate()
+        # Weld guarantee: the cap rim comes from vtkCutter (slice) but the
+        # trimmed wall rim from vtkClipPolyData — the same plane/edge
+        # intersections through different float paths. On some geometries the
+        # coordinates differ in the last bits, so merge-by-coordinate never
+        # welds and the "capped" clip is silently open. Snap cap vertices onto
+        # the trimmed wall's boundary vertices within a tiny tolerance (far
+        # below rim spacing) so the weld is exact by construction.
+        wall_rim = trimmed.extract_feature_edges(
+            boundary_edges=True, feature_edges=False,
+            manifold_edges=False, non_manifold_edges=False)
+        if wall_rim.n_points and cap.n_points:
+            b = np.asarray(trimmed.bounds, dtype=float)
+            diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+            tol = 1e-6 * diag if diag > 0 else 1e-6
+            from scipy.spatial import cKDTree
+            d, j = cKDTree(np.asarray(wall_rim.points)).query(
+                np.asarray(cap.points))
+            hit = d < tol
+            if hit.any():
+                pts = np.asarray(cap.points).copy()
+                pts[hit] = np.asarray(wall_rim.points)[j[hit]]
+                cap.points = pts
         self._push_history()
         pid = self._new_patch_id(name)
         mag = float(np.linalg.norm(normal))
@@ -613,11 +635,99 @@ class STLClipperEngine:
                 out |= (c0 & c1)
         return sorted(out)
 
+    @staticmethod
+    def _retriangulate_planar_cap(cap, rim):
+        """Rebuild a PLANAR cap's triangulation with near-isotropic triangles.
+
+        vtkDelaunay2D's edge constraint is unreliable on real rims (concave or
+        multi-disc cross-sections make it fill the convex hull instead). This
+        does it the robust way: unconstrained planar Delaunay over the rim
+        points PLUS interior seed points laid out on a hex grid at rim-edge
+        spacing, then keep only triangles whose center lies ON the original
+        cap — concavities and separate discs filter themselves out, and the
+        rim points are reused verbatim so the merge glues exactly.
+
+        Returns the new cap PolyData, or None when it declines (non-planar cap,
+        degenerate rim, or Delaunay dropped points)."""
+        cap_pts = np.asarray(cap.points, dtype=float)
+        centroid = cap_pts.mean(axis=0)
+        cov = np.cov((cap_pts - centroid).T)
+        w, v = np.linalg.eigh(cov)
+        n, u1, u2 = v[:, 0], v[:, 1], v[:, 2]            # normal + in-plane basis
+        b = np.asarray(cap.bounds, dtype=float)
+        diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+        if diag <= 0:
+            return None
+        thickness = float(np.ptp((cap_pts - centroid) @ n))
+        if thickness > 1e-3 * diag:                      # only flat caps
+            return None
+
+        rim_pts = np.asarray(rim.points, dtype=float)
+        seg = rim.lines.reshape(-1, 3)[:, 1:]
+        spacing = float(np.median(np.linalg.norm(
+            rim_pts[seg[:, 0]] - rim_pts[seg[:, 1]], axis=1)))
+        if spacing <= 0:
+            return None
+        # Bound the interior grid: a very fine rim on a large cap would demand
+        # millions of candidates (observed: a 10-minute hang). Coarsening the
+        # spacing keeps the work bounded at a slightly coarser interior.
+        min_spacing = diag / 300.0
+        if spacing < min_spacing:
+            spacing = min_spacing
+
+        # Hex-grid interior candidates over the cap's in-plane bounding box.
+        rp2 = np.column_stack([(rim_pts - centroid) @ u1, (rim_pts - centroid) @ u2])
+        lo, hi = rp2.min(axis=0), rp2.max(axis=0)
+        xs = np.arange(lo[0], hi[0] + spacing, spacing)
+        row_h = spacing * np.sqrt(3.0) / 2.0
+        ys = np.arange(lo[1], hi[1] + row_h, row_h)
+        gx, gy = np.meshgrid(xs, ys)
+        gx[1::2, :] += spacing / 2.0                     # hex offset rows
+        cand2 = np.column_stack([gx.ravel(), gy.ravel()])
+        cand3 = centroid + cand2[:, :1] * u1 + cand2[:, 1:2] * u2
+        # Keep candidates ON the cap (inside test against the actual surface)
+        # and clear of the rim, so boundary triangles stay well-shaped.
+        from scipy.spatial import cKDTree
+        if len(cand3):
+            _, cp = cap.find_closest_cell(cand3, return_closest_point=True)
+            on_cap = np.linalg.norm(cand3 - cp, axis=1) < 1e-6 * diag
+            # Clearance > 0.707*edge keeps every interior point outside the
+            # diametral circle of any rim segment, so the Delaunay always
+            # contains the rim edges (no coverage gaps in narrow notches).
+            clear = cKDTree(rim_pts).query(cand3)[0] > 0.75 * spacing
+            interior = cand3[on_cap & clear]
+        else:
+            interior = np.empty((0, 3))
+
+        pts3 = np.vstack([rim_pts, interior])
+        flat = np.column_stack([(pts3 - centroid) @ u1, (pts3 - centroid) @ u2,
+                                np.zeros(len(pts3))])
+        try:
+            tri2d = pv.PolyData(flat).delaunay_2d()
+        except Exception:
+            return None
+        if tri2d.n_points != len(pts3):                  # Delaunay dropped points
+            return None
+        faces = tri2d.faces.reshape(-1, 4)
+        if not bool((faces[:, 0] == 3).all()):
+            return None
+        # Back to 3D with the ORIGINAL coordinates (rim points verbatim), then
+        # drop hull triangles: keep only those whose center is on the cap.
+        new_cap = pv.PolyData(pts3, faces.ravel())
+        centers = new_cap.cell_centers().points
+        _, cp = cap.find_closest_cell(centers, return_closest_point=True)
+        keep = np.nonzero(np.linalg.norm(centers - cp, axis=1) < 1e-6 * diag)[0]
+        if len(keep) == 0:
+            return None
+        return new_cap.extract_cells(keep).extract_surface().triangulate()
+
     def remesh_patch(self, pid: int):
-        """Replace a cap patch's triangulation with a constrained-Delaunay one
+        """Replace a cap patch's triangulation with a near-isotropic planar one
         built on its rim (well-shaped triangles instead of a sliver fan).
-        Relabels with the same patch id/name; one undo step. Returns the new
-        current_mesh, or None if the patch is missing or triangulation fails."""
+        Handles concave and multi-disc cross-sections (a clip plane through
+        several vessel limbs). Relabels with the same patch id/name; one undo
+        step. Returns the new current_mesh, or None if the patch is missing,
+        non-planar, or retriangulation fails validation."""
         if self.current_mesh is None or pid == 0 or pid not in self.patch_names:
             return None
         self._ensure_labels()
@@ -631,13 +741,9 @@ class STLClipperEngine:
             manifold_edges=False, non_manifold_edges=False)
         if rim.n_cells == 0:
             return None
-        try:
-            new_cap = rim.delaunay_2d(edge_source=rim)
-        except Exception:
-            new_cap = None
+        new_cap = self._retriangulate_planar_cap(cap, rim)
         if new_cap is None or new_cap.n_cells == 0:
             return None
-        new_cap = new_cap.triangulate()
         # Retriangulation must cover EXACTLY the same surface — same rim, same
         # area. If the Delaunay constraint failed on a concave rim, VTK falls
         # back to the convex hull, which would ADD surface beyond the original
@@ -645,11 +751,41 @@ class STLClipperEngine:
         old_area = float(cap.area)
         if old_area > 0 and abs(float(new_cap.area) - old_area) > 0.01 * old_area:
             return None
-        self._push_history()
+        # Signatures of loops that already exist (pre-existing openings must
+        # not be touched; only gaps CREATED by the retriangulation get sealed).
+        b = np.asarray(self.current_mesh.bounds, dtype=float)
+        diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+        tol = 1e-6 * diag if diag > 0 else 1e-6
+        before = [(g.n_cells, np.asarray(g.points).mean(axis=0))
+                  for g in self.detect_open_profiles()]
+        # Assemble the full result FIRST; commit only if it validates.
         keep = np.nonzero(ids != pid)[0]
         base = self.current_mesh.extract_cells(keep).extract_surface()
         base = self._carry_labels(base, self.current_mesh)
-        self.original_mesh = self._merge_labeled(base, new_cap, pid)
+        result = self._merge_labeled(base, new_cap, pid)
+        # A rim segment can still be missed in a degenerate spot, leaving a
+        # thin gap the area gate cannot see. Seal CLOSED new loops with a fan
+        # (labeled as this patch). A non-closed chain means overlapping or
+        # non-manifold geometry would result — decline instead of committing.
+        edges = result.extract_feature_edges(
+            boundary_edges=True, feature_edges=False,
+            manifold_edges=False, non_manifold_edges=False)
+        for loop in self._split_edge_groups(edges):
+            cl = np.asarray(loop.points).mean(axis=0)
+            if any(nc == loop.n_cells and float(np.linalg.norm(cl - bc)) <= tol
+                   for nc, bc in before):
+                continue                                 # pre-existing opening
+            seg = loop.lines.reshape(-1, 3)[:, 1:] if loop.lines.size else None
+            closed = (seg is not None
+                      and np.all(np.bincount(seg.ravel()) == 2))
+            if not closed:
+                return None                              # would corrupt — decline
+            gap = self._fan_fill(loop)
+            if gap is None:
+                return None
+            result = self._merge_labeled(result, gap, pid)
+        self._push_history()
+        self.original_mesh = result
         return self.current_mesh
 
     def patches_by_id(self) -> dict:
@@ -1777,6 +1913,68 @@ class STLClipperEngine:
         return (f"Decimated: {before:,} → {after:,} faces "
                 f"({100.0 * (before - after) / before:.0f}% removed)")
 
+    def remesh_surface(self, target_faces: int = None) -> str:
+        """Whole-surface ISOTROPIC remesh (ACVD clustering via pyacvd).
+
+        Re-tessellates current_mesh into near-equilateral triangles of uniform
+        size — the standard CFD preparation step after repair. New vertices are
+        placed ON the original surface (centroidal Voronoi clustering, not
+        smoothing), so geometry is preserved to a fraction of the edge length.
+        Patch labels are re-carried by nearest face — boundaries between
+        patches become approximate, so run this BEFORE clipping/naming when
+        crisp patch borders matter. Cut feature curves no longer lie on mesh
+        edges afterwards and stop being drawn. One undo step.
+
+        Best on watertight surfaces; open boundaries may be re-tessellated
+        raggedly (the message warns when openings exist)."""
+        if self.original_mesh is None:
+            return "No mesh loaded."
+        try:
+            import pyacvd
+        except ImportError:
+            return ("pyacvd is not installed — run: pip install pyacvd "
+                    "(note: not usable in the legacy conda env — its bundled "
+                    "OpenMP clashes with vmtk's)")
+        m = self.current_mesh.triangulate()
+        before = m.n_cells
+        target = int(target_faces) if target_faces else before
+        if target < 100:
+            return "Target too small — need at least 100 faces."
+        n_open = len(self.detect_open_profiles())
+        # ACVD clusters VERTICES; a closed triangulated surface has roughly
+        # twice as many faces as points, so aim for target/2 clusters. The
+        # input needs comfortably more points than clusters — subdivide first
+        # when upsampling.
+        n_clusters = max(50, target // 2)
+        try:
+            clus = pyacvd.Clustering(m)
+            guard = 0
+            while clus.mesh.n_points < 3 * n_clusters and guard < 3:
+                clus.subdivide(2)
+                guard += 1
+            clus.cluster(n_clusters)
+            out = clus.create_mesh()
+        except Exception as e:
+            return f"Remesh failed: {type(e).__name__}: {e}"
+        if out is None or out.n_cells == 0:
+            return "Remesh produced an empty mesh — no change."
+        self._push_history()
+        self.original_mesh = self._carry_labels(out.triangulate(), self.current_mesh)
+        # A patch smaller than the new triangle size can lose all its faces in
+        # the relabeling — purge such names so exports stay consistent.
+        labels = np.asarray(self.original_mesh.cell_data[PATCH_ID])
+        present = set(int(v) for v in np.unique(labels))
+        for old_pid in [p for p in self.patch_names if p not in present]:
+            del self.patch_names[old_pid]
+            self._patch_normals.pop(old_pid, None)
+        after = self.original_mesh.n_cells
+        msg = f"Remeshed surface: {before:,} → {after:,} faces (isotropic)"
+        if n_open:
+            msg += (f". Note: {n_open} open profile(s) — open boundaries "
+                    f"re-tessellate raggedly; cap or fill them first for a "
+                    f"clean rim.")
+        return msg
+
     def repair_make_watertight(self) -> str:
         """MeshFix (pymeshfix): close ALL holes, remove self-intersections and
         non-manifold geometry, keep the largest component. Use BEFORE clipping —
@@ -2705,8 +2903,10 @@ class STLClipperApp(QMainWindow):
 
         self._btn_remesh_sel = QPushButton("🔧 Remesh region")
         self._btn_remesh_sel.setToolTip(
-            "Delete the selected faces and re-triangulate the rim — fixes a "
-            "non-manifold junction in place (select its faces, Grow, Remesh)")
+            "Delete the selected faces and fill the rim with a FLAT patch — "
+            "for removing defects (non-manifold junctions), NOT for improving "
+            "a curved area (it flattens the shape there). To refine while "
+            "keeping the shape, use Smooth or Remesh Surface (isotropic).")
         self._btn_remesh_sel.clicked.connect(self._on_remesh_selection)
         panel.addWidget(self._btn_remesh_sel)
 
@@ -3371,6 +3571,16 @@ class STLClipperApp(QMainWindow):
         dec_row.addWidget(self._spin_decimate_pct)
         tab3.addLayout(dec_row)
 
+        rem_row = QHBoxLayout()
+        self._btn_remesh_surface = QPushButton("Remesh Surface (isotropic)")
+        self._btn_remesh_surface.setToolTip(
+            "Re-tessellate the whole surface into uniform, near-equilateral "
+            "triangles (ACVD). Geometry preserved; patch labels remapped — "
+            "best run after repair, before clipping/naming.")
+        self._btn_remesh_surface.clicked.connect(self._on_remesh_surface)
+        rem_row.addWidget(self._btn_remesh_surface)
+        tab3.addLayout(rem_row)
+
         self._btn_watertight = QPushButton("Make Watertight (MeshFix)")
         self._btn_watertight.setToolTip(
             "pymeshfix: close ALL holes, remove self-intersections/non-manifold "
@@ -3654,6 +3864,24 @@ class STLClipperApp(QMainWindow):
         if self.engine.current_mesh is None:
             return
         msg = self.engine.repair_decimate(self._spin_decimate_pct.value() / 100.0)
+        self._lbl_repair_status.setText(msg)
+        self._centerline_mesh = None
+        self._refresh_patch_list()
+        self._refresh_object_tree()
+        self._refresh_display()
+        self._update_button_states()
+        self.status.showMessage(f"{msg} Ctrl+Z to undo.")
+
+    def _on_remesh_surface(self):
+        if self.engine.current_mesh is None:
+            return
+        target, ok = QInputDialog.getInt(
+            self, "Remesh Surface",
+            "Target face count:", self.engine.current_mesh.n_cells,
+            100, 10_000_000, 1000)
+        if not ok:
+            return
+        msg = self.engine.remesh_surface(target)
         self._lbl_repair_status.setText(msg)
         self._centerline_mesh = None
         self._refresh_patch_list()
@@ -4947,24 +5175,37 @@ class STLClipperApp(QMainWindow):
         self._update_button_states()
 
     def _pick_wall_cell(self, pos):
-        """Cell id of the wall face under display position `pos`, or None. The picker
-        is restricted to the wall actor so it cannot catch the centerline or feature
-        curves. Shared by single-click and double-click selection."""
-        wall_actor = getattr(self, "_wall_actor", None)
+        """Cell id (in current_mesh space) of the surface face under display
+        position `pos`, or None. The picker is restricted to the surface actors
+        — wall AND named caps — so it cannot catch the centerline or feature
+        curves, but a click on a capped outlet picks the cap face instead of
+        missing (or hitting the wall hidden behind it). Shared by single-click
+        and double-click selection."""
         mesh = self.engine.original_mesh
-        if wall_actor is None or mesh is None:
+        actors = getattr(self, "_pickable_surface_actors", None)
+        if actors is None:                       # display not built via helper yet
+            wall_actor = getattr(self, "_wall_actor", None)
+            actors = ([(wall_actor, getattr(self, "_wall_cell_map", None))]
+                      if wall_actor is not None else [])
+        if mesh is None or not actors:
             return None
         picker = vtk.vtkCellPicker()
         picker.InitializePickList()
-        picker.AddPickList(wall_actor)
+        for actor, _ in actors:
+            picker.AddPickList(actor)
         picker.PickFromListOn()
         picker.Pick(pos[0], pos[1], 0, self.plotter.renderer)
         cid = picker.GetCellId()
         if cid is None or cid < 0:
             return None
-        # The wall actor shows only the pid-0 subset once patches exist; translate
-        # its cell id back into current_mesh space before anyone consumes it.
-        cmap = getattr(self, "_wall_cell_map", None)
+        # Translate the hit actor's local cell id back into current_mesh space
+        # (each subset actor carries its own original-id map; None = identity).
+        hit = picker.GetActor()
+        cmap = None
+        for actor, m in actors:
+            if actor is hit:
+                cmap = m
+                break
         if cmap is not None:
             if cid >= len(cmap):
                 return None
@@ -5071,6 +5312,7 @@ class STLClipperApp(QMainWindow):
                 self._wall_cell_map = wall_idx[sub]
             elif wall is not None:
                 self._wall_cell_map = wall_idx
+        pickable = []                            # [(actor, cell_map or None)]
         if wall is not None and wall.n_cells > 0:
             self._wall_actor = self.plotter.add_mesh(
                 wall, color=WALL_COLOR, opacity=wall_opacity,
@@ -5078,6 +5320,7 @@ class STLClipperApp(QMainWindow):
                 specular=0.15, specular_power=20.0, ambient=0.15, diffuse=0.9,
                 name="wall", reset_camera=False,
             )
+            pickable.append((self._wall_actor, self._wall_cell_map))
         else:                                   # everything selected -> no wall actor
             self.plotter.remove_actor("wall", render=False)
             self._wall_actor = None
@@ -5091,14 +5334,24 @@ class STLClipperApp(QMainWindow):
                 continue                        # fully selected -> selection draws it
             cap = mesh.extract_cells(idx).extract_surface()
             aname = f"cap_{pname}"
-            self.plotter.add_mesh(
+            cap_actor = self.plotter.add_mesh(
                 cap, color=_color_for_name(pname), opacity=1.0,
                 name=aname, reset_camera=False,
             )
+            # Same original-id mapping as the wall: extract_surface may reorder,
+            # and its original-ids index into the extract_cells order (= idx).
+            if "vtkOriginalCellIds" in cap.cell_data:
+                cmap = idx[np.asarray(cap.cell_data["vtkOriginalCellIds"])]
+            else:
+                cmap = idx
+            pickable.append((cap_actor, cmap))
             drawn.add(aname)
         for stale in getattr(self, "_cap_actor_names", set()) - drawn:
             self.plotter.remove_actor(stale, render=False)
         self._cap_actor_names = drawn
+        # Every surface actor is click-pickable — named caps included, so
+        # Select mode works on a capped outlet, not only on the wall.
+        self._pickable_surface_actors = pickable
 
     def _refresh_selection_highlight(self):
         self._draw_selection_actor()
