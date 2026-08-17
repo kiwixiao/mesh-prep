@@ -40,7 +40,7 @@ def test_cube_face_bounded_by_90_degree_edges():
 
 
 def test_cylinder_cap_selected_from_one_seed():
-    eng = _engine_with(pv.Cylinder(resolution=60, capping=True))
+    eng = _engine_with(pv.Cylinder(resolution=60, capping=True).clean())
     m = eng.current_mesh
     cap = _cap_cells(m, (1, 0, 0), 1)                      # +x end cap
     assert len(cap) > 10
@@ -50,7 +50,7 @@ def test_cylinder_cap_selected_from_one_seed():
 
 
 def test_multiple_seeds_grow_independently():
-    eng = _engine_with(pv.Cylinder(resolution=60, capping=True))
+    eng = _engine_with(pv.Cylinder(resolution=60, capping=True).clean())
     m = eng.current_mesh
     cap_a = _cap_cells(m, (1, 0, 0), 1)
     cap_b = _cap_cells(m, (1, 0, 0), -1)
@@ -85,7 +85,7 @@ def test_bad_seeds_return_empty():
 
 
 def test_assign_patch_from_cells_labels_and_normal():
-    eng = _engine_with(pv.Cylinder(resolution=60, capping=True))
+    eng = _engine_with(pv.Cylinder(resolution=60, capping=True).clean())
     cap = sorted(_cap_cells(eng.current_mesh, (1, 0, 0), 1))
     n_before = eng.current_mesh.n_cells
     pid = eng.assign_patch_from_cells(cap, "outlet1")
@@ -108,7 +108,7 @@ def test_sharp_select_works_after_clip():
     """clip_and_name used to leave quads (breaking the all-triangle invariant),
     which silently reduced sharp-select to the seed face and made check_normals
     report unknown. The clip paths now re-triangulate."""
-    eng = _engine_with(pv.Cylinder(resolution=60, capping=True))
+    eng = _engine_with(pv.Cylinder(resolution=60, capping=True).clean())
     eng.clip_and_name("inlet", (0.4, 0, 0), (1, 0, 0))
     m = eng.current_mesh
     f = m.faces
@@ -133,7 +133,7 @@ def test_cut_by_plane_keeps_triangles():
 def test_assign_skips_normal_when_faces_cancel():
     """Selecting BOTH end caps (antipodal normals) must not record a noise
     direction as the patch normal — it would become the inlet velocity in 0/U."""
-    eng = _engine_with(pv.Cylinder(resolution=60, capping=True))
+    eng = _engine_with(pv.Cylinder(resolution=60, capping=True).clean())
     m = eng.current_mesh
     both = sorted(_cap_cells(m, (1, 0, 0), 1) | _cap_cells(m, (1, 0, 0), -1))
     pid = eng.assign_patch_from_cells(both, "weird")
@@ -144,7 +144,7 @@ def test_assign_skips_normal_when_faces_cancel():
 def test_assign_purges_emptied_patches():
     """Re-assigning every face of an existing patch must drop the old name, so
     exports never reference a patch with zero faces."""
-    eng = _engine_with(pv.Cylinder(resolution=60, capping=True))
+    eng = _engine_with(pv.Cylinder(resolution=60, capping=True).clean())
     cap = sorted(_cap_cells(eng.current_mesh, (1, 0, 0), 1))
     pid1 = eng.assign_patch_from_cells(cap, "outlet1")
     pid2 = eng.assign_patch_from_cells(cap, "outlet2")     # steals every face
@@ -153,7 +153,7 @@ def test_assign_purges_emptied_patches():
     assert pid1 not in eng._patch_normals
     assert eng.patch_names[pid2] == "outlet2"
     # partial overlap keeps the survivor
-    eng2 = _engine_with(pv.Cylinder(resolution=60, capping=True))
+    eng2 = _engine_with(pv.Cylinder(resolution=60, capping=True).clean())
     cap2 = sorted(_cap_cells(eng2.current_mesh, (1, 0, 0), 1))
     p1 = eng2.assign_patch_from_cells(cap2, "outlet1")
     p2 = eng2.assign_patch_from_cells(cap2[: len(cap2) // 2], "outlet2")

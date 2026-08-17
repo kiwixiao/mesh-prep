@@ -130,6 +130,7 @@ conda run -n mesh-prep mesh-prep
 
 ```bash
 mesh-prep [file.stl]          # GUI
+mesh-prep --debug [file.stl]  # GUI + full log saved to ~/.mesh-prep/logs/ (attach when reporting a bug)
 mesh-prep-create --stl X.stl --type les|rans --output CASE_DIR   # headless case
 mesh-render --case CASE_DIR --mode velocity|streamlines|...      # needs ParaView
 ```

@@ -69,7 +69,9 @@ def _tet_circumcenters(points, tets):
     valid = np.abs(det) > 1e-12
     centers = np.full((len(tets), 3), np.nan)
     if valid.any():
-        centers[valid] = np.linalg.solve(M[valid], rhs[valid])
+        # Explicit column vectors: NumPy 2.0 treats a 2-D `b` as one matrix
+        # (only 1-D `b` is a vector now), so (M,3) rhs must be (M,3,1).
+        centers[valid] = np.linalg.solve(M[valid], rhs[valid][:, :, None])[:, :, 0]
     radii = np.linalg.norm(centers - a, axis=1)
     valid &= np.isfinite(centers).all(axis=1) & np.isfinite(radii)
     return centers, radii, valid

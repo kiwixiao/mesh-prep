@@ -71,7 +71,7 @@ def test_centerline_cylinder_is_axial_with_correct_radius():
     pts = out.points
     # Path hugs the z-axis: x,y small; z spans most of the height.
     assert np.abs(pts[:, :2]).max() < 0.4
-    assert pts[:, 2].ptp() > 4.0
+    assert np.ptp(pts[:, 2]) > 4.0
     # MISR ~ cylinder radius (discrete circumradius, tolerant band).
     r = np.asarray(out[RADIUS_ARRAY])
     assert 0.6 < float(np.median(r)) < 1.4

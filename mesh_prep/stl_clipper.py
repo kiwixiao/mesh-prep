@@ -1194,6 +1194,124 @@ class STLClipperEngine:
         self.original_mesh = self._merge_labeled(self.current_mesh, cap, pid)
         return self.current_mesh
 
+    def extrude_profile(self, profile_edges, length, direction=None):
+        """Flow extension: extrude an open rim straight along the cut-plane
+        normal so the vessel continues naturally (vmtk's flow-extension idea).
+
+        direction defaults to the rim's best-fit plane normal (for a flat cut
+        this IS the cut normal), signed to point away from the existing
+        surface. The rim vertices are copied outward in rings (~rim edge
+        length apart, so side triangles stay well-shaped); side walls are
+        wound to match the surrounding surface, so winding stays consistent
+        without a global re-wind. The far end becomes a NEW open profile —
+        Fill it as a named patch to cap the extension. One undo step.
+
+        Returns a status message, or None on a no-op (no mesh / bad loop /
+        non-positive length / rim not found on the surface)."""
+        mesh = self.current_mesh
+        if (mesh is None or profile_edges is None or profile_edges.n_cells == 0
+                or not np.isfinite(length) or length <= 0):
+            return None
+        faces = mesh.faces
+        if faces.size != 4 * mesh.n_cells or not bool(
+                (faces.reshape(-1, 4)[:, 0] == 3).all()):
+            return None
+        lines = profile_edges.lines
+        if lines.size != 3 * profile_edges.n_cells:
+            return None
+
+        # Map rim points to mesh vertex ids (same tolerance rule as faces_on_edges).
+        b = np.asarray(mesh.bounds, dtype=float)
+        diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+        tol = 1e-6 * diag if diag > 0 else 1e-6
+        lpts = np.asarray(profile_edges.points)
+        pid = np.empty(profile_edges.n_points, dtype=np.int64)
+        ok = np.zeros(profile_edges.n_points, dtype=bool)
+        for i in range(profile_edges.n_points):
+            j = int(mesh.find_closest_point(lpts[i]))
+            pid[i] = j
+            ok[i] = float(np.linalg.norm(lpts[i] - mesh.points[j])) <= tol
+        seg_keys = set()
+        n_points = mesh.n_points
+        for seg in lines.reshape(-1, 3):
+            i0, i1 = int(seg[1]), int(seg[2])
+            if ok[i0] and ok[i1]:
+                a_, b_ = int(pid[i0]), int(pid[i1])
+                seg_keys.add(min(a_, b_) * n_points + max(a_, b_))
+        if not seg_keys:
+            return None
+
+        # Directed boundary edges of THIS rim, as wound in their one incident
+        # face (a->b). The extension face sharing edge (a,b) must traverse b->a,
+        # which keeps the whole extension consistent with the surface winding.
+        tri = faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+        de = np.vstack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]])
+        und = de.min(axis=1) * n_points + de.max(axis=1)
+        uu, uc = np.unique(und, return_counts=True)
+        boundary_und = set(uu[uc == 1].tolist())
+        rim_dir = [(int(a_), int(b_)) for (a_, b_), u in zip(de, und)
+                   if int(u) in boundary_und and int(u) in seg_keys]
+        if not rim_dir:
+            return None
+
+        # Extrusion direction: best-fit plane normal of the rim (PCA), signed to
+        # point AWAY from the faces attached to the rim (out of the vessel).
+        rim_ids = sorted({v for e in rim_dir for v in e})
+        rim_pts = np.asarray(mesh.points, dtype=float)[rim_ids]
+        centroid = rim_pts.mean(axis=0)
+        if direction is not None:
+            d = np.asarray(direction, dtype=float)
+        else:
+            cov = np.cov((rim_pts - centroid).T)
+            w, v = np.linalg.eigh(cov)
+            d = v[:, 0]                                   # smallest-variance axis
+            attached = self.faces_on_edges(profile_edges)
+            if attached:
+                inward = mesh.cell_centers().points[attached].mean(axis=0)
+                if float(np.dot(d, centroid - inward)) < 0:
+                    d = -d
+        mag = float(np.linalg.norm(d))
+        if mag == 0:
+            return None
+        d = d / mag
+
+        # Ring spacing ~ rim edge length keeps side triangles near-isotropic.
+        seg_len = [float(np.linalg.norm(mesh.points[a_] - mesh.points[b_]))
+                   for a_, b_ in rim_dir]
+        med = float(np.median(seg_len))
+        n_rings = int(np.clip(round(length / med) if med > 0 else 1, 1, 100))
+
+        # The extension inherits each rim face's winding. On an already
+        # inconsistent surface every ring replicates the conflict, so warn the
+        # user to repair first (checked BEFORE mutating).
+        pre_flips = self._count_winding_flips(mesh) or 0
+
+        local = {v: i for i, v in enumerate(rim_ids)}
+        nv = len(rim_ids)
+        base = np.asarray(mesh.points, dtype=float)[rim_ids]
+        rings = [base + d * (length * k / n_rings) for k in range(n_rings + 1)]
+        pts = np.vstack(rings)
+        tris = []
+        for k in range(n_rings):
+            bot, top = k * nv, (k + 1) * nv
+            for a_, b_ in rim_dir:
+                la, lb = local[a_] , local[b_]
+                tris.append([3, lb + bot, la + bot, la + top])   # (b, a, a')
+                tris.append([3, lb + bot, la + top, lb + top])   # (b, a', b')
+        ext = pv.PolyData(pts, np.asarray(tris, dtype=np.int64).ravel())
+
+        self._ensure_labels()
+        self._push_history()
+        self.original_mesh = self._merge_labeled(self.current_mesh, ext, 0)
+        msg = (f"Extended {len(rim_dir)}-edge rim by {length:g} along "
+               f"({d[0]:.2f}, {d[1]:.2f}, {d[2]:.2f}) — {n_rings} ring(s), "
+               f"{2 * n_rings * len(rim_dir)} faces added. The new end is an "
+               f"open profile: Fill it as a named patch to cap it.")
+        if pre_flips:
+            msg += (f" Note: the surface already had {pre_flips} flipped edge(s) "
+                    f"— consider Ctrl+Z, Fix Normals, then extrude again.")
+        return msg
+
     def unfilled_open_profiles(self):
         """Open profiles not yet filled. Filling merges the cap into current_mesh
         (the hole closes), so every remaining open profile is by definition unfilled."""
@@ -3650,14 +3768,28 @@ class STLClipperApp(QMainWindow):
         file_menu.addAction("Quit", self.close)
 
     def _patch_dpr_picking(self):
-        """Fix macOS Retina DPR mismatch for VTK widget picking.
+        """Fix macOS Retina DPR mismatch for VTK widget picking (VTK < 9.4).
 
-        pyvistaqt scales mouse coords by device-pixel-ratio before passing
-        them to VTK, but vtkCocoaRenderWindow reports size in logical pixels.
-        This makes widget pickers (plane, box) receive physical-pixel coords
-        against a logical-pixel viewport — the pick ray misses.  Patch the
-        interactor to keep everything in logical-pixel space.
+        On VTK 9.2.x, pyvistaqt scales mouse coords by device-pixel-ratio
+        before passing them to VTK, but vtkCocoaRenderWindow reports size in
+        logical pixels. This makes widget pickers (plane, box) receive
+        physical-pixel coords against a logical-pixel viewport — the pick ray
+        misses.  Patch the interactor to keep everything in logical-pixel space.
+
+        VTK >= 9.4 fixed Qt/Retina handling upstream: event coords AND window
+        size are both physical pixels, already consistent. Applying this patch
+        there forces logical size onto a physical-coordinate stack and shifts
+        every click by the device-pixel-ratio (2x offset on Retina) — so the
+        patch must be skipped on modern VTK.
         """
+        major = vtk.vtkVersion.GetVTKMajorVersion()
+        minor = vtk.vtkVersion.GetVTKMinorVersion()
+        if (major, minor) >= (9, 4):
+            logger.info("Retina DPR patch SKIPPED (VTK %d.%d handles Qt "
+                        "device-pixel-ratio natively)", major, minor)
+            return
+        logger.info("Retina DPR patch applied (VTK %d.%d reports logical-pixel "
+                    "window size)", major, minor)
         interactor = self.plotter.interactor
 
         def _patched_setEventInformation(
@@ -3822,7 +3954,7 @@ class STLClipperApp(QMainWindow):
         self._current_plane_origin = center.copy()
         self._current_plane_normal = np.array([0.0, 0.0, 1.0])
         bounds = np.array(mesh.bounds).reshape(3, 2)
-        diag = np.linalg.norm(bounds.ptp(axis=1))
+        diag = np.linalg.norm(np.ptp(bounds, axis=1))
         self._spin_step.setValue(round(max(diag * 0.01, 0.1), 2))
         self._show_plane_controls(True)
 
@@ -3855,7 +3987,7 @@ class STLClipperApp(QMainWindow):
         if wall is None:
             return
         bounds = np.array(wall.bounds).reshape(3, 2)
-        radius = np.linalg.norm(bounds.ptp(axis=1)) * 0.5
+        radius = np.linalg.norm(np.ptp(bounds, axis=1)) * 0.5
         disc = pv.Disc(center=self._current_plane_origin,
                        normal=self._current_plane_normal,
                        inner=0.0, outer=radius)
@@ -3878,7 +4010,7 @@ class STLClipperApp(QMainWindow):
         # Compute initial box state — centered at current plane origin
         center = np.array(self._current_plane_origin, dtype=float)
         bounds = np.array(mesh.bounds).reshape(3, 2)
-        extents = bounds.ptp(axis=1)  # [dx, dy, dz]
+        extents = np.ptp(bounds, axis=1)  # [dx, dy, dz]
         half_extents = extents * 0.3 / 2.0  # factor=0.3 matching old widget
 
         self._box_center = center.copy()
@@ -4137,7 +4269,7 @@ class STLClipperApp(QMainWindow):
         Rotation sliders: fixed 0-3600 (0.0°-360.0°)
         """
         bounds = np.array(mesh.bounds).reshape(3, 2)
-        extents = bounds.ptp(axis=1)
+        extents = np.ptp(bounds, axis=1)
         margin = extents * 0.5  # 50% margin
 
         for slider, bmin, bmax, m in [
@@ -4227,7 +4359,7 @@ class STLClipperApp(QMainWindow):
             return
         center = np.array(mesh.center, dtype=float)
         bounds = np.array(mesh.bounds).reshape(3, 2)
-        extents = bounds.ptp(axis=1)
+        extents = np.ptp(bounds, axis=1)
         half_extents = extents * 0.3 / 2.0
 
         self._updating_box_controls = True
@@ -4383,7 +4515,7 @@ class STLClipperApp(QMainWindow):
 
         # Normal direction arrow (green = keep side)
         arrow_length = np.linalg.norm(
-            np.array(wall.bounds).reshape(3, 2).ptp(axis=1)
+            np.ptp(np.array(wall.bounds).reshape(3, 2), axis=1)
         ) * 0.15
         arrow = pv.Arrow(
             start=self._current_plane_origin,
@@ -5112,7 +5244,7 @@ class STLClipperApp(QMainWindow):
         menu = QMenu(self._object_tree)
         act_hl = menu.addAction("Highlight")
         act_rename = act_split = act_remove = act_fill = act_del_piece = None
-        act_remesh = act_del_nm = act_fill_wall = None
+        act_remesh = act_del_nm = act_fill_wall = act_extrude = None
         if kind == "patch":
             act_rename = menu.addAction("Rename…")
             act_split = menu.addAction("Split disconnected components")
@@ -5121,6 +5253,7 @@ class STLClipperApp(QMainWindow):
         elif kind == "profile":
             act_fill_wall = menu.addAction("Fill (merge into wall)")
             act_fill = menu.addAction("Fill as named patch…")
+            act_extrude = menu.addAction("Extrude (flow extension)…")
         elif kind == "piece":
             act_del_piece = menu.addAction("Delete piece (faces)")
         elif kind == "nonmanifold":
@@ -5140,6 +5273,8 @@ class STLClipperApp(QMainWindow):
             self._fill_profile_as_wall(index)
         elif chosen is act_fill:
             self._fill_profile_dialog(index)
+        elif chosen is act_extrude:
+            self._extrude_profile_dialog(index)
         elif chosen is act_del_piece:
             self._delete_piece(index)
         elif chosen is act_remesh:
@@ -5393,6 +5528,38 @@ class STLClipperApp(QMainWindow):
             self.status.showMessage("Select an open profile in the Objects tree first.")
             return
         self._fill_profile_dialog(idx)
+
+    def _extrude_profile_dialog(self, idx):
+        """Flow extension: prompt for a length and extrude open profile `idx`
+        along its cut-plane normal. Default length = 3x equivalent diameter."""
+        if self.engine.current_mesh is None:
+            self.status.showMessage("Load an STL first.")
+            return
+        profiles = self._tree_profiles
+        if not (0 <= idx < len(profiles)):
+            self.status.showMessage("That open profile is stale — refreshing the tree.")
+            self._refresh_object_tree()
+            return
+        rim = profiles[idx]
+        pts = np.asarray(rim.points, dtype=float)
+        diameter = 2.0 * float(np.linalg.norm(pts - pts.mean(axis=0), axis=1).mean())
+        default = max(3.0 * diameter, 1e-6)
+        length, ok = QInputDialog.getDouble(
+            self, "Flow Extension",
+            "Extension length (mesh units):", default, 1e-6, 1e9, 3)
+        if not ok:
+            return
+        msg = self.engine.extrude_profile(rim, float(length))
+        if msg is None:
+            self.status.showMessage("Could not extrude this profile.")
+            return
+        self._active_profile_index = None
+        self.plotter.remove_actor("tree_highlight", render=False)
+        self._refresh_display()
+        self._refresh_object_tree()
+        self._refresh_patch_list()
+        self._update_button_states()
+        self.status.showMessage(f"{msg} Ctrl+Z to undo.")
 
     def _fill_profile_as_wall(self, idx):
         """Quick-fill open profile `idx` and merge the cap into the wall — no name
@@ -5986,15 +6153,69 @@ class STLClipperApp(QMainWindow):
             QMessageBox.critical(self, "Export Error", str(e))
 
 
-def main():
+def _log_environment():
+    """Log the runtime stack once at startup. Environment divergence (two
+    installs, different numpy/vtk generations) has produced GUI-only bugs that
+    tests could not see — this header makes any pasted log self-diagnosing."""
+    import numpy
+    import pyvista
+    try:
+        from PyQt5.QtCore import PYQT_VERSION_STR
+    except Exception:                                    # pragma: no cover
+        PYQT_VERSION_STR = "?"
+    logger.info("mesh-prep starting")
+    logger.info("  python  : %s (%s)", sys.version.split()[0], sys.prefix)
+    logger.info("  numpy   : %s", numpy.__version__)
+    logger.info("  pyvista : %s", pyvista.__version__)
+    logger.info("  vtk     : %s", vtk.vtkVersion.GetVTKVersion())
+    logger.info("  pyqt    : %s", PYQT_VERSION_STR)
+
+
+def _setup_logging(debug: bool):
+    """Console logging as before; with --debug also mirror everything to a
+    timestamped file under ~/.mesh-prep/logs/. Returns the log path or None."""
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    log_path = None
+    if debug:
+        log_dir = os.path.join(os.path.expanduser("~"), ".mesh-prep", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir, time.strftime("mesh-prep-%Y%m%d-%H%M%S.log"))
+        fh = logging.FileHandler(log_path)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+        logging.getLogger().addHandler(fh)
+
+    # Uncaught exceptions abort the Qt app (macOS: 'Abort trap: 6') — capture
+    # the traceback into every handler (incl. the file) BEFORE that happens.
+    previous_hook = sys.excepthook
+
+    def _log_uncaught(exc_type, exc, tb):
+        logger.critical("UNCAUGHT EXCEPTION — the app may abort now",
+                        exc_info=(exc_type, exc, tb))
+        previous_hook(exc_type, exc, tb)
+
+    sys.excepthook = _log_uncaught
+    return log_path
+
+
+def main():
+    args = list(sys.argv[1:])
+    debug = "--debug" in args
+    if debug:
+        args.remove("--debug")
+    log_path = _setup_logging(debug)
+    _log_environment()
+    if log_path:
+        logger.info("debug log: %s", log_path)
 
     app = QApplication.instance() or QApplication(sys.argv)
 
-    initial_file = sys.argv[1] if len(sys.argv) > 1 else None
+    initial_file = args[0] if args else None
     window = STLClipperApp(initial_file=initial_file)
     window.show()
 
