@@ -1056,6 +1056,12 @@ docker run --rm --name meshprep-checkmesh \\
     bash -c "$OF_BASHRC && stdbuf -oL checkMesh" 2>&1 | tee log.checkMesh
 
 if [ "$NPROCS" -gt 1 ]; then
+    # Keep decomposeParDict in sync with the requested core count: the dict is
+    # written at export time (template default), and decomposePar/mpirun abort
+    # when numberOfSubdomains does not equal -np.
+    sed -i.bak -E "s/^ *numberOfSubdomains .*/numberOfSubdomains $NPROCS;/" \\
+        "$CASE_DIR/system/decomposeParDict" && rm -f "$CASE_DIR/system/decomposeParDict.bak"
+
     echo "=== Decomposing mesh for $NPROCS processors ==="
     docker run --rm --name meshprep-decompose \\
         -v "$CASE_DIR":/case \\
