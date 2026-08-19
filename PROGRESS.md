@@ -1,7 +1,7 @@
 # mesh-prep PROGRESS
 
 ## NEXT STEP
-GUI-test the review-fix batch (clip a mesh: normals stay green; fill an opening named inlet and export: 0/U direction correct; centerline tube now scale-relative), then merge cl to main on approval. After that: region-scoped shape-preserving remesh if the global pass is not enough, and pMesh end-to-end.
+GUI-test the selection fixes (double-click the front of a cut model in a perspective view: it must flood the clicked side, not the far side) and the review-fix batch (clip a mesh: normals stay green; fill an opening named inlet and export: 0/U direction correct; centerline tube now scale-relative), then merge cl to main on approval. After that: region-scoped shape-preserving remesh if the global pass is not enough, and pMesh end-to-end.
 
 ## LAST SESSION (2026-08-17)
 Remesh quality batch: rebuilt the cap remesh (remesh_patch) so it works on real concave and multi-disc caps (min angle median 1.9 to 60 deg on the aorta outlet cap); found and fixed a pre-existing clip weld bug (cap rim from vtkCutter vs wall rim from vtkClipPolyData only matched by floating point luck; two-cylinder case had 316 open seam edges, now 0); made named caps click-pickable in Select mode; added whole-surface isotropic remesh (pyacvd/ACVD) as a Mesh Repair button. Earlier same day: NumPy 2 compatibility (ptp, linalg.solve), VTK 9.4+ gate for the Retina picking patch, mesh-prep --debug logging mode, flow extension (extrude open rim along cut normal).
@@ -27,6 +27,7 @@ Remesh quality batch: rebuilt the cap remesh (remesh_patch) so it works on real 
 - Run the test suite under BOTH pythons before handoff. GUI smoke (offscreen) only works in the conda env.
 
 ## SESSION LOG
+- 2026-08-19 (later): two selection bugs from GUI testing. (1) Pinched figure-8 rims filled as one disc created non-manifold edges, which the flood graph excludes, so a double-click on such a cap selected one face; fill_profile now splits the rim into simple cycles (commit ccbfeec). (2) The selection actor was not pickable while selected faces are excluded from the wall actor (single-copy rendering), so the second click of a double-click passed through the just-selected face and flooded whatever was behind it, often the other side of a cut. Measured on coa_001: 400/400 probe positions fell through, 13 into a different region; 0 after the fix.
 - 2026-08-19: multi-agent bug review (12 confirmed findings); fixed all in 8 commits on cl: cap winding harmonized at every cap merge + fill patch normals recorded (reversed-inlet-velocity bug), patch-name purge on all face-removing paths, stale selection cleared in 5 mesh-replacing handlers, scale-aware centerline tube, worker quiesce on load, run_docker NPROCS sync, visualize.py origin scaling, flood barriers survive smoothing, branch decomposition dedupe. Suites: conda 158 passed, base 156 passed.
 - 2026-08-17: cap remesh rebuilt; clip weld fix; caps pickable; Remesh Surface (pyacvd) added; PROGRESS.md created. Two-point DPR fix and extrude verified in GUI.
 - 2026-08-17 (earlier): NumPy 2 fixes; VTK 9.4 DPR gate; --debug mode; commit 1c3085b pushed to cl/dev/main.

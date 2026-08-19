@@ -2783,6 +2783,7 @@ class STLClipperApp(QMainWindow):
         # Selection state
         self._selection: set = set()          # active selected cell ids (original_mesh)
         self._cap_actor_names: set = set()    # cap actors currently drawn (for staleness)
+        self._pickable_selection = None   # (actor, cell map) for the selection actor
         self._select_mode = False
 
         self._build_ui()
@@ -5392,6 +5393,10 @@ class STLClipperApp(QMainWindow):
             wall_actor = getattr(self, "_wall_actor", None)
             actors = ([(wall_actor, getattr(self, "_wall_cell_map", None))]
                       if wall_actor is not None else [])
+        actors = list(actors)
+        sel = getattr(self, "_pickable_selection", None)
+        if sel is not None:                      # the selected faces' only copy
+            actors.append(sel)
         if mesh is None or not actors:
             return None
         picker = vtk.vtkCellPicker()
@@ -5470,15 +5475,27 @@ class STLClipperApp(QMainWindow):
             self.plotter.remove_actor("selection", render=False)
         except Exception:
             pass
+        self._pickable_selection = None
         mesh = self.engine.original_mesh
         if self._selection and mesh is not None:
             ids = sorted(i for i in self._selection if 0 <= i < mesh.n_cells)
             if ids:
+                sub = mesh.extract_cells(ids)
+                # PICKABLE: selected faces are excluded from the wall/cap actors
+                # (single-copy rendering), so this actor is the ONLY geometry
+                # covering them. Leaving it unpickable let a click pass straight
+                # through an already-selected face and hit the far wall behind
+                # it — which is what made the second click of a double-click
+                # flood the opposite side of the model.
                 actor = self.plotter.add_mesh(
-                    mesh.extract_cells(ids), color=(1.0, 0.55, 0.0),
-                    name="selection", lighting=True, pickable=False,
+                    sub, color=(1.0, 0.55, 0.0),
+                    name="selection", lighting=True, pickable=True,
                     reset_camera=False)
                 self._pull_to_front(actor)
+                cmap = (np.asarray(sub.cell_data["vtkOriginalCellIds"])
+                        if "vtkOriginalCellIds" in sub.cell_data
+                        else np.asarray(ids, dtype=np.int64))
+                self._pickable_selection = (actor, cmap)
 
     def _draw_surface_actors(self, exclude=None):
         """Draw/replace the wall + named-cap actors, excluding `exclude` cell ids
