@@ -143,7 +143,10 @@ def _decompose_branches(paths):
         return seg
 
     branches = []
-    for u in list(roots) + sorted(bifs):
+    # A node can be BOTH a path root and a bifurcation (the inlet seed snapped
+    # onto a fork); iterating it from both lists emitted every branch under it
+    # twice. Deduplicate the start nodes.
+    for u in sorted(set(roots) | bifs):
         for c in children[u]:
             branches.append(walk(u, c))
     return branches, bifs

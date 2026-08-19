@@ -142,3 +142,13 @@ def test_centerline_empty_seeds_raises():
     cyl = _watertight(pv.Cylinder(radius=1.0, height=4.0, resolution=24, capping=True))
     with pytest.raises(ValueError):
         compute_centerlines(cyl, [], [0, 0, 1])
+
+
+def test_decompose_root_that_is_also_bifurcation_not_duplicated():
+    """The inlet seed can snap exactly onto a fork node: the root is then also
+    a bifurcation, and iterating it from both lists duplicated every branch
+    under it (review finding 11)."""
+    from mesh_prep.centerline_native import _decompose_branches
+    branches, bifs = _decompose_branches([[0, 1, 2], [0, 3, 4]])
+    assert sorted(map(tuple, branches)) == [(0, 1, 2), (0, 3, 4)]
+    assert bifs == {0}
