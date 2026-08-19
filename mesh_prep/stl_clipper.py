@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import types
-from collections import deque
+from collections import defaultdict, deque
 from typing import Optional
 
 import numpy as np
@@ -1316,6 +1316,66 @@ class STLClipperEngine:
                 for pid, name in sorted(self.patch_names.items())]
 
     @staticmethod
+    def _split_boundary_into_cycles(loop):
+        """Decompose a boundary-edge group into edge-disjoint simple cycles.
+
+        detect_open_profiles groups boundary edges by CONNECTIVITY, so one
+        "open profile" can be a figure-8: two or more rings meeting at pinch
+        vertices (degree 4). Triangulating that as a single disc spans the
+        pinch and produces non-manifold edges once merged, which excludes
+        those faces from the flood adjacency: a double-click on such a cap
+        then selected a single face. Filling each simple cycle separately
+        keeps the result edge-manifold (the pinch stays a shared vertex only).
+
+        Returns a list of loop PolyData. A rim that is already a simple cycle
+        (every vertex degree 2) is returned unchanged, so the common clean
+        case takes exactly the old path."""
+        if loop is None or loop.n_cells == 0:
+            return []
+        lines = loop.lines
+        if lines.size != 3 * loop.n_cells:          # not simple 2-point segments
+            return [loop]
+        seg = lines.reshape(-1, 3)[:, 1:]
+        adj = defaultdict(list)
+        for k, (a, b) in enumerate(seg):
+            adj[int(a)].append((int(b), k))
+            adj[int(b)].append((int(a), k))
+        if all(len(v) == 2 for v in adj.values()):
+            return [loop]                           # already simple
+        pts = np.asarray(loop.points)
+        used, cycles = set(), []
+        for k0 in range(len(seg)):
+            if k0 in used:
+                continue
+            start = int(seg[k0][0])
+            path, pos, cur = [start], {start: 0}, start
+            while True:
+                nxt = next(((nb, k) for nb, k in adj[cur] if k not in used), None)
+                if nxt is None:
+                    break
+                used.add(nxt[1])
+                cur = nxt[0]
+                if cur in pos:                      # walk closed a sub-cycle
+                    i = pos[cur]
+                    if len(path) - i >= 3:
+                        cycles.append(path[i:])
+                    for v in path[i + 1:]:
+                        pos.pop(v, None)
+                    path = path[:i + 1]
+                else:
+                    pos[cur] = len(path)
+                    path.append(cur)
+        out = []
+        for cyc in cycles:
+            idx = np.asarray(cyc, dtype=np.int64)
+            n = len(idx)
+            la = []
+            for i in range(n):
+                la += [2, i, (i + 1) % n]
+            out.append(pv.PolyData(pts[idx], lines=np.asarray(la, dtype=np.int64)))
+        return out or [loop]
+
+    @staticmethod
     def _fan_fill(loop):
         """Seal a boundary loop with a triangle fan from its centroid.
 
@@ -1423,27 +1483,43 @@ class STLClipperEngine:
         empty or cannot be triangulated."""
         if self.current_mesh is None or profile_edges is None or profile_edges.n_cells == 0:
             return None
-        cap = self._triangulate_loop(profile_edges)
-        if cap is None:
-            return None
-        cap = self._orient_cap_to_base(cap, self.current_mesh)
+        # A pinched rim (figure-8) must be filled as separate simple discs,
+        # otherwise the single disc spans the pinch and turns non-manifold.
+        caps = []
+        for lp in self._split_boundary_into_cycles(profile_edges):
+            c = self._triangulate_loop(lp)
+            if c is None or c.n_cells == 0:
+                caps = []
+                break
+            caps.append(c)
+        if not caps:                                # fall back to one disc
+            c = self._triangulate_loop(profile_edges)
+            if c is None:
+                return None
+            caps = [c]
         self._ensure_labels()
         self._push_history()
         pid = self._new_patch_id(name) if name and name.strip() else 0
-        if pid != 0:
-            # Record the outward normal (cap is now wound like the surrounding
-            # surface) so the OpenFOAM export derives the inlet velocity from a
-            # real direction instead of the previously arbitrary cap winding.
-            tri = cap.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
-            pts = np.asarray(cap.points, dtype=float)
+        result = self.current_mesh
+        fn_sum = np.zeros(3)
+        area2 = 0.0
+        for c in caps:
+            c = self._orient_cap_to_base(c, result)
+            tri = c.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+            pts = np.asarray(c.points, dtype=float)
             fn = np.cross(pts[tri[:, 1]] - pts[tri[:, 0]],
                           pts[tri[:, 2]] - pts[tri[:, 0]])
-            mean = fn.sum(axis=0)
-            mag = float(np.linalg.norm(mean))
-            total = float(np.linalg.norm(fn, axis=1).sum())
-            if total > 0 and mag > 1e-6 * total:
-                self._patch_normals[pid] = tuple(mean / mag)
-        self.original_mesh = self._merge_labeled(self.current_mesh, cap, pid)
+            fn_sum += fn.sum(axis=0)
+            area2 += float(np.linalg.norm(fn, axis=1).sum())
+            result = self._merge_labeled(result, c, pid)
+        if pid != 0:
+            # Record the outward normal (caps are wound like the surrounding
+            # surface) so the OpenFOAM export derives the inlet velocity from a
+            # real direction instead of the previously arbitrary cap winding.
+            mag = float(np.linalg.norm(fn_sum))
+            if area2 > 0 and mag > 1e-6 * area2:
+                self._patch_normals[pid] = tuple(fn_sum / mag)
+        self.original_mesh = result
         return self.current_mesh
 
     def extrude_profile(self, profile_edges, length, direction=None):
