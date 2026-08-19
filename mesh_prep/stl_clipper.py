@@ -3923,6 +3923,7 @@ class STLClipperApp(QMainWindow):
 
     def _on_repair_clean(self):
         msg = self.engine.repair_clean()
+        self._clear_selection()          # cell ids are renumbered by the repair
         self._lbl_repair_status.setText(msg)
         self._centerline_mesh = None
         self._refresh_patch_list()
@@ -3956,6 +3957,7 @@ class STLClipperApp(QMainWindow):
         if self.engine.current_mesh is None:
             return
         msg = self.engine.repair_decimate(self._spin_decimate_pct.value() / 100.0)
+        self._clear_selection()          # cell ids are renumbered by the repair
         self._lbl_repair_status.setText(msg)
         self._centerline_mesh = None
         self._refresh_patch_list()
@@ -3974,6 +3976,7 @@ class STLClipperApp(QMainWindow):
         if not ok:
             return
         msg = self.engine.remesh_surface(target)
+        self._clear_selection()          # cell ids are renumbered by the remesh
         self._lbl_repair_status.setText(msg)
         self._centerline_mesh = None
         self._refresh_patch_list()
@@ -3996,6 +3999,7 @@ class STLClipperApp(QMainWindow):
             if reply != QMessageBox.Yes:
                 return
         msg = self.engine.repair_make_watertight()
+        self._clear_selection()          # MeshFix rebuilds the mesh entirely
         self._lbl_repair_status.setText(msg)
         self._centerline_mesh = None
         self._refresh_patch_list()
@@ -5031,6 +5035,7 @@ class STLClipperApp(QMainWindow):
                 "Clip produced no surface — the plane may not intersect the geometry.")
             return
 
+        self._clear_selection()          # cell ids are renumbered by the clip
         self._cancel_clip_widgets()
         self._refresh_display()
         self._refresh_patch_list()
