@@ -540,6 +540,7 @@ class STLClipperEngine:
                 pts = np.asarray(cap.points).copy()
                 pts[hit] = np.asarray(wall_rim.points)[j[hit]]
                 cap.points = pts
+        cap = self._orient_cap_to_base(cap, trimmed)
         self._push_history()
         pid = self._new_patch_id(name)
         mag = float(np.linalg.norm(normal))
@@ -762,6 +763,7 @@ class STLClipperEngine:
         keep = np.nonzero(ids != pid)[0]
         base = self.current_mesh.extract_cells(keep).extract_surface()
         base = self._carry_labels(base, self.current_mesh)
+        new_cap = self._orient_cap_to_base(new_cap, base)
         result = self._merge_labeled(base, new_cap, pid)
         # A rim segment can still be missed in a degenerate spot, leaving a
         # thin gap the area gate cannot see. Seal CLOSED new loops with a fan
@@ -1311,6 +1313,63 @@ class STLClipperEngine:
             return None
         return cap.triangulate()
 
+    @staticmethod
+    def _orient_cap_to_base(cap, base):
+        """Flip the cap's winding if it disagrees with the surrounding surface.
+
+        The base's boundary directed edges (a->b, as wound in their single
+        incident face) define the orientation a conforming cap must have: the
+        cap face sharing edge (a,b) must traverse b->a. Cap and base share rim
+        coordinates exactly (loop points verbatim, or snap-welded), so edges
+        are matched by coordinates. Majority vote over all matched rim edges;
+        no matches leaves the cap unchanged. Returns the (possibly flipped)
+        cap. Fixes caps being merged wound INTO the domain, which broke the
+        normals health check after every clip/fill and silently reversed the
+        inlet velocity derived from fill-created patches."""
+        if cap is None or cap.n_cells == 0 or base is None or base.n_cells == 0:
+            return cap
+        bf = base.faces
+        if bf.size != 4 * base.n_cells:
+            # Clip output still holds quads at this point; triangulation
+            # preserves winding, so the boundary directed edges are unchanged.
+            base = base.triangulate()
+            bf = base.faces
+        cf = cap.faces
+        if (bf.size != 4 * base.n_cells or cf.size != 4 * cap.n_cells):
+            return cap
+        btri = bf.reshape(-1, 4)[:, 1:].astype(np.int64)
+        n_points = base.n_points
+        de = np.vstack([btri[:, [0, 1]], btri[:, [1, 2]], btri[:, [2, 0]]])
+        und = de.min(axis=1) * n_points + de.max(axis=1)
+        uu, uc = np.unique(und, return_counts=True)
+        boundary_und = set(uu[uc == 1].tolist())
+        bpts = np.asarray(base.points, dtype=float)
+        bdir = set()
+        for (a, b), u in zip(de, und):
+            if int(u) in boundary_und:
+                bdir.add((bpts[a].tobytes(), bpts[b].tobytes()))
+        if not bdir:
+            return cap
+        ctri = cf.reshape(-1, 4)[:, 1:].astype(np.int64)
+        cpts = np.asarray(cap.points, dtype=float)
+        ckeys = [cpts[i].tobytes() for i in range(cap.n_points)]
+        same = opposite = 0
+        for t in ctri:
+            for i in range(3):
+                u, v = ckeys[t[i]], ckeys[t[(i + 1) % 3]]
+                if (u, v) in bdir:
+                    same += 1          # cap traverses a->b like the base: wrong
+                elif (v, u) in bdir:
+                    opposite += 1      # cap traverses b->a: conforming
+        if same > opposite:
+            flipped = cf.reshape(-1, 4).copy()
+            flipped[:, 1:] = flipped[:, 1:][:, ::-1]
+            out = pv.PolyData(cpts, flipped.ravel())
+            for k in cap.cell_data:
+                out.cell_data[k] = np.asarray(cap.cell_data[k])
+            return out
+        return cap
+
     def fill_profile(self, profile_edges, name=None):
         """Triangulate an open profile's boundary loop into a cap and merge it
         into current_mesh (closing the hole).
@@ -1324,9 +1383,23 @@ class STLClipperEngine:
         cap = self._triangulate_loop(profile_edges)
         if cap is None:
             return None
+        cap = self._orient_cap_to_base(cap, self.current_mesh)
         self._ensure_labels()
         self._push_history()
         pid = self._new_patch_id(name) if name and name.strip() else 0
+        if pid != 0:
+            # Record the outward normal (cap is now wound like the surrounding
+            # surface) so the OpenFOAM export derives the inlet velocity from a
+            # real direction instead of the previously arbitrary cap winding.
+            tri = cap.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+            pts = np.asarray(cap.points, dtype=float)
+            fn = np.cross(pts[tri[:, 1]] - pts[tri[:, 0]],
+                          pts[tri[:, 2]] - pts[tri[:, 0]])
+            mean = fn.sum(axis=0)
+            mag = float(np.linalg.norm(mean))
+            total = float(np.linalg.norm(fn, axis=1).sum())
+            if total > 0 and mag > 1e-6 * total:
+                self._patch_normals[pid] = tuple(mean / mag)
         self.original_mesh = self._merge_labeled(self.current_mesh, cap, pid)
         return self.current_mesh
 
