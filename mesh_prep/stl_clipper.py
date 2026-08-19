@@ -4224,6 +4224,10 @@ class STLClipperApp(QMainWindow):
         self._loaded_filepath = filepath
         self._cancel_clip_widgets()
         self._centerline_mesh = None
+        # A still-running worker would later inject the PREVIOUS geometry's
+        # centerline into this new session (and dropping the only reference to
+        # a live QThread risks a Qt crash). Detach its signals and wait first.
+        self._quiesce_worker(self._centerline_worker)
         self._centerline_worker = None
         self._lbl_repair_status.setText("Status: \u2014")
         self._clear_selection()
@@ -6112,7 +6116,12 @@ class STLClipperApp(QMainWindow):
                       self._centerline_mesh.n_points if self._centerline_mesh is not None else 0,
                       self._centerline_mesh.n_cells if self._centerline_mesh is not None else 0)
         if has_cl:
-            tube = self._centerline_mesh.tube(radius=0.3)
+            cl_bounds = self.engine.original_mesh.bounds \
+                if self.engine.original_mesh is not None else None
+            cl_r = 0.004 * float(np.linalg.norm(
+                np.array(cl_bounds[1::2]) - np.array(cl_bounds[0::2]))) \
+                if cl_bounds else 0.3
+            tube = self._centerline_mesh.tube(radius=cl_r)
             logger.debug("Tube generated: n_points=%s, n_cells=%s",
                           tube.n_points if tube is not None else None,
                           tube.n_cells if tube is not None else None)
