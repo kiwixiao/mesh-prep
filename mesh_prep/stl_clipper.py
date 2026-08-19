@@ -1018,6 +1018,31 @@ class STLClipperEngine:
                 pts = new_pts
         smoothed = mesh.copy()
         smoothed.points = pts
+        # Feature curves are matched to the mesh by coordinates; smoothing
+        # moves exactly the vertices a cut ring lies on, which silently
+        # dissolved the flood barrier (and the drawn cyan curve). Ride the
+        # curves along: snap each curve point that matched an OLD vertex to
+        # that vertex's NEW position (point ids and order are unchanged).
+        if self._feature_curves:
+            b = np.asarray(mesh.bounds, dtype=float)
+            diag = float(np.linalg.norm(b[1::2] - b[0::2]))
+            tol = 1e-6 * diag if diag > 0 else 1e-6
+            from scipy.spatial import cKDTree
+            tree = cKDTree(np.asarray(mesh.points))
+            updated = []
+            for curve in self._feature_curves:
+                if curve is None or curve.n_points == 0:
+                    updated.append(curve)
+                    continue
+                cpts = np.asarray(curve.points).copy()
+                d, j = tree.query(cpts)
+                hit = d <= tol
+                if hit.any():
+                    cpts[hit] = pts[j[hit]]
+                    curve = curve.copy()
+                    curve.points = cpts
+                updated.append(curve)
+            self._feature_curves = updated
         self.original_mesh = smoothed
         return self.current_mesh
 
