@@ -471,6 +471,22 @@ class STLClipperEngine:
                               or len(m.cell_data[PATCH_ID]) != m.n_cells):
             m.cell_data[PATCH_ID] = np.zeros(m.n_cells, dtype=np.int64)
 
+    def _purge_empty_patches(self) -> list:
+        """Drop patch_names/_patch_normals entries whose pid no longer labels
+        any face. A name without faces would still be written into meshDict,
+        the BC files and controlDict function objects, while the exported STL
+        has no such solid: pMesh then creates no patch and the solver aborts.
+        Called by every face-removing operation. Returns the purged names."""
+        m = self.current_mesh
+        if m is None or PATCH_ID not in m.cell_data:
+            return []
+        present = set(int(v) for v in np.unique(np.asarray(m.cell_data[PATCH_ID])))
+        gone = [pid for pid in self.patch_names if pid not in present]
+        for pid in gone:
+            del self.patch_names[pid]
+            self._patch_normals.pop(pid, None)
+        return [self.patch_name_for(pid) for pid in gone] if gone else []
+
     def _new_patch_id(self, name: str) -> int:
         pid = self._next_patch_id
         self.patch_names[pid] = name
@@ -552,6 +568,7 @@ class STLClipperEngine:
         # check_normals / flood / grow / sharp-select fast paths rely on.
         # vtkTriangleFilter carries cell data, so each sub-triangle keeps its label.
         self.original_mesh = self._merge_labeled(trimmed, cap, pid).triangulate()
+        self._purge_empty_patches()
         return self.current_mesh
 
     def rename_patch(self, pid: int, new_name: str) -> bool:
@@ -831,6 +848,7 @@ class STLClipperEngine:
         self._push_history()
         keep_ids = np.where(~inside)[0]
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
+        self._purge_empty_patches()
         return self.current_mesh
 
     def select_cells_in_polygon(self, polygon_xy, view_matrix, viewport,
@@ -1591,6 +1609,7 @@ class STLClipperEngine:
         self._push_history()
         keep_ids = np.array([i for i in range(n) if i not in ids], dtype=np.int64)
         self.original_mesh = self.original_mesh.extract_cells(keep_ids).extract_surface()
+        self._purge_empty_patches()
         return self.current_mesh
 
     def remesh_region(self, cell_ids) -> Optional[str]:
