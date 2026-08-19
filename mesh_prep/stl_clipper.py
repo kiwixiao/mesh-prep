@@ -2464,7 +2464,10 @@ class STLClipperEngine:
         clips_data = [
             {
                 "name": name,
-                "origin": tuple(float(v) for v in (
+                # The exported mesh is multiplied by scale_factor (mm->m);
+                # slice origins must live in the SAME scaled coordinates or
+                # every visualize.py slice plane misses the domain entirely.
+                "origin": tuple(float(v) * scale_factor for v in (
                     patches[pid].center if pid in patches and patches[pid].n_cells > 0
                     else (0.0, 0.0, 0.0))),
                 "normal": tuple(float(v) for v in self._patch_normals.get(pid, (0.0, 0.0, 1.0))),
